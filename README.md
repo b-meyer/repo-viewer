@@ -11,6 +11,8 @@ A Tauri 2 desktop app: Rust backend, Vue 3 frontend, native installer, no server
 
 - **[PLAN.md](./PLAN.md)** — the specification: design decisions, roadmap, open questions.
 - **[AGENTS.md](./AGENTS.md)** — conventions, hard rules, and the traps. Read before changing code.
+- **[docs/phase-0.md](./docs/phase-0.md)** — the current runbook: scaffold the repo. Status is
+  planning; no code yet.
 
 ---
 
@@ -21,19 +23,20 @@ Layers 1–2 are the only JavaScript in the system; layer 3 down is Rust.
 ```mermaid
 flowchart TB
     subgraph L1["1 &nbsp;UI layer &mdash; the only JavaScript in the system"]
-        L1A["Root folder picker<br/>@tauri-apps/plugin-dialog 2.7.3"]
+        L1A["Root folder picker<br/>pick_root command &rarr; tauri-plugin-dialog 2.7.3, from Rust"]
         L1B["Repo table, filter chips, search<br/>vue 3.5.42 &middot; pinia 4.0.3 &middot; tailwindcss 4.3.3"]
         L1C["Detail drawer<br/>requests Tier 2 on open"]
     end
 
     subgraph L2["2 &nbsp;IPC bridge &mdash; @tauri-apps/api 2.11.1"]
         L2A["invoke &mdash; commands down"]
-        L2B["Channel&lt;ScanEvent&gt; &mdash; results up, ordered and batched"]
-        L2C["listen &mdash; low-frequency notices only"]
+        L2B["Channel&lt;ScanEvent&gt; &mdash; one per scan, ordered and batched, tagged with ScanId"]
+        L2C["Channel&lt;RepoEvent&gt; &mdash; one per session: watcher, poll, fetch pushes<br/>no emit / listen"]
     end
 
     subgraph L3["3 &nbsp;Tauri core &mdash; tauri 2.11.5"]
-        L3A["invoke_handler command registry<br/>own commands need no capability declaration"]
+        L3A["invoke_handler command registry<br/>own commands need no capability declaration; capabilities = core:default"]
+        L3B["canonical state: HashMap&lt;PathBuf, RepoStatus&gt;<br/>tiers merged here, full rows pushed"]
     end
 
     subgraph L4["4 &nbsp;Discovery &mdash; ignore 0.4.33"]
@@ -42,18 +45,18 @@ flowchart TB
     end
 
     subgraph L5["5 &nbsp;Git reads &mdash; gix 0.87.1, fanned out by rayon 1.12.0, zero C dependencies"]
-        L5A["Tier 0 &mdash; refs only, sub-ms per repo<br/>head_ref &middot; rev_walk.with_boundary &middot; commit_graph"]
-        L5B["Tier 1 &mdash; dirty flag<br/>is_dirty, early exit"]
+        L5A["Tier 0 &mdash; refs only, sub-ms per repo with a commit-graph<br/>head_ref &middot; rev_walk.with_hidden, capped &middot; commit_graph"]
+        L5B["Tier 1 &mdash; dirty flag incl. untracked, conflicted from index<br/>status iterator, first item, early exit"]
         L5C["Tier 2 &mdash; full counts, lazy<br/>status, index-to-worktree diff"]
     end
 
     subgraph L6["6 &nbsp;Watching &mdash; notify 8.2.0"]
-        L6A["ONE watcher over N git dirs<br/>notify-debouncer-full 0.7.0, 300-500 ms<br/>60 s poll and focus-refresh as the safety net"]
+        L6A["ONE watcher over N git dirs<br/>git-dir root non-recursive &middot; refs/ recursive &middot; logs/HEAD<br/>notify-debouncer-full 0.7.0, 300-500 ms<br/>refresh runs in Rust; 60 s poll and focus-refresh as the safety net"]
     end
 
-    subgraph L7["7 &nbsp;Side channels &mdash; subprocess and OS"]
-        L7A["git CLI subprocess<br/>fetch / pull / push ONLY<br/>real credential helpers, SSH config, proxies"]
-        L7B["tauri-plugin-opener 2.5.5<br/>editor &middot; terminal &middot; file manager"]
+    subgraph L7["7 &nbsp;Side channels &mdash; subprocess and OS, all driven from Rust"]
+        L7A["git CLI subprocess<br/>fetch / pull / push ONLY<br/>real credential helpers, SSH config, proxies<br/>CREATE_NO_WINDOW, GIT_TERMINAL_PROMPT=0, timeout"]
+        L7B["tauri-plugin-opener 2.5.5<br/>editor &middot; terminal &middot; file manager<br/>path must be a known repo"]
         L7C["tauri-plugin-store 2.4.4<br/>JSON cache of roots and last status"]
     end
 
@@ -61,6 +64,7 @@ flowchart TB
 
     L1 --> L2
     L2 --> L3
+    L3A --> L3B
     L3 --> L4
     L3 --> L7
     L4A --> L4B
@@ -100,7 +104,7 @@ disable themselves with an explanation if it is absent.
 
 | | |
 |---|---|
-| Node.js | 22.13+ — corepack fetches pnpm from `packageManager` |
+| Node.js | **24** (Active LTS), pinned in `.node-version`. Install pnpm with `npm i -g pnpm`; it enforces the version in `packageManager` itself. Corepack is not used |
 | Rust | via `rustup`, MSVC host (`x86_64-pc-windows-msvc`). MSRV **1.85**, set by `gix` |
 | Windows | VS C++ build tools — `MSVC v… C++ x64/x86 build tools (Latest)` + `Windows 11 SDK`. Nothing else from the C++ workload is needed |
 | macOS | Xcode Command Line Tools |
@@ -177,12 +181,12 @@ repo-viewer/
 │
 └── src-tauri/                    # ── THIN shell. Tauri glue only.
     ├── tauri.conf.json
-    ├── capabilities/             # plugin permissions
+    ├── capabilities/             # core:default only — plugins are called from Rust
     └── src/
         ├── lib.rs                # run(): builder, plugins, state, invoke_handler
-        ├── state.rs
+        ├── state.rs              # canonical HashMap<PathBuf, RepoStatus>, tier merge, session channel
         ├── stream.rs             # domain events → tauri::ipc::Channel
-        └── commands/             # scan, repo, fetch, config
+        └── commands/             # scan, repo, fetch, open, config
 ```
 
 Coming from .NET: there is no `.sln` and no `.csproj`. The root `Cargo.toml` is the workspace

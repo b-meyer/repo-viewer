@@ -3,7 +3,8 @@
 A cross-platform desktop app: point it at a folder and get a live dashboard of every Git repo
 beneath it — branch, ahead/behind, dirty state, file counts — without opening each one in an IDE.
 
-Status: **planning.** No code yet.
+Status: **planning.** No code yet. Next step: [docs/phase-0.md](./docs/phase-0.md), the
+scaffold runbook, gated on the Rust toolchain being allowed to execute on the dev machine.
 
 ---
 
@@ -48,17 +49,20 @@ Vue 3 + Pinia (src/) ............ presentation only
   - NO git logic, NO path manipulation, NO filesystem access
 
 IPC (@tauri-apps/api) ...........
-  invoke()      -> commands (scan, refresh, fetch, open, reveal)
-  Channel<T>    -> streamed scan results and progress
-  listen()      -> low-frequency watcher notifications
+  invoke()             -> commands (scan, cancel, refresh, fetch, open, pick root)
+  Channel<ScanEvent>   -> one per scan: streamed results and progress
+  Channel<RepoEvent>   -> one per app session, opened at startup: watcher, poll, and
+                          fetch-driven row updates. No emit()/listen().
 
 Rust (crates/ + src-tauri/) ..... all system work
   - parallel discovery
   - tiered Git reads
+  - canonical row state: one map of path -> RepoStatus, merged per tier (§6.3)
   - filesystem watching and debounce
   - `git` CLI subprocess for fetch/pull/push only
   - path normalization, editor/terminal/file-manager launch
-  - JSON cache read/write
+  - plugin calls (dialog, opener, store) — the frontend never imports a plugin package
+  - settings and cache persistence
 ```
 
 The boundary is structural, not aspirational: `src/` cannot import the engine, because one is
@@ -72,8 +76,8 @@ tiers stream independently, so a row appears before any worktree is touched.
 | Tier | Cost per repo | Yields | When |
 |---|---|---|---|
 | **0 — refs only** | sub-millisecond; reads `.git/HEAD`, `packed-refs`, loose refs, revwalk with commit-graph | branch, ahead/behind, upstream, stash count, state flags (rebase/merge/bisect/detached), last commit | immediately, every scan |
-| **1 — dirty flag** | early-exit via `is_dirty()` | clean/dirty boolean | streams in right after Tier 0 |
-| **2 — full counts** | full index↔worktree diff | staged / unstaged / untracked / conflicted | lazily: visible rows, expanded rows, explicit refresh |
+| **1 — dirty flag** | early-exit: first item from the status iterator, **untracked files included**; conflicted count read from index stage entries, no worktree I/O | clean/dirty boolean, conflicted count | streams in right after Tier 0 |
+| **2 — full counts** | full index↔worktree diff | staged / unstaged / untracked / conflicted | lazily: expanded rows, explicit refresh — never in the default scan path |
 
 Tier 0 alone answers "which repos have unpushed commits?" with zero worktree I/O. This tiering
 matters more to perceived performance than any library choice.
@@ -95,19 +99,20 @@ Two views live outside this document so they sit where they are used:
 
 | Crate | Version | Role |
 |---|---|---|
-| `tauri` | 2.11.5 | shell, windowing, IPC |
+| `tauri` / `tauri-build` | 2.11.5 / 2.6.3 | shell, windowing, IPC / `src-tauri` build script |
 | `gix` | 0.87.1 | all Git reads — **default features only**, no network/TLS features (§10.3) |
 | `ignore` | 0.4.33 | parallel repo discovery |
 | `rayon` | 1.12.0 | per-repo fan-out |
 | `notify` | 8.2.0 | filesystem watching |
 | `notify-debouncer-full` | 0.7.0 | debounce — mandatory (§7.3) |
 | `tokio` | 1.53.1 | async runtime for Tauri commands |
-| `serde` / `serde_json` | 1.x / 1.0.151 | IPC payloads |
+| `serde` / `serde_json` | 1.0.229 / 1.0.151 | IPC payloads |
 | `thiserror` | 2.0.20 | engine errors |
 | `anyhow` | 1.0.104 | `src-tauri` layer only |
 | `tracing` / `tracing-subscriber` | 0.1.44 / 0.3.23 | scan timings |
 | `ts-rs` | 12.0.1 | TypeScript type generation (§4.2) |
-| `tempfile` / `assert_fs` | 3.27.0 / 1.1.4 | dev-only, test fixtures |
+| `dunce` | 1.0.5 | strips the `\\?\` prefix `canonicalize()` returns on Windows (§5.2) |
+| `tempfile` | 3.27.0 | dev-only, test fixtures |
 | `tauri-plugin-dialog` | 2.7.3 | native folder picker |
 | `tauri-plugin-store` | 2.4.4 | JSON cache |
 | `tauri-plugin-opener` | 2.5.5 | reveal in Explorer/Finder, open in editor |
@@ -118,16 +123,25 @@ feeling instant, and libgit2 is the slower option per repository: `git_status_li
 ~2.5× slower than `git status` without the untracked cache and ~5–6× slower with it
 ([libgit2#4230](https://github.com/libgit2/libgit2/issues/4230)), ~3 s vs ~0.1 s on the `rust`
 repo ([exa#28](https://github.com/ogham/exa/issues/28)). It also has no early-exit, so "is this
-repo dirty?" costs a full diff. `gix` provides `Repository::is_dirty()`, exactly the primitive a
-dashboard needs, and `gix-credentials` invokes real `git credential` helpers.
+repo dirty?" costs a full diff. `gix`'s status platform is a lazy iterator, so the dirty flag is
+"take the first item", and `gix-credentials` invokes real `git credential` helpers.
 
-Two `gix` gaps and their handling:
+Three `gix` traps and their handling:
 
-- **No `ahead_behind` API.** Compute it with `rev_walk([local]).with_boundary([upstream])`,
-  counted, then the same with arguments swapped. Isolated in one file so it is easy to swap.
+- **`Repository::is_dirty()` is not the dirty flag.** Its docs state "untracked files do *not*
+  affect this flag" — it sets `dirwalk_options = None`, so a repo with a brand-new file reports
+  clean. Tier 1 uses `repo.status(Discard)?.untracked_files(Collapsed).into_index_worktree_iter(..)`
+  with `should_interrupt`, and takes the first item. Clean repos pay a full ignore-aware worktree
+  walk; Phase 4 records that cost.
+- **`with_boundary` is not `^upstream`.** Its docs say a boundary "is distinctly different from
+  exclusive revspecs" — it stops the walk at the given ids but does not hide their ancestors, so
+  any merged history overcounts. Ahead/behind is `rev_walk([local]).with_hidden([upstream])`
+  counted, then swapped. `with_hidden` warns that disjoint histories may traverse everything, so
+  the walk is capped (~1000, shown as "1000+"). Cost depends on a commit-graph being present;
+  without one every commit is an object decode. Isolated in one module — that module is the seam
+  if the primitive changes; there is no backend trait.
 - **Pre-1.0, breaks on minor bumps** ([gix#470](https://github.com/GitoxideLabs/gitoxide/issues/470)).
-  Pin exact and treat upgrades as tasks. Keep reads behind a small `GitBackend` trait so `git2`
-  can be dropped in per-operation — keep the seam, do not build two backends.
+  Pin exact and treat upgrades as tasks.
 
 **In-process reads, not subprocess.** Windows process creation is >20× slower than Linux and
 acutely sensitive to Defender and corporate AV
@@ -142,8 +156,14 @@ parallel walk with a prune predicate. `jwalk` 0.9.0 is the fallback if `ignore`'
 machinery gets in the way.
 
 **Storage is JSON, not SQLite.** Hundreds of small flat records, no relational queries, no
-history, no concurrent writers. `tauri-plugin-store` covers it. Revisit only if commit-history
-or time-series features land.
+history, no concurrent writers. `tauri-plugin-store`, driven from Rust, covers it. Revisit only
+if commit-history or time-series features land.
+
+**Plugins are called from Rust only.** `dialog`, `opener`, and `store` are registered in the
+builder and reached through the app's own commands (`pick_root`, `open_in`, settings). The
+frontend installs none of the `@tauri-apps/plugin-*` packages, so `src-tauri/capabilities/` is
+`core:default` and nothing else. Plugin scopes are enforced only on webview-initiated calls, so
+the path check in `open_in` (§6.1) is the real guard, not a capability scope.
 
 ### 3.2 Frontend (`src/`)
 
@@ -158,24 +178,24 @@ ahead of that catalog and serves as the proving ground for bumps later applied t
 | `vue` | 3.5.42 | latest stable; 3.6 is at rc.7 |
 | `vue-router` | 5.3.1 | file-based routing via `vue-router/vite` |
 | `pinia` | 4.0.3 | ESM-only |
-| `@vue/devtools-api` | 8.2.1 | required peer of pinia 4 (`^8.1.5`); no longer bundled |
+| `@vue/devtools-api` | 8.2.1 | required peer of pinia 4 (`^8.1.5`); pinia does not bundle it |
 | `reka-ui` | 2.10.4 | headless primitives, wrapped as `App*` |
 | `@vueuse/core` | 14.4.0 | |
 | `@vitejs/plugin-vue` | 6.0.8 | |
 | `tailwindcss` + `@tailwindcss/vite` | 4.3.3 | CSS-first; custom palette, `--spacing: 1px` |
 | `typescript` | **6.0.3 — not 7.0.2** | see §3.3 |
-| `@typescript/native-preview` | 7.0.0-dev.20260707.2 | `tsgo`, non-SFC TypeScript only |
+| `@typescript/native-preview` | 7.0.0-dev.20260707.2 | provides a `tsgo` binary distinct from TS 6's `tsc`; non-SFC TypeScript only |
 | `vue-tsc` | 3.3.11 | |
 | `minisearch` | 7.2.0 | repo search (§8.3) |
-| `zod` | 4.5.4 | validates the persisted settings/cache shape |
 | `@iconify-json/bi` + `bootstrap-icons` | 1.2.7 / 1.13.1 | |
 | `@vue/test-utils` / `jsdom` | 2.5.0 / 30.0.1 | |
-| `@tauri-apps/api` | 2.11.1 | |
+| `@tauri-apps/api` | 2.11.1 | the only Tauri package in the frontend |
 | `@tauri-apps/cli` | 2.11.4 | |
-| `@tauri-apps/plugin-dialog` / `-store` / `-opener` | 2.7.3 / 2.4.4 / 2.5.5 | |
 
 `oxlint` 1.79.0, `oxfmt` 0.64.0, `oxlint-tsgolint` 7.0.2001 and `tsdown` 0.22.14 arrive inside
-`vite-plus` — do not add them as catalog entries.
+`vite-plus` — do not add them as catalog entries. No `@tauri-apps/plugin-*` package and no schema
+validator: plugins are reached through Rust commands (§3.1), and everything the frontend receives
+is typed end to end by `ts-rs` (§4.2).
 
 **Every version exact, declared once** in the root `pnpm-workspace.yaml` `catalog:` block.
 Catalogs are a pnpm-workspace feature, so that file exists even though this is a single package.
@@ -194,25 +214,34 @@ it is operational rather than architectural, so it lives in [AGENTS.md](./AGENTS
 `vite`/`vite-plus`/`vitest` lockstep, `build.minify: 'oxc'`, `envPrefix: 'TAURI_ENV_'`, and
 the `NODE_ENV` + `--mode production` pairing.
 
+The TypeScript pin has an exit condition. `typescript@7.0.2` is `latest`, but `vue-tsc` needs
+the compiler's programmatic API, which TypeScript 7.0 does not expose stably; 7.1 is slated to
+ship it, and `vue-tsgo` bridges the gap in the meantime. The pin holds until 7.1 is released
+**and** `vue-tsc` runs on it; review at the 7.1 release, not before.
+
 ---
 
 ## 4. Structural decisions
 
-### 4.1 The workspace, and three rules it imposes
+### 4.1 The workspace, and four rules it imposes
 
 The engine is a separate crate so `cargo test` and timing runs work without booting a webview,
 and so the §2.1 boundary is compile-enforced. `tauri dev` watches `src-tauri` *and its dependent
 workspace crates*, so editing `repo-scan` still triggers a rebuild.
 
 1. **`[profile.release]` must live in the root `Cargo.toml`.** Cargo ignores profile sections in
-   member crates with only a warning, so the Tauri template's
-   `lto`/`codegen-units = 1`/`panic = "abort"`/`strip` block belongs at the root or the binary
-   ships unoptimized and large.
+   member crates with only a warning, so the `lto`/`codegen-units = 1`/`strip` block belongs at
+   the root or the binary ships unoptimized and large.
 2. **`target/` is at the workspace root.** The template's `src-tauri/.gitignore` entry for
    `/target/` stops matching; add `/target/` at the repo root.
 3. **Keep `[lib] name = "..._lib"`** in `src-tauri/Cargo.toml`. The suffix prevents a lib/bin
    name collision **on Windows specifically**
    ([cargo#8519](https://github.com/rust-lang/cargo/issues/8519)).
+4. **`panic = "unwind"` (the default) and `opt-level = 3`.** Tauri's app-size guide suggests
+   `panic = "abort"` and `opt-level = "s"`; both are wrong here. Per-repo work runs under
+   `catch_unwind` so a `gix` panic on one corrupt repo becomes `RepoStatus.error` instead of
+   killing the app — `abort` defeats that, and rayon propagates worker panics. A scanning engine
+   wants speed over a few hundred KB of binary.
 
 ### 4.2 Rust ↔ TypeScript type sync
 
@@ -228,6 +257,13 @@ diff, which is what actually prevents drift.
 has roughly a tenth of the adoption. The handful of command signatures in `src/scripts/ipc.ts`
 are cheap to hand-write and rarely change.
 
+**`model.rs` types are `gix`-free and `ts-rs`-expressible.** Object ids are hex `String`, not
+`gix::ObjectId`; timestamps are `u64` epoch milliseconds, not `SystemTime` (`ts-rs` has no impl
+for it, and serde would emit a `secs`/`nanos` struct). Every type carries
+`#[serde(rename_all = "camelCase")]` and enums with data are internally tagged
+(`#[serde(tag = "kind")]`) so the generated TypeScript is a discriminated union. `ts-rs` mirrors
+serde attributes, so the wire shape and the types agree by construction.
+
 ### 4.3 Tests and fixtures
 
 Tests sit next to their subject (`RepoTable.vue` + `RepoTable.test.ts`); `src/tests/` holds only
@@ -237,6 +273,13 @@ A nested `.git` cannot be committed inside the outer repo, and the cases most wo
 linked worktree, a submodule, a bare repo (§5.2) — are exactly the ones needing real git
 metadata. So `tests/support/fixtures.rs` builds the tree at test time into a `tempfile::TempDir`
 by shelling out to `git`, and nothing under `tests/fixtures/` is committed.
+
+Two fixtures exist specifically to pin the §3.1 traps: a repo whose only change is one untracked
+file (Tier 1 must say dirty), and two ahead/behind topologies — a merge from upstream into local,
+and a criss-cross merge — asserted against `git rev-list --left-right --count local...upstream`.
+
+Frontend code that reaches `ipc.ts` is tested with `mockIPC` from `@tauri-apps/api/mocks`,
+which intercepts `invoke` and `Channel` traffic without a webview; no hand-rolled mocks.
 
 **No `criterion`.** Its repeated-sampling model is the wrong shape for a whole-tree scan — 100
 samples of a multi-second operation is a five-minute run fought with `sample_size`. The Phase 2
@@ -275,13 +318,20 @@ Parallel walk from each configured root via `ignore::WalkBuilder`:
 
 - `git_ignore(false)`, `hidden(false)`, `standard_filters(false)` — this walk must *see* ignored
   and hidden directories in order to prune them; it is not a content search.
-- `filter_entry` prunes by name: `node_modules`, `target`, `.venv`, `venv`, `__pycache__`,
-  `dist`, `build`, `.next`, `.nuxt`, `.gradle`, `vendor`, `bin`, `obj`, `Pods`, `.terraform`,
-  `.build`. User-extensible.
+- `filter_entry` prunes by name, only names that are near-certainly generated: `node_modules`,
+  `target`, `.venv`, `venv`, `__pycache__`, `.gradle`, `.terraform`, `Pods`, `.next`, `.nuxt`.
+  User-extensible. `bin`, `obj`, `build`, `dist` and `vendor` are deliberately absent — a Go
+  `vendor/` tree or a `Source/build/` folder legitimately holds repos, and a name-pruned repo
+  vanishes silently. The scan summary reports how many directories were pruned so the omission
+  is visible.
+- `.git` itself is never descended — `hidden(false)` makes it visible to the walk, so the prune
+  predicate has to exclude it explicitly.
 - `same_file_system(true)` by default — avoids network shares and mounted volumes, a common
   cause of multi-minute scans.
 - `follow_links(false)` by default — symlink loops are real.
 - `max_depth` configurable, default 8.
+- `threads(n)` set explicitly. The walker and the rayon pool each default to the full core count,
+  which doubles the thread population during a scan.
 - On finding a repo, record it and **stop descending** by default (config flag to continue).
   Submodules are enumerated from the parent's config rather than by walking.
 
@@ -296,9 +346,12 @@ These are what make naive implementations wrong:
   them flagged, with no worktree status.
 - **Linked worktrees** share one object store. Each is its own row with its own HEAD and index,
   but must not be double-counted as separate repos.
-- **Windows long paths.** Use `PathBuf` throughout, and enable long-path support (`\\?\`
-  prefixing / the app manifest) — deep `node_modules` trees exceed `MAX_PATH` and the walk errors
-  out mid-scan. Junctions and reparse points need the same treatment as symlinks.
+- **Windows long paths cut the other way.** Rust's `std::fs` converts long absolute paths to the
+  `\\?\` form on its own, so deep `node_modules` trees do not break the walk. The trap is
+  `canonicalize()`, which *returns* verbatim `\\?\C:\...` paths: they render badly, confuse
+  `git` CLI arguments, and compare unequal to the user-typed form. Canonicalize through `dunce`
+  (§3.1), which drops the prefix whenever the path is representable without it. Junctions and
+  reparse points are already reported as symlinks by `std`, so `follow_links(false)` covers them.
 - **Case sensitivity.** macOS is case-insensitive-preserving, Linux sensitive, Windows
   insensitive. Canonicalize for deduplication, display the on-disk form.
 - **Permission errors** are collected and surfaced as a scan summary, never fatal to a scan.
@@ -310,30 +363,60 @@ These are what make naive implementations wrong:
 ### 6.1 Commands
 
 ```rust
-scan_roots(roots: Vec<PathBuf>, opts: ScanOpts, on_event: Channel<ScanEvent>)
+subscribe(on_event: Channel<RepoEvent>)           // once at startup; lives for the session
+scan_roots(roots: Vec<PathBuf>, opts: ScanOpts, on_event: Channel<ScanEvent>) -> ScanId
+cancel_scan(id: ScanId)
 refresh_repo(path: PathBuf, tier: Tier) -> RepoStatus
 full_status(path: PathBuf) -> DetailedStatus      // Tier 2, on demand
 fetch_repos(paths: Vec<PathBuf>, on_event: Channel<FetchEvent>)   // git CLI
 open_in(path: PathBuf, target: OpenTarget)        // editor | terminal | file manager
+pick_root() -> Option<PathBuf>                    // native folder dialog, via the plugin's Rust API
 add_root(path) / remove_root(path) / list_roots()
 ```
 
 Commands registered via `invoke_handler` are callable by all windows by default and need no
-capability declaration. Only the *plugins* (`dialog`, `store`, `opener`) need entries in
-`src-tauri/capabilities/`. Filesystem work inside our own commands is not constrained by the `fs`
-plugin scope — the Rust side is trusted — which is why all fs access stays in Rust and
-`tauri-plugin-fs` is not used.
+capability declaration. Because the plugins are reached only from Rust (§3.1), no plugin
+permission is declared either: `src-tauri/capabilities/default.json` grants `core:default` and
+nothing else. Filesystem work inside our own commands is not constrained by any plugin scope —
+the Rust side is trusted — which is why all fs access stays in Rust and `tauri-plugin-fs` is not
+used. The corollary is that commands validate their own inputs: `open_in`, `refresh_repo` and
+`full_status` accept only a path that is already a key in the canonical repo map (§6.3), never
+an arbitrary string from the webview.
 
 ### 6.2 `Channel<T>` for scan results, not events
 
 Tauri's event system is explicitly "not designed for low latency or high throughput situations":
 payloads are always JSON strings, unsuitable for larger messages. `tauri::ipc::Channel` is
 "designed to be fast and deliver ordered data" and is what Tauri uses internally for streaming. A
-scan emitting hundreds of tiered updates is the channel use case. Reserve `emit()` for infrequent
-one-off notifications.
+scan emitting hundreds of tiered updates is the channel use case. `Channel` is `Clone + Send`, so
+the one passed to `subscribe` is stored in app state and outlives the command; watcher, poll, and
+fetch results all go out on it. `emit()`/`listen()` are not used at all — one mechanism, one
+ordering.
 
 Batch channel sends — flush every ~50 ms or every 25 repos — rather than one send per repo. The
 per-message JSON serialization cost is what bites.
+
+Every `ScanEvent` carries its `ScanId`. The frontend keeps the id of the scan it asked for and
+drops batches from any other, so a rescan or a root change mid-scan cannot interleave stale rows
+with fresh ones.
+
+### 6.3 Rust owns the canonical state
+
+A tiered stream has a merge problem: a Tier 0 result for a repo arriving after its Tier 1 result
+carries `dirty: None`, and a naive "replace the row" would erase a value the UI already shows.
+The merge therefore happens once, in Rust. `src-tauri/src/state.rs` holds
+`HashMap<PathBuf, RepoStatus>`; each tier result is merged field-wise into the existing row, and
+the **full merged row** is what goes over the channel. The Pinia store is a mirror keyed by path
+— it never merges, never infers, and never holds a value Rust does not. The same map is what the
+JSON cache serialises, so there is exactly one source of truth on each side of the IPC boundary.
+
+### 6.4 Cancellation
+
+Every scan gets an `Arc<AtomicBool>`. Discovery checks it and returns `WalkState::Quit`; `gix`
+status calls take it via `should_interrupt`; the rayon fan-out checks it between repos.
+`cancel_scan` flips it, a root change flips the previous scan's flag before starting the next,
+and window close flips all of them. The scan body runs on `tauri::async_runtime::spawn_blocking`
+so the Tauri runtime's threads are never occupied by a walk.
 
 ---
 
@@ -346,15 +429,23 @@ per-message JSON serialization cost is what bites.
 
 ### 7.2 What to watch
 
-Non-recursive watches on each repo's git dir:
+Three watches per repo, all inside the git dir:
 
-- `.git/HEAD` — branch switch / detach
-- `.git/index` — staging changes
-- `.git/refs/` and `.git/packed-refs` — commits, fetches, ref updates
+- the git dir root, **non-recursive** — catches `HEAD`, `index`, `packed-refs`, `FETCH_HEAD`,
+  `ORIG_HEAD`, `MERGE_HEAD`, and the `index.lock` bursts (§7.3)
+- `refs/`, **recursive** — a non-recursive watch sees only direct children, so it misses every
+  slash-named branch (`refs/heads/feature/x`) and every remote-tracking update
+  (`refs/remotes/origin/main`), which is exactly the ahead/behind signal. The refs tree is a few
+  dozen small files, so recursion here is free.
+- `logs/HEAD` — appended on every commit, checkout, and reset regardless of branch name
 
-Non-recursive is deliberate: recursively watching worktrees means watching `node_modules`, which
-is how tools burn CPU and blow past inotify limits. The worktree itself is not watched — edits
-are picked up by the debounced Tier 1/2 refresh or on window focus.
+A linked worktree has a private git dir (`.git/worktrees/<name>/`, its own `HEAD` and `index`)
+and a shared common dir (refs, objects); both are watched, resolved through `gitdir:` and
+`commondir`.
+
+The worktree itself is never watched: recursively watching worktrees means watching
+`node_modules`, which is how tools burn CPU and blow past inotify limits. Worktree edits are
+picked up by the poll, by refresh-on-focus, or by the `index` change that follows any `git add`.
 
 ### 7.3 Debouncing is mandatory
 
@@ -377,6 +468,14 @@ overflow.
 So always ship a low-frequency poll (Tier 0 every ~60 s, configurable) and a refresh-on-focus,
 with `PollWatcher` available as a manual fallback for network mounts and containers.
 
+### 7.5 Refresh happens in Rust
+
+A debounced event never crosses the IPC boundary as a "something changed" notice. The watcher
+task re-runs Tier 0 and Tier 1 for that repo, merges the result into the canonical map (§6.3),
+and pushes the merged row on the session channel. The poll and the focus handler
+(`WindowEvent::Focused(true)`) take the same path. The frontend has nothing to do but render
+what arrives.
+
 ---
 
 ## 8. Data, fetch, and search
@@ -384,36 +483,39 @@ with `PollWatcher` available as a manual fallback for network mounts and contain
 ### 8.1 Model
 
 ```rust
+#[serde(rename_all = "camelCase")]
 struct RepoStatus {
     path: PathBuf,
     name: String,
+    parent: PathBuf,             // for group-by-folder; the frontend does no path splitting
     kind: RepoKind,              // Normal | Bare | LinkedWorktree | Submodule
 
     // Tier 0
-    head: Head,                  // Branch(String) | Detached(ObjectId) | Unborn
+    head: Head,                  // Branch { name } | Detached { id: String } | Unborn — tagged
     upstream: Option<String>,
-    ahead: Option<u32>,          // None = no upstream configured
+    ahead: Option<u32>,          // None = no upstream configured; capped, see §3.1
     behind: Option<u32>,
     last_commit: Option<CommitSummary>,
     stash_count: u32,
     state: RepoState,            // Clean | Merging | Rebasing | Bisecting | CherryPicking
-    last_fetched: Option<SystemTime>,   // drives the staleness badge (§8.2)
+    last_fetched_ms: Option<u64>,  // mtime of FETCH_HEAD; None if never fetched (§8.2)
 
     // Tier 1
-    dirty: Option<bool>,         // None = not yet computed
+    dirty: Option<bool>,         // None = not yet computed; true includes untracked files
+    conflicted: Option<u32>,     // index entries with stage > 0; None = not yet computed
 
     // Tier 2
     counts: Option<FileCounts>,  // staged, unstaged, untracked, conflicted
     submodules: Vec<SubmoduleStatus>,
 
-    scanned_at: SystemTime,
+    scanned_at_ms: u64,
     error: Option<String>,       // per-repo failure, never fatal to the scan
 }
 ```
 
 `Option` on every tiered field is load-bearing: the UI must render a partial row honestly
 ("counting…") rather than showing `0` for "unknown". That is the most common bug in this class of
-app.
+app. Times are `u64` milliseconds and ids are hex strings for the reasons in §4.2.
 
 Persisted to the JSON store so launch paints last-known state immediately, then reconciles. Every
 cached row renders with its `scanned_at` age until refreshed.
@@ -432,11 +534,18 @@ is misleading if it shows stale numbers silently. So:
   wrong means hanging on a credential prompt with no UI. This is also why `keyring` is not
   needed: delegate to the credential helper already installed (Git Credential Manager on
   Windows, Keychain on macOS).
+- **Subprocess hygiene.** `GIT_TERMINAL_PROMPT=0` so a missing credential fails instead of
+  waiting on a terminal that does not exist; `CREATE_NO_WINDOW` (`creation_flags(0x0800_0000)`)
+  on Windows or every fetch flashes a console; a per-process timeout (~60 s) because SSH and
+  proxy stalls are otherwise indefinite; at most ~4 concurrent fetches. `last_fetched_ms` is
+  re-read from `FETCH_HEAD` after each completion and pushed on the session channel.
 
 ### 8.3 Search
 
 `minisearch` 7.2.0. CIT Quickwire's `qdocs` runs it in production
-(`src/composables/useSearch.ts`); the tuning below is borrowed from there.
+(`src/composables/useSearch.ts`); the tuning below is borrowed from there. At a few hundred
+short strings a `String.includes` filter in a `computed` would also do; MiniSearch is here for
+parity with the qdocs pattern, not because the corpus needs it.
 
 1. **`shallowRef`, never `ref`, for the instance.** The index is a large nested structure; deep
    reactivity over it is a performance disaster.
@@ -484,6 +593,12 @@ a pristine 22.04 build ([tauri#12463](https://github.com/tauri-apps/tauri/issues
 Config that must be set rather than left on defaults:
 
 ```jsonc
+"app": {
+  "security": {
+    // default is null, i.e. no CSP. Tauri injects nonces for its own scripts.
+    "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:"
+  }
+},
 "bundle": {
   "macOS": { "minimumSystemVersion": "10.15" },   // config default is 10.13; real floor is Catalina
   "windows": {
@@ -497,9 +612,14 @@ Config that must be set rather than left on defaults:
 No system tray is planned, which drops `libappindicator3-1` — one fewer Linux dependency. Keep it
 that way unless a tray is wanted.
 
-Unsigned builds hit SmartScreen on Windows and Gatekeeper on macOS. For internal use, document
-the click-through; for wider distribution, budget for a code-signing certificate and macOS
-notarization.
+**Signing is a Phase 8 prerequisite for goal 1, not a nicety.** CIT-managed Windows machines run
+Defender for Endpoint with tamper protection; it denies *execution* of freshly downloaded,
+low-prevalence executables outright (`os error 5` with correct ACLs), independent of SmartScreen.
+An unsigned installer handed to a colleague does not get a click-through, it gets blocked. The
+two workable paths are an Authenticode certificate trusted by the tenant, or an IT-issued allow
+indicator by publisher or hash — either is an IT request with lead time, so it is filed before
+Phase 8 starts. macOS Gatekeeper and notarization matter only if a Mac build ships. How
+colleagues receive updates is open decision 5.
 
 ---
 
@@ -521,11 +641,13 @@ has a hard version floor.
 | Ubuntu 20.04 and older, Debian 11 and older | — | **4.1 does not exist in those repos** | **not a supported target** |
 
 **Windows is not unconditional.** Microsoft states the runtime "may be missing on clean Windows
-10 installs, Windows Server, or LTSC editions" — all realistic in a managed enterprise fleet. So
-preflight at startup by reading the `pv (REG_SZ)` value for the WebView2 Runtime under **both**
-`HKEY_LOCAL_MACHINE` and `HKEY_CURRENT_USER`; at least one must exist with a version above
-`0.0.0.0`. Keep `downloadBootstrapper` for general distribution and build a second
-`offlineInstaller` artifact (~127 MB) for locked-down environments.
+10 installs, Windows Server, or LTSC editions" — all realistic in a managed enterprise fleet.
+The installer's bootstrapper is the mechanism that closes that gap. As a diagnostic only, the
+binary reads the `pv (REG_SZ)` value for the WebView2 Runtime under **both**
+`HKEY_LOCAL_MACHINE` and `HKEY_CURRENT_USER` before creating the window, so a missing runtime
+produces a native message box naming the fix rather than a blank exit. Keep
+`downloadBootstrapper` for general distribution and build a second `offlineInstaller` artifact
+(~127 MB) for locked-down environments.
 
 **Linux is version-gated, not just dependency-managed.** A Tauri v2 `.deb` declares
 `libwebkit2gtk-4.1-0` and `libgtk-3-0`, so `apt` pulls them — but 4.1 exists in jammy 22.04,
@@ -573,7 +695,9 @@ and the other two as opt-in proof of portability. Do not build a three-platform 
 the Windows one is used in anger.
 
 CI invokes the toolchain as `pnpm exec vp …` because `vp` is not global on an ADO agent — a
-pipeline detail, not a local pattern. Rust legs run `cargo fmt --check`,
+pipeline detail, not a local pattern. Agents use Node 24 (the Active LTS line) via
+`NodeTool@0` reading `.node-version`, and install pnpm with `npm i -g pnpm@<pinned>`; pnpm then
+enforces the `packageManager` field itself. Rust legs run `cargo fmt --check`,
 `cargo clippy --all-targets -- -D warnings`, and `cargo test` alongside the frontend's
 `vp check`.
 
@@ -585,36 +709,49 @@ the built bundle's `import.meta.env.PROD` flag (§3.3).
 
 ## 11. Roadmap
 
+Each phase gets a runbook in `docs/` when it starts, written against the tree as it exists then,
+and is deleted when the phase completes — durable facts move into README.md and AGENTS.md.
+Phase 0's is [docs/phase-0.md](./docs/phase-0.md).
+
 **Phase 0 — Environment.** Install the toolchain per [README.md](./README.md) and confirm it
 with a real build, not a version print. Scaffold with `create-tauri-app` 4.6.2 (Vue + TS), then
 replace the toolchain with `vite-plus`, add `pnpm-workspace.yaml` with the catalog, pin
-TypeScript to 6.0.3, add the root `.gitignore`, and apply the two `vite.config.ts` corrections
-([AGENTS.md](./AGENTS.md), *Durable failure shapes*).
+TypeScript to 6.0.3, pin Node 24 (`engines` + `.node-version`; pnpm enforces `packageManager`,
+corepack is not involved), set the root `[profile.release]` (§4.1), add the root `.gitignore`,
+set the CSP (§9), and apply the two `vite.config.ts` corrections ([AGENTS.md](./AGENTS.md),
+*Durable failure shapes*).
 
 **Phase 1 — Discovery.** `ignore`-based parallel walk, prune list, `.git`-as-file handling,
-bare/worktree detection. *Deliverable:* a Rust test that finds a fixture tree containing a
-worktree, a submodule, and a bare repo.
+bare/worktree detection, `dunce` canonicalisation. *Deliverable:* a Rust test that finds a
+fixture tree containing a worktree, a submodule, and a bare repo.
 
-**Phase 2 — Tier 0 reads.** `gix` refs, HEAD, upstream resolution, hand-rolled ahead/behind,
-stash count, state flags. *Deliverable:* a recorded timing over a real tree of 100+ repos, via
-`examples/scan.rs`. This is the number the whole design defends.
+**Phase 2 — Tier 0 reads.** `gix` refs, HEAD, upstream resolution, ahead/behind via
+`with_hidden` with the cap, stash count, state flags, `catch_unwind` per repo. *Deliverables:*
+the topology fixtures of §4.3 passing against `git rev-list`, and a recorded timing over a real
+tree of 100+ repos via `examples/scan.rs`, taken twice — with and without
+`.git/objects/info/commit-graph` present. This is the number the whole design defends.
 
-**Phase 3 — Streaming IPC and minimal UI.** `Channel<ScanEvent>`, folder picker, Pinia store,
-plain non-virtualized table, progress indicator. **First point at which the app is useful.**
+**Phase 3 — Streaming IPC and minimal UI.** Canonical state map and tier merge (§6.3),
+`subscribe` session channel, `scan_roots` with `ScanId` and `cancel_scan` (§6.4), `pick_root`
+over the dialog plugin's Rust API, Pinia mirror store, plain non-virtualized table, progress
+indicator. **First point at which the app is useful.**
 
-**Phase 4 — Tiers 1 and 2.** `is_dirty()` streaming; lazy full status on row expand. Verify
-partial-state rendering is honest (§8.1).
+**Phase 4 — Tiers 1 and 2.** Dirty flag from the status iterator with untracked files included,
+conflicted count from the index; lazy full status on row expand. *Deliverable:* Tier 1 timing
+over the same tree as Phase 2, and a check that partial-state rendering is honest (§8.1).
 
 **Phase 5 — Filters, sort, grouping, search, persistence.** Filter chips, MiniSearch (§8.3), JSON
-cache, window state, open-in-editor/terminal/file-manager.
+cache and settings via the store plugin from Rust, window state, `open_in` with the repo-map
+check.
 
-**Phase 6 — Watching.** Single debounced watcher, poll fallback, focus refresh, inotify-limit
-error handling.
+**Phase 6 — Watching.** Single debounced watcher over the §7.2 watch set, Rust-side refresh
+(§7.5), poll fallback, focus refresh, inotify-limit error handling.
 
-**Phase 7 — Fetch.** Opt-in background `git fetch` via CLI, rate-limited, with visible
-last-fetched state and a clear failure surface for auth problems.
+**Phase 7 — Fetch.** Opt-in `git fetch` via CLI with the §8.2 subprocess hygiene, rate-limited,
+with visible last-fetched state and a clear failure surface for auth problems.
 
-**Phase 8 — Packaging.** Windows installer first (§9), then the CI matrix.
+**Phase 8 — Packaging.** Signing or an allow indicator secured first (§9), then the Windows
+installer, then the CI matrix.
 
 Phases 1–4 are the product. 5–7 make it pleasant. 8 makes it shippable.
 
@@ -632,8 +769,10 @@ Settle each before the phase that depends on it.
    explicit "fetch all"; auto-fetch over VPN on 300 repos is a support burden. *(Blocks Phase 7.)*
 4. **`gix` pin policy.** Pre-1.0 breaks on minor bumps. Recommend exact pin with scheduled
    upgrades. *(Affects maintenance, not a phase.)*
-5. **Mobile.** Tauri 2 supports iOS/Android; assumed out of scope for a local-filesystem scanner.
-   Confirm.
+5. **Signing and update delivery.** Which of the two §9 paths — Authenticode certificate or an
+   IT allow indicator — and how colleagues get new versions: a share path with a version check
+   in-app, or `tauri-plugin-updater` against an ADO artifact feed. Recommend the certificate plus
+   the updater; the allow-indicator route has to be repeated per build hash. *(Blocks Phase 8.)*
 
 ---
 
@@ -658,12 +797,12 @@ stays relevant only for a future app wanting an embedded local store.
 ## References
 
 - Tauri: [core releases](https://tauri.app/release/core/) · [calling the frontend](https://v2.tauri.app/develop/calling-frontend/) · [capabilities](https://v2.tauri.app/security/capabilities/) · [Windows installer](https://v2.tauri.app/distribute/windows-installer/) · [prerequisites](https://v2.tauri.app/start/prerequisites/) · [Debian](https://v2.tauri.app/distribute/debian/) · [config reference](https://v2.tauri.app/reference/config/) · [Vite guide](https://v2.tauri.app/start/frontend/vite/) (contains the two errors corrected in §3.3) · [project structure](https://v2.tauri.app/start/project-structure/)
-- gitoxide: [repo](https://github.com/GitoxideLabs/gitoxide) · [gix docs](https://docs.rs/gix/latest/gix/) · [status module](https://docs.rs/gix/latest/gix/status/index.html) · [feature flags](https://docs.rs/crate/gix/latest/features) · [towards 1.0](https://github.com/GitoxideLabs/gitoxide/issues/470) · [gix-credentials](https://docs.rs/gix-credentials) · [zlib-rs performance](https://trifectatech.org/blog/current-zlib-rs-performance/)
+- gitoxide: [repo](https://github.com/GitoxideLabs/gitoxide) · [gix docs](https://docs.rs/gix/latest/gix/) · [status module](https://docs.rs/gix/latest/gix/status/index.html) · [status Platform](https://docs.rs/gix/latest/gix/status/struct.Platform.html) · [`is_dirty` source](https://github.com/GitoxideLabs/gitoxide/blob/main/gix/src/status/mod.rs) · [revision walk Platform: `with_hidden` vs `with_boundary`](https://docs.rs/gix/latest/gix/revision/walk/struct.Platform.html) · [feature flags](https://docs.rs/crate/gix/latest/features) · [towards 1.0](https://github.com/GitoxideLabs/gitoxide/issues/470) · [gix-credentials](https://docs.rs/gix-credentials) · [zlib-rs performance](https://trifectatech.org/blog/current-zlib-rs-performance/)
 - libgit2 performance: [libgit2#4230](https://github.com/libgit2/libgit2/issues/4230) · [exa#28](https://github.com/ogham/exa/issues/28) · [gitui#2823](https://github.com/gitui-org/gitui/issues/2823) · [git2-rs#347](https://github.com/rust-lang/git2-rs/issues/347)
 - Watching and traversal: [notify docs](https://docs.rs/notify/) · [notify-rs](https://github.com/notify-rs/notify) · [ignore::WalkBuilder](https://docs.rs/ignore/latest/ignore/struct.WalkBuilder.html)
 - Process-creation cost: [OS primitives benchmark](https://www.bitsnbites.eu/benchmarking-os-primitives/)
 - WebView2 availability: [Evergreen vs fixed](https://learn.microsoft.com/microsoft-edge/webview2/concepts/evergreen-vs-fixed-version) · [distribution](https://learn.microsoft.com/microsoft-edge/webview2/concepts/distribution) · [delivery to Windows 10](https://blogs.windows.com/msedgedev/2022/12/14/delivering-microsoft-edge-webview2-runtime-to-managed-windows-10-devices/)
 - Linux floor: [Ubuntu archive: `libwebkit2gtk-4.1-0`](https://packages.ubuntu.com/search?keywords=libwebkit2gtk-4.1-0&searchon=names&suite=all&section=all) · [tauri#12463](https://github.com/tauri-apps/tauri/issues/12463)
-- Toolchain: [Vite 8 / Rolldown](https://vite.dev/blog/announcing-vite8-beta) · [what changed](https://certificates.dev/blog/rolldown-and-vite-8-what-changed) · [vuejs/language-tools#5381 (TS 7)](https://github.com/vuejs/language-tools/issues/5381) · [cargo#8519](https://github.com/rust-lang/cargo/issues/8519)
+- Toolchain: [Vite 8 / Rolldown](https://vite.dev/blog/announcing-vite8-beta) · [what changed](https://certificates.dev/blog/rolldown-and-vite-8-what-changed) · [Vite `build.minify`](https://vite.dev/config/build-options) · [TypeScript 7.0 RC announcement](https://devblogs.microsoft.com/typescript/announcing-typescript-7-0-rc/) · [vuejs/language-tools#5381 (TS 7)](https://github.com/vuejs/language-tools/issues/5381) · [vue-tsgo](https://github.com/NikhilVerma/vue-tsgo) · [Node.js release schedule](https://endoflife.date/nodejs) · [Corepack is not distributed with Node 25+](https://socket.dev/blog/node-js-tsc-votes-to-stop-distributing-corepack) · [cargo#8519](https://github.com/rust-lang/cargo/issues/8519) · [Rust: automatic verbatim paths on Windows](https://github.com/rust-lang/rust/pull/89174) · [`dunce`](https://docs.rs/dunce) · [Tauri JS mocks](https://v2.tauri.app/develop/tests/mocking/)
 - Prior art: [gitpane](https://github.com/affromero/gitpane) · [RepoZ](https://github.com/awaescher/RepoZ) · [mu-repo](https://github.com/fabioz/mu-repo) · [gr](https://github.com/mixu/gr)
 - Sibling repos: `WPT.Dashboard` (frontend stack and conventions) · `CIT Quickwire/qdocs` (`src/composables/useSearch.ts`, the MiniSearch pattern)

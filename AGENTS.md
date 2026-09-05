@@ -2,7 +2,9 @@
 
 A Tauri 2 desktop app: Rust backend, Vue 3 frontend. Points at a folder, reports Git status for
 every repo beneath it. See [README.md](./README.md) for orientation and commands;
-**[PLAN.md](./PLAN.md) is the specification** — design decisions, roadmap, open questions.
+**[PLAN.md](./PLAN.md) is the specification** — design decisions, roadmap, open questions. The
+phase currently being executed has a runbook in `docs/`, linked from PLAN.md §11; start there
+when picking up work.
 
 This app also exists to prove Tauri + Vue as a delivery pattern for offline client apps against a
 local SQL database. That is why the frontend stack matches `WPT.Dashboard` and why `src-tauri/`
@@ -19,10 +21,12 @@ because `vp` is not global on an ADO agent — a pipeline detail, not a pattern 
 |---|---|
 | Dev, full app | `vp run dev` |
 | Dev, frontend only | `vp dev` |
-| Check everything | `vp check` |
+| Check everything (fmt, lint, `.ts` types) | `vp check` |
 | Auto-fix | `vp check --fix` |
+| Vue SFC type-check | `vp run typecheck` |
 | Tests | `vp test run` |
-| Build + installer | `vp run build` |
+| Build + installer | `vp run build`, then `vp run verify` asserts the bundle is a production build |
+| Regenerate TS types | `vp run types` |
 | Add a dependency | `vp add <pkg>` then pin it exact in the catalog |
 | Bump a dependency | `vp update -L <pkg>` |
 | Rust checks | `cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test` |
@@ -39,14 +43,23 @@ Break any of these and the design stops working. They are not style preferences.
 - **`crates/repo-scan/` has no Tauri dependency.** All discovery, Git reads, watching, and fetch
   live there. `src-tauri/` is glue: commands, state, channel adaptation. If engine code needs a
   Tauri type, the boundary is in the wrong place.
-- **`src/scripts/ipc.ts` is the only file that imports `@tauri-apps/api`.** Components and stores
-  go through it. Keeps the IPC surface auditable and components testable.
+- **`src/scripts/ipc.ts` is the only file that imports `@tauri-apps/api`, and no
+  `@tauri-apps/plugin-*` package exists in the frontend.** Components and stores go through
+  `ipc.ts`; dialog, opener, and store are reached through the app's own commands, from their
+  Rust APIs. Keeps the IPC surface auditable, the capabilities file at `core:default`, and
+  components testable with `mockIPC`.
 - **The frontend does no Git logic, no path manipulation, and no filesystem access.** Rust owns
   all of it.
-- **Scan results stream over `tauri::ipc::Channel`, not `emit()`.** Tauri's event system is
-  documented as "not designed for low latency or high throughput" — payloads are always JSON
-  strings. Batch sends (~50 ms, or 25 repos) rather than one per repo. `emit()` is for infrequent
-  one-off notices.
+- **Rust owns the canonical row state.** `src-tauri/src/state.rs` holds the one
+  `HashMap<PathBuf, RepoStatus>`, merges each tier into it, and sends the full merged row. The
+  Pinia store is a mirror keyed by path: it never merges tiers and never holds a value Rust does
+  not. Commands that take a path accept only a key of that map.
+- **Everything streams over `tauri::ipc::Channel`; `emit()`/`listen()` are not used.** Tauri's
+  event system is documented as "not designed for low latency or high throughput" — payloads are
+  always JSON strings. One `Channel<ScanEvent>` per scan, one `Channel<RepoEvent>` per session
+  opened by `subscribe` at startup for watcher, poll, and fetch pushes. Batch sends (~50 ms, or
+  25 repos) rather than one per repo. Every scan event carries its `ScanId`; the frontend drops
+  events from any scan it did not ask for.
 - **One `notify` watcher for all repos.** `notify` spawns a thread per `Watcher`, so N watchers
   means N threads. Create one and call `watch()` per repo, non-recursively, on the git dir only.
 - **Uncomputed tiers render as unknown, never as `0`.** Every tiered field is `Option`, and the UI
@@ -78,8 +91,8 @@ sequenceDiagram
     G-->>V: branch, ahead/behind, state, last commit
     Note over V: "what have I not pushed?" answered<br/>with zero worktree I/O
 
-    T->>G: Tier 1 - is_dirty, early exit
-    G-->>V: clean / dirty per repo
+    T->>G: Tier 1 - status iterator, first item, early exit
+    G-->>V: clean / dirty (untracked included), conflicted count from index
 
     T->>W: register one watcher over N git dirs
 
@@ -88,27 +101,42 @@ sequenceDiagram
     T->>G: Tier 2 - full index-to-worktree diff
     G-->>V: staged / unstaged / untracked / conflicted
 
-    W-->>V: debounced change notice
-    V->>T: refresh_repo, Tier 0 + 1
-    Note over V,W: watching is an optimization<br/>a 60 s poll and focus-refresh are the safety net
+    W-->>T: debounced change on a git dir
+    T->>G: Tier 0 + 1 for that repo
+    G-->>V: merged row on the session channel
+    Note over V,W: watching is an optimization<br/>a 60 s poll and focus-refresh are the safety net<br/>and take the same Rust-side path
 ```
 
 Never move Tier 2 work into the default scan path. Tier 0 is refs-only and must stay that way.
+A change notice never crosses IPC on its own: Rust refreshes and pushes the row.
 
 ## Hard rules
 
 - **Every dependency version is exact**, declared once in `pnpm-workspace.yaml`'s `catalog:`
   (frontend) and `[workspace.dependencies]` in the root `Cargo.toml` (Rust). Bump deliberately
   with `vp update -L <pkg>`; never widen a range.
-- **`typescript` stays at 6.0.3.** TS 7's Go-native compiler has no stable programmatic API, so
-  Volar and `vue-tsc` cannot use it and SFC type-checking breaks. `vue-tsc`'s peer range
+- **`typescript` stays at 6.0.3 until TypeScript 7.1 ships its programmatic API and `vue-tsc`
+  runs on it.** `typescript@7.0.2` is `latest`, but its Go-native compiler exposes no stable API,
+  so Volar and `vue-tsc` cannot use it and SFC type-checking breaks. `vue-tsc`'s peer range
   (`>=5.0.0`) will let you install the broken pair. Two checkers: `vue-tsc` on TS 6 for `.vue`,
-  `tsgo` for plain `.ts`. `vp check` does **not** route Vue through `vue-tsc` — it stays wired
-  explicitly in the `check` task.
+  `tsgo` (from `@typescript/native-preview`) for plain `.ts`. `vp check` does **not** route Vue
+  through `vue-tsc` — that is the `typecheck` task (`vp run typecheck`), which `build` depends
+  on. Review the pin when 7.1 is released, not before; `vue-tsgo` is the interim bridge if it
+  is needed sooner.
 - **`vitest` stays at 4.1.11.** `vite-plus` 0.3.0 pins it and every `@vitest/*` internal to match.
   `vite` / `vite-plus` / `vitest` move in **lockstep**.
+- **Node is 24, pinned in `engines` and `.node-version`.** pnpm enforces the `packageManager`
+  field itself; corepack is not part of the setup and is not distributed with Node 25+.
 - **`[profile.release]` lives in the root `Cargo.toml`.** Cargo ignores profile sections in member
   crates with only a warning, so a `src-tauri`-local block silently ships an unoptimized binary.
+- **`panic = "unwind"` and `opt-level = 3` in that profile.** Per-repo work runs under
+  `catch_unwind` so a `gix` panic on one corrupt repo becomes `RepoStatus.error`; `abort` would
+  take the app down, and rayon propagates worker panics. Do not copy `panic = "abort"` /
+  `opt-level = "s"` from Tauri's app-size guide.
+- **`app.security.csp` is set in `tauri.conf.json`.** The default is `null`, which is no CSP.
+- **`model.rs` types are `gix`-free and `ts-rs`-expressible.** Hex `String` for ids, `u64`
+  epoch-ms for times (`ts-rs` has no `SystemTime` impl), `rename_all = "camelCase"`, internally
+  tagged enums.
 - **Keep `[lib] name = "..._lib"`** in `src-tauri/Cargo.toml`. The suffix prevents a lib/bin name
   collision on Windows specifically ([cargo#8519](https://github.com/rust-lang/cargo/issues/8519)).
 - `/target/` is gitignored at the **repo root**, not under `src-tauri/` — the workspace moves it.
@@ -155,7 +183,8 @@ Each of these has bitten. They are silent, which is why they are written down.
 **Tauri's Vite guide has two wrong values.** They fail identically on plain Vite 8 and on
 `vite-plus`, since vite-plus-core 0.3.0 *is* Vite 8.2.2:
 
-- `build.minify: 'esbuild'` hard-fails — Vite 8 dropped esbuild for Oxc. Use `'oxc'`.
+- `build.minify: 'esbuild'` is deprecated in Vite 8 and slated for removal; Oxc is the minifier.
+  Use `'oxc'`, or omit the key — `'oxc'` is the default.
 - `envPrefix: ['VITE_', 'TAURI_ENV_*']` exposes nothing. `envPrefix` is a literal `startsWith`
   prefix, not a glob, so the trailing `*` matches no variable and
   `import.meta.env.TAURI_ENV_PLATFORM` is `undefined`. Use `'TAURI_ENV_'`. Config-side
@@ -171,9 +200,33 @@ specify `vp build --mode production` there — and assert the built bundle's `PR
 containing `gitdir: <path>`. `path.join(".git").is_dir()` silently misses both. Test existence,
 then resolve. Bare repos have no `.git` at all — detect via `HEAD` + `objects/` + `refs/`.
 
-**Windows long paths break the walk mid-scan.** Deep `node_modules` trees exceed `MAX_PATH`.
-Use `PathBuf` throughout and enable long-path support (`\\?\` prefixing / the app manifest).
-Junctions and reparse points need the same handling as symlinks.
+**`gix::Repository::is_dirty()` ignores untracked files.** Its docs say so, and it disables the
+directory walk internally. A repo whose only change is a new file reports clean. The dirty flag
+comes from the status iterator with `untracked_files(Collapsed)`, first item, `should_interrupt`.
+
+**`gix`'s `with_boundary` is not `^rev`.** It stops the walk at the given commits but does not
+hide their ancestors, so ahead/behind over any merged history overcounts. Use `with_hidden`,
+which the docs equate to `^branch-to-not-list`, and cap the walk — disjoint histories can make
+it visit everything.
+
+**A non-recursive watch on `.git/refs/` misses most ref updates.** It sees only direct children,
+so `refs/heads/feature/x` and every `refs/remotes/origin/*` update are invisible. Watch `refs/`
+recursively (it is tiny), the git-dir root non-recursively, and `logs/HEAD`.
+
+**Windows long paths bite on the way out, not in.** `std::fs` already applies the `\\?\` prefix
+for long paths, so the walk does not fail on deep `node_modules`. `canonicalize()` *returns*
+`\\?\C:\...` paths, which render badly, confuse `git` CLI arguments, and compare unequal to the
+typed form. Canonicalize through `dunce`. Junctions and reparse points are reported as symlinks
+by `std`, so `follow_links(false)` covers them.
+
+**A spawned `git` flashes a console window on Windows.** Every `Command` for `git fetch` sets
+`creation_flags(CREATE_NO_WINDOW)` and `GIT_TERMINAL_PROMPT=0`, and has a timeout — a credential
+or SSH prompt with no terminal otherwise hangs the process forever.
+
+**Defender for Endpoint on CIT-managed machines blocks unsigned executables.** It denies
+execution of freshly downloaded, low-prevalence binaries with `os error 5` even when ACLs are
+correct, before SmartScreen is ever involved. An unsigned installer cannot be clicked through;
+signing or an IT allow indicator is a prerequisite for distributing to colleagues.
 
 **Git writes `.git/index` three times per operation.** It writes `index.lock`, writes, then
 renames, so one `git add` produces a create/modify/remove burst. Debouncing
