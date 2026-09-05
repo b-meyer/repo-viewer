@@ -78,104 +78,14 @@ tiers stream independently, so a row appears before any worktree is touched.
 Tier 0 alone answers "which repos have unpushed commits?" with zero worktree I/O. This tiering
 matters more to perceived performance than any library choice.
 
-### 2.3 Layers and libraries
+### 2.3 Diagrams
 
-Layers 1–2 are the only JavaScript; layer 3 down is Rust. The upward return path is in §2.4.
+Two views live outside this document so they sit where they are used:
 
-```mermaid
-flowchart TB
-    subgraph L1["1 &nbsp;UI layer &mdash; the only JavaScript in the system"]
-        L1A["Root folder picker<br/>@tauri-apps/plugin-dialog 2.7.3"]
-        L1B["Repo table, filter chips, search<br/>vue 3.5.42 &middot; pinia 4.0.3 &middot; tailwindcss 4.3.3"]
-        L1C["Detail drawer<br/>requests Tier 2 on open"]
-    end
-
-    subgraph L2["2 &nbsp;IPC bridge &mdash; @tauri-apps/api 2.11.1"]
-        L2A["invoke &mdash; commands down"]
-        L2B["Channel&lt;ScanEvent&gt; &mdash; results up, ordered and batched"]
-        L2C["listen &mdash; low-frequency notices only"]
-    end
-
-    subgraph L3["3 &nbsp;Tauri core &mdash; tauri 2.11.5"]
-        L3A["invoke_handler command registry<br/>own commands need no capability declaration"]
-    end
-
-    subgraph L4["4 &nbsp;Discovery &mdash; ignore 0.4.33"]
-        L4A["WalkBuilder::build_parallel<br/>genuinely parallel descent"]
-        L4B["prune node_modules, target, .venv<br/>resolve .git as file vs dir<br/>same_file_system, max_depth"]
-    end
-
-    subgraph L5["5 &nbsp;Git reads &mdash; gix 0.87.1, fanned out by rayon 1.12.0, zero C dependencies"]
-        L5A["Tier 0 &mdash; refs only, sub-ms per repo<br/>head_ref &middot; rev_walk.with_boundary &middot; commit_graph"]
-        L5B["Tier 1 &mdash; dirty flag<br/>is_dirty, early exit"]
-        L5C["Tier 2 &mdash; full counts, lazy<br/>status, index-to-worktree diff"]
-    end
-
-    subgraph L6["6 &nbsp;Watching &mdash; notify 8.2.0"]
-        L6A["ONE watcher over N git dirs<br/>notify-debouncer-full 0.7.0, 300-500 ms<br/>60 s poll and focus-refresh as the safety net"]
-    end
-
-    subgraph L7["7 &nbsp;Side channels &mdash; subprocess and OS"]
-        L7A["git CLI subprocess<br/>fetch / pull / push ONLY<br/>real credential helpers, SSH config, proxies"]
-        L7B["tauri-plugin-opener 2.5.5<br/>editor &middot; terminal &middot; file manager"]
-        L7C["tauri-plugin-store 2.4.4<br/>JSON cache of roots and last status"]
-    end
-
-    OUT["Rows paint progressively, tier by tier, back up through Channel to the repo table.<br/>Tiers not yet computed render as unknown &mdash; never as 0."]
-
-    L1 --> L2
-    L2 --> L3
-    L3 --> L4
-    L3 --> L7
-    L4A --> L4B
-    L4 -->|"repo paths"| L5
-    L4 -->|"register git dirs"| L6
-    L5A --> L5B
-    L5B --> L5C
-    L5 -.-> OUT
-    L6 -.-> OUT
-    L7A -.->|"updates last_fetched"| L5
-
-    style OUT fill:#eef7ee,stroke:#8bb88b
-```
-
-### 2.4 A scan, end to end
-
-```mermaid
-sequenceDiagram
-    autonumber
-    actor U as User
-    participant V as Vue + Pinia
-    participant T as Tauri IPC
-    participant D as Discovery / ignore
-    participant G as Git reads / gix + rayon
-    participant W as Watcher / notify
-
-    U->>V: pick root folder
-    V->>T: invoke scan_roots with Channel
-    T->>D: parallel walk, prune heavy dirs
-    D-->>T: repo paths, streamed
-    T-->>V: RepoFound batches
-    Note over V: rows paint immediately<br/>tiered fields render as "unknown", never 0
-
-    T->>G: Tier 0 - refs only
-    G-->>V: branch, ahead/behind, state, last commit
-    Note over V: "what have I not pushed?" answered<br/>with zero worktree I/O
-
-    T->>G: Tier 1 - is_dirty, early exit
-    G-->>V: clean / dirty per repo
-
-    T->>W: register one watcher over N git dirs
-
-    U->>V: expand a row
-    V->>T: invoke full_status
-    T->>G: Tier 2 - full index-to-worktree diff
-    G-->>V: staged / unstaged / untracked / conflicted
-
-    W-->>V: debounced change notice
-    V->>T: refresh_repo, Tier 0 + 1
-    Note over V,W: watching is an optimization<br/>a 60 s poll and focus-refresh are the safety net
-```
+- **Layers and libraries** — which library runs at which layer — is in
+  [README.md](./README.md), as orientation for anyone opening the repo.
+- **A scan end to end** — the tiered sequence — is in [AGENTS.md](./AGENTS.md), where it belongs
+  with the invariant that Tier 0 stays refs-only.
 
 ---
 
@@ -186,7 +96,7 @@ sequenceDiagram
 | Crate | Version | Role |
 |---|---|---|
 | `tauri` | 2.11.5 | shell, windowing, IPC |
-| `gix` | 0.87.1 | all Git reads — **default features only**, no network/TLS features (§11.3) |
+| `gix` | 0.87.1 | all Git reads — **default features only**, no network/TLS features (§10.3) |
 | `ignore` | 0.4.33 | parallel repo discovery |
 | `rayon` | 1.12.0 | per-repo fan-out |
 | `notify` | 8.2.0 | filesystem watching |
@@ -196,7 +106,7 @@ sequenceDiagram
 | `thiserror` | 2.0.20 | engine errors |
 | `anyhow` | 1.0.104 | `src-tauri` layer only |
 | `tracing` / `tracing-subscriber` | 0.1.44 / 0.3.23 | scan timings |
-| `ts-rs` | 12.0.1 | TypeScript type generation (§4.4) |
+| `ts-rs` | 12.0.1 | TypeScript type generation (§4.2) |
 | `tempfile` / `assert_fs` | 3.27.0 / 1.1.4 | dev-only, test fixtures |
 | `tauri-plugin-dialog` | 2.7.3 | native folder picker |
 | `tauri-plugin-store` | 2.4.4 | JSON cache |
@@ -276,177 +186,19 @@ complexity in measurement, sticky headers, keyboard nav, and find-in-page. Keep 
 fixed-height, measure, and add `@tanstack/vue-virtual` 3.13.36 past a measured threshold
 (~1000 rows, or a p95 frame-budget miss).
 
-### 3.3 Constraints that are load-bearing
+### 3.3 Version constraints
 
-**`typescript` must be 6.0.3.** TS 7's Go-native compiler ships without a stable programmatic
-API, so Volar and `vue-tsc` cannot use it and SFC type-checking breaks. `vue-tsc`'s peer range
-(`>=5.0.0`) will happily install the broken pair. The arrangement is **two checkers**: `vue-tsc`
-on TS 6 for `.vue`, `tsgo` for plain `.ts`. `vp check` does not route Vue through `vue-tsc` —
-wire it explicitly in the `check` task. Revisit at TS 7.1 (~Oct 2026).
-
-**`vitest` must be 4.1.11.** `vite-plus` 0.3.0 pins `vitest@4.1.11` and every `@vitest/*`
-internal to match. Breaking the lockstep fails as a resolution error in a transitive dependency,
-which reads like an unrelated upstream problem — pnpm does not re-resolve the `vite` npm-alias on
-a range bump.
-
-**Two values in Tauri's Vite guide are wrong on Vite 8** and must be corrected in
-`vite.config.ts`. They apply equally to plain Vite 8 and `vite-plus`, since vite-plus-core 0.3.0
-is Vite 8.2.2:
-
-1. `build.minify: 'esbuild'` hard-fails — Vite 8 dropped esbuild for Oxc, and the error is
-   *"Failed to load `transformWithEsbuild`… migrate to `transformWithOxc`."* Use **`'oxc'`**.
-2. `envPrefix: ['VITE_', 'TAURI_ENV_*']` exposes nothing. `envPrefix` is a literal `startsWith`
-   prefix, not a glob, so the trailing `*` matches no variable and
-   `import.meta.env.TAURI_ENV_PLATFORM` is `undefined`. Use **`'TAURI_ENV_'`**. Config-side
-   `process.env.TAURI_ENV_PLATFORM` works either way, which is why this goes unnoticed.
-
-**Production builds need `NODE_ENV=production` *and* `--mode production`.** The `vp` task runner
-sets `NODE_ENV`, and Vite derives `isProduction` from it, overriding `--mode` — a bundle built
-through `vp run build` has `import.meta.env.DEV` **true** and `PROD` **false**, silently
-inverting every env guard. Tauri's `beforeBuildCommand` invokes commands directly rather than
-through `vp run`, so specify `vp build --mode production` there and assert the built bundle's
-`PROD` flag in a test.
-
-**Tauri interop contract.** `vp dev` serves on `server.port` with `strictPort: true` and injects
-`/@vite/client`, satisfying `devUrl`; `vp build` emits `dist/`, satisfying `frontendDist`.
-`defineConfig` from `vite-plus` passes through every Vite key Tauri needs: `clearScreen`,
-`server.host/port/strictPort/hmr`, `server.watch.ignored`, `envPrefix`,
-`build.target/minify/sourcemap`.
+Three pins are load-bearing and two documented Tauri config values are wrong on Vite 8. All of
+it is operational rather than architectural, so it lives in [AGENTS.md](./AGENTS.md) under
+**Hard rules** and **Durable failure shapes**: `typescript` at 6.0.3, `vitest` at 4.1.11, the
+`vite`/`vite-plus`/`vitest` lockstep, `build.minify: 'oxc'`, `envPrefix: 'TAURI_ENV_'`, and
+the `NODE_ENV` + `--mode production` pairing.
 
 ---
 
-## 4. Project structure
+## 4. Structural decisions
 
-### 4.1 There is no solution file
-
-| .NET habit | Here |
-|---|---|
-| `.sln` | root **`Cargo.toml`** — the `[workspace]` manifest |
-| `.csproj` | one **`Cargo.toml`** per crate |
-| NuGet `packages.config` | `Cargo.toml` `[dependencies]` + `Cargo.lock` |
-| — | root **`package.json`** + `pnpm-workspace.yaml` |
-
-Visual Studio has weak Rust support; work in **VS Code with rust-analyzer** (or RustRover).
-
-### 4.2 Layout
-
-Tauri convention is a flat root with `src/` and `src-tauri/`, and this is one frontend package,
-so there is no `apps/`/`packages/` split. Inside `src/`, layout and naming follow the
-WPT.Dashboard house rules.
-
-```
-repo-viewer/
-├── Cargo.toml                    # [workspace] + [workspace.dependencies]
-├── Cargo.lock                    # committed (application, not library)
-├── package.json                  # one package; vp fronts every command
-├── pnpm-workspace.yaml           # catalog: only — every version exact, declared once
-├── pnpm-lock.yaml
-├── vite.config.ts                # vp config: vite + test + lint + fmt + run.tasks
-├── tsconfig.json / tsconfig.base.json
-├── index.html
-├── .taurignore                   # keeps `tauri dev` from rebuilding on frontend churn
-├── azure-pipelines.yml
-├── PLAN.md
-├── CLAUDE.md                     # conventions, layered like WPT.Dashboard's
-│
-├── src/                          # ── Vue frontend
-│   ├── main.ts
-│   ├── route-map.d.ts            # generated by VueRouter({ dts }) — committed
-│   ├── layout/
-│   │   ├── App.vue               # shell (App.vue lives here, not src root)
-│   │   └── Header.vue
-│   ├── pages/                    # file-based routes; index.vue = /
-│   │   ├── index.vue             # the dashboard
-│   │   └── settings.vue          # roots, prune list, thresholds
-│   ├── components/
-│   │   ├── inputs/               # App*.vue reka-ui wrappers — ALWAYS use at call sites
-│   │   │   ├── AppDialog.vue
-│   │   │   ├── AppCheckbox.vue
-│   │   │   ├── AppDropdownlist.vue
-│   │   │   └── AppContextMenu.vue      # row right-click: open in editor / terminal
-│   │   ├── repos/                # domain components, unprefixed
-│   │   │   ├── RepoTable.vue     # fixed-height rows (§3.2)
-│   │   │   ├── RepoTable.test.ts #   tests colocated, never a mirror tree
-│   │   │   ├── RepoRow.vue
-│   │   │   ├── FilterBar.vue
-│   │   │   ├── DetailDrawer.vue  # triggers Tier 2 on open
-│   │   │   └── StalenessBadge.vue      # last_fetched age (§8.2)
-│   │   └── feedback/
-│   │       ├── AppToaster.vue
-│   │       └── ScanProgress.vue
-│   ├── scripts/                  # plumbing — the house home for data access
-│   │   ├── ipc.ts                # the ONLY place @tauri-apps/api is imported
-│   │   ├── scan.ts               # Channel<ScanEvent> subscription + batching
-│   │   ├── search.ts             # MiniSearch index over the live repo set (§8.3)
-│   │   ├── router.ts             # guard only
-│   │   ├── utils.ts              # useLS etc.
-│   │   └── generated/            # ts-rs output, committed (§4.4)
-│   ├── stores/                   # Pinia, one file per store + colocated test
-│   │   ├── repos.ts
-│   │   ├── filters.ts
-│   │   └── settings.ts
-│   ├── styles/
-│   │   ├── main.css
-│   │   └── theme.css             # custom palette; stock Tailwind hues blanked
-│   ├── tests/
-│   │   └── setup.ts              # shared harness only
-│   └── types/
-│       └── ipc.d.ts              # ambient only
-│
-├── crates/
-│   └── repo-scan/                # ── THE ENGINE. Zero Tauri dependency.
-│       ├── Cargo.toml
-│       ├── examples/
-│       │   └── scan.rs           # `cargo run --release --example scan -- <path>` (§4.6)
-│       ├── src/
-│       │   ├── lib.rs
-│       │   ├── model.rs          # RepoStatus, Tier, Head, FileCounts (§8.1)
-│       │   ├── error.rs          # thiserror — per-repo errors are values, not panics
-│       │   ├── discover/
-│       │   │   ├── mod.rs        # ignore::WalkBuilder::build_parallel
-│       │   │   ├── prune.rs      # node_modules, target, .venv … user-extensible
-│       │   │   └── gitdir.rs     # .git file vs dir, bare, worktree, submodule (§5.2)
-│       │   ├── status/
-│       │   │   ├── mod.rs
-│       │   │   ├── tier0.rs      # refs, upstream, stash, state flags
-│       │   │   ├── tier1.rs      # is_dirty, early exit
-│       │   │   ├── tier2.rs      # full index-to-worktree counts
-│       │   │   └── ahead_behind.rs   # rev_walk + with_boundary; isolated (§3.1)
-│       │   ├── watch/
-│       │   │   └── mod.rs        # ONE notify watcher + debouncer + poll fallback
-│       │   └── fetch.rs          # git CLI subprocess (§8.2)
-│       └── tests/
-│           ├── discovery.rs
-│           ├── status.rs
-│           └── support/
-│               └── fixtures.rs   # BUILDS repos into a TempDir (§4.5)
-│
-└── src-tauri/                    # ── THIN shell. Tauri-specific glue only.
-    ├── Cargo.toml
-    ├── tauri.conf.json
-    ├── build.rs
-    ├── capabilities/default.json # dialog, store, opener — NOT our own commands (§6.1)
-    ├── icons/
-    ├── gen/schemas/              # generated, gitignored
-    └── src/
-        ├── main.rs               # calls app_lib::run()
-        ├── lib.rs                # run(): builder, plugins, state, invoke_handler
-        ├── state.rs              # AppState: roots, cache, watcher handle
-        ├── stream.rs             # domain events → tauri::ipc::Channel (§6.2)
-        └── commands/
-            ├── mod.rs
-            ├── scan.rs           # scan_roots, refresh_repo
-            ├── repo.rs           # full_status
-            ├── fetch.rs          # fetch_repos
-            └── config.rs         # add_root / remove_root / list_roots
-```
-
-Alias `@/*` → `src/*`. House code rules carry over: `function foo()` declarations rather than
-`const foo = () =>`; JSDoc on every export; `<script setup>` section order (Imports → Type →
-Setup → Data → Composed → Computed → Watchers → Methods → Lifecycle) with `/// Section`
-dividers; import order packages → `@/` → `./`, alphabetical, no blank lines between groups.
-
-### 4.3 The workspace, and three rules it imposes
+### 4.1 The workspace, and three rules it imposes
 
 The engine is a separate crate so `cargo test` and timing runs work without booting a webview,
 and so the §2.1 boundary is compile-enforced. `tauri dev` watches `src-tauri` *and its dependent
@@ -462,7 +214,7 @@ workspace crates*, so editing `repo-scan` still triggers a rebuild.
    name collision **on Windows specifically**
    ([cargo#8519](https://github.com/rust-lang/cargo/issues/8519)).
 
-### 4.4 Rust ↔ TypeScript type sync
+### 4.2 Rust ↔ TypeScript type sync
 
 Generate the types. Hand-maintained mirrors of `RepoStatus` drift, and the bug drift produces is
 precisely the one §8.1 exists to prevent: an uncomputed tier rendering as `0` instead of unknown.
@@ -476,7 +228,7 @@ diff, which is what actually prevents drift.
 has roughly a tenth of the adoption. The handful of command signatures in `src/scripts/ipc.ts`
 are cheap to hand-write and rarely change.
 
-### 4.5 Tests and fixtures
+### 4.3 Tests and fixtures
 
 Tests sit next to their subject (`RepoTable.vue` + `RepoTable.test.ts`); `src/tests/` holds only
 shared harness and setup.
@@ -492,7 +244,7 @@ deliverable is one recorded number, which is `std::time::Instant` in the example
 `criterion` later for micro-level pieces (`ahead_behind` on one repo, the prune predicate) if
 they profile hot.
 
-### 4.6 Running the engine without the GUI
+### 4.4 Running the engine without the GUI
 
 `crates/repo-scan/examples/scan.rs`, run as
 `cargo run --release --example scan -- C:/Working/Source`. Cargo compiles `examples/` during
@@ -501,18 +253,7 @@ producing the timing number, debugging one repo without a webview in the way, an
 behaviour in a CI container. Promote to `crates/repo-scan-cli/` with `clap` only once it wants
 subcommands and flags.
 
-### 4.7 Rust conventions
-
-- **`edition = "2024"`**, not the Tauri template's 2021. Stabilized in Rust 1.85, and `gix`
-  already forces MSRV 1.85.
-- **`[workspace.dependencies]` in the root manifest**, members writing `gix.workspace = true` —
-  the Cargo analogue of the pnpm catalog, so one policy covers both halves of the repo.
-- **`cargo fmt --check` and `cargo clippy --all-targets -- -D warnings`** in CI from the first
-  commit.
-- `thiserror` for the engine's typed errors, `anyhow` only at the `src-tauri` edge.
-- Derive `Debug` on public types; return a crate-local `Result<T>` alias from `error.rs`.
-
-### 4.8 How this maps onto WPT.Dashboard
+### 4.5 How this maps onto WPT.Dashboard
 
 | WPT.Dashboard | repo-viewer |
 |---|---|
@@ -520,9 +261,9 @@ subcommands and flags.
 | OData over HTTP, `credentials: 'include'` | `invoke()` + `Channel<T>` (§6) |
 | `apps/api` — Functions handlers, `ok()` / `errorResponse()` | `src-tauri/src/commands/` — `#[tauri::command]` |
 | `packages/db` — data access via `mssql` | `crates/repo-scan/` — the domain engine |
-| `packages/shared` — contracts, zod | `ts-rs`-generated types (§4.4) |
+| `packages/shared` — contracts, zod | `ts-rs`-generated types (§4.2) |
 | SWA auth, `allowedRoles` | none — the OS user is the user |
-| Azure Static Web App | an installer (§10) |
+| Azure Static Web App | an installer (§9) |
 
 ---
 
@@ -729,74 +470,7 @@ from `src/`, so Vite's initial scan pre-bundles it with no configuration.
 
 ---
 
-## 9. Build environment
-
-### 9.1 State of this machine
-
-| | Needed for | Status |
-|---|---|---|
-| Node.js + pnpm | the frontend | ✅ Node 22.21.1, pnpm 10.33.1 via corepack 0.34.0 |
-| Git CLI | the fetch path (§8.2) and normal VCS work | ✅ 2.54.0.windows.1 |
-| WebView2 Runtime | running the app, dev builds included | ✅ per-machine, `pv = 152.0.4191.62` |
-| MSVC C++ toolset | compiling every Rust build | ✅ VS Enterprise 2026, MSVC 14.51.36231 — `cl.exe` + `link.exe` |
-| Windows SDK | linking every Rust build | ✅ 10.0.26100.0 — `kernel32.lib`, `ucrt.lib`, `Windows.h`, `stdio.h`; `KitsRoot10` registered |
-| VBSCRIPT | only WiX `.msi` bundling | ✅ System32 + SysWOW64 |
-| Disk + cores | Rust builds, `rayon` fan-out | ✅ 194 GB free, 16 cores |
-| **Rust toolchain** | the entire backend | ❌ **absent — `Rustlang.Rustup` is blocked, approval in progress** |
-
-**Rust is the only blocker, and it is an approval blocker rather than a technical one.**
-Everything else needed to build is in place. Phase 1 onward cannot start until it clears.
-
-Set `"packageManager": "pnpm@11.9.0"` in `package.json` to match WPT.Dashboard and qdocs;
-corepack fetches it on first use, so pnpm needs no manual install.
-
-Verify toolchain state against **files**, not the VS component list — this machine has reported
-`Component.Windows11SDK.26100` as installed while none of its files were on disk. When querying
-components, use a **versioned** ID; `Component.Windows11SDK` unsuffixed is not a real ID and
-always returns zero matches.
-
-One package fails to install here and does not matter:
-`Win11SDK_WindowsPerformanceToolkit` returns `0x80070653` (Win32 1619,
-`ERROR_INSTALL_PACKAGE_OPEN_FAILED` — a corrupt cached payload). It is WPA/xperf/ETW tracing,
-pulled in implicitly by the `NativeDesktop` workload group, and nothing in the Rust or Tauri
-build path touches it. Untick *Windows 11 SDK — Windows Performance Toolkit* to stop it
-recurring, or leave it failed.
-
-### 9.2 Once Rust is approved
-
-```
-winget install --id Rustlang.Rustup --exact
-```
-
-Then in a **new** shell (the installer edits PATH):
-
-```
-rustup default stable-x86_64-pc-windows-msvc
-```
-
-MSRV floor is **Rust 1.85**, set by `gix` (`tauri` declares 1.77.2). Current stable is well clear.
-
-Verify with a real link rather than a version print:
-
-```
-cargo new --bin /c/Users/BLAKEM~1/AppData/Local/Temp/linkcheck
-cd /c/Users/BLAKEM~1/AppData/Local/Temp/linkcheck && cargo build
-```
-
-Nothing else is needed. In particular: `@tauri-apps/cli` is a project devDependency, not a global
-install; and the Tauri bundler downloads WiX and NSIS on the first `tauri build`, so that first
-build needs outbound network access.
-
-### 9.3 Other platforms
-
-macOS needs Xcode Command Line Tools. Linux needs `libwebkit2gtk-4.1-dev`, `build-essential`,
-`libssl-dev`, `librsvg2-dev`, `libxdo-dev` — but build Linux artifacts in the 22.04 container
-(§11.4) rather than on a workstation. `libssl-dev` is a build-time package only; our own code
-links no TLS (§11.3).
-
----
-
-## 10. Packaging
+## 9. Packaging
 
 Targets: NSIS `.exe` and WiX `.msi` on Windows (MSI is Windows-build-only); `.dmg`/`.app` on
 macOS; `.deb` and `.AppImage` on Linux. ARM64 Windows needs
@@ -829,9 +503,9 @@ notarization.
 
 ---
 
-## 11. Platform support
+## 10. Platform support
 
-### 11.1 End-user requirements
+### 10.1 End-user requirements
 
 Tauri bundles the frontend into the native binary, so **no Node and no Rust on an end-user
 machine.** Windows and macOS need nothing extra; Linux needs one package-manager dependency and
@@ -860,13 +534,13 @@ Declare Ubuntu 22.04 / Debian 12 as the floor and build Linux artifacts in a 22.
 glibc compatibility is forward-only, so building on a newer system raises the minimum glibc and
 produces binaries that fail on the stated floor.
 
-### 11.2 The Git CLI is a real but graceful dependency
+### 10.2 The Git CLI is a real but graceful dependency
 
 Viewing status needs no Git — that is in-process `gix`. Fetch/pull/push do (§8.2). Detect its
 absence at startup and disable those actions with an explanation rather than failing at click
 time; the rest of the app stays fully functional.
 
-### 11.3 No native dependencies
+### 10.3 No native dependencies
 
 Beyond Tauri's unavoidable webview, this stack adds **no C library dependencies**, which is the
 main portability payoff:
@@ -884,7 +558,7 @@ main portability payoff:
 - **`ignore`, `rayon`, and `notify` are pure Rust** over native OS APIs — inotify, FSEvents,
   `ReadDirectoryChangesW`.
 
-### 11.4 CI
+### 10.4 CI
 
 **Azure DevOps** (`azure-pipelines.yml`), per house convention.
 
@@ -894,7 +568,7 @@ main portability payoff:
 | `macos-latest` | `.dmg`, `universal-apple-darwin` | set `minimumSystemVersion: 10.15` |
 | `ubuntu-22.04` container | `.deb`, `.AppImage` | **must be 22.04, not `ubuntu-latest`** — glibc floor |
 
-Given the audience — this machine plus colleagues at CIT — treat the Windows leg as the pipeline
+Given the audience — a single developer plus colleagues at CIT — treat the Windows leg as the pipeline
 and the other two as opt-in proof of portability. Do not build a three-platform release before
 the Windows one is used in anger.
 
@@ -909,12 +583,13 @@ the built bundle's `import.meta.env.PROD` flag (§3.3).
 
 ---
 
-## 12. Roadmap
+## 11. Roadmap
 
-**Phase 0 — Environment.** Clear the Rust approval (§9.1), install `rustup`, verify a real link.
-Scaffold with `create-tauri-app` 4.6.2 (Vue + TS), then replace the toolchain with `vite-plus`,
-add `pnpm-workspace.yaml` with the catalog, pin TypeScript to 6.0.3, and apply the two
-`vite.config.ts` corrections from §3.3.
+**Phase 0 — Environment.** Install the toolchain per [README.md](./README.md) and confirm it
+with a real build, not a version print. Scaffold with `create-tauri-app` 4.6.2 (Vue + TS), then
+replace the toolchain with `vite-plus`, add `pnpm-workspace.yaml` with the catalog, pin
+TypeScript to 6.0.3, add the root `.gitignore`, and apply the two `vite.config.ts` corrections
+([AGENTS.md](./AGENTS.md), *Durable failure shapes*).
 
 **Phase 1 — Discovery.** `ignore`-based parallel walk, prune list, `.git`-as-file handling,
 bare/worktree detection. *Deliverable:* a Rust test that finds a fixture tree containing a
@@ -939,13 +614,13 @@ error handling.
 **Phase 7 — Fetch.** Opt-in background `git fetch` via CLI, rate-limited, with visible
 last-fetched state and a clear failure surface for auth problems.
 
-**Phase 8 — Packaging.** Windows installer first (§10), then the CI matrix.
+**Phase 8 — Packaging.** Windows installer first (§9), then the CI matrix.
 
 Phases 1–4 are the product. 5–7 make it pleasant. 8 makes it shippable.
 
 ---
 
-## 13. Open decisions
+## 12. Open decisions
 
 Settle each before the phase that depends on it.
 
@@ -967,7 +642,7 @@ Settle each before the phase that depends on it.
 The §1.1 objective. Recorded because it changes nothing structural, which is the point worth
 proving: for an offline client app over a local SQL Server, only the engine crate changes.
 `crates/repo-scan/` becomes `crates/<domain>/` and its data access uses **`tiberius`**, the pure
-Rust TDS client — preserving §11.3's zero-C-dependency property, so no ODBC driver or SQL Native
+Rust TDS client — preserving §10.3's zero-C-dependency property, so no ODBC driver or SQL Native
 Client to install alongside the app. `src/`, the IPC layer, and `src-tauri/src/commands/` keep
 their shape; commands return query results instead of scan results.
 
