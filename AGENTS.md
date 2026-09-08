@@ -62,7 +62,9 @@ Break any of these and the design stops working. They are not style preferences.
   25 repos) rather than one per repo. Every scan event carries its `ScanId`; the frontend drops
   events from any scan it did not ask for.
 - **One `notify` watcher for all repos.** `notify` spawns a thread per `Watcher`, so N watchers
-  means N threads. Create one and call `watch()` per repo, non-recursively, on the git dir only.
+  means N threads. Create one and call `watch()` per repo, non-recursively, on the git dir only —
+  which discovery already resolved onto `DiscoveredRepo.git_dir`, including the indirection for a
+  worktree or submodule whose `.git` is a file. Do not re-resolve it.
 - **Uncomputed tiers render as unknown, never as `0`.** Every tiered field is `Option`, and the UI
   must say "counting…" rather than showing a number it does not have. This is the most common bug
   in this class of app.
@@ -84,7 +86,7 @@ sequenceDiagram
     U->>V: pick root folder
     V->>T: invoke scan_roots with Channel
     T->>D: parallel walk, prune heavy dirs
-    D-->>T: repo paths, streamed
+    D-->>T: DiscoveredRepo streamed - path, kind, resolved git dir
     T-->>V: RepoFound batches
     Note over V: rows paint immediately<br/>tiered fields render as "unknown", never 0
 
@@ -232,6 +234,34 @@ which would otherwise redirect the generated output somewhere else entirely.
 **`.git` is often a file, not a directory.** Linked worktrees and submodules write a `.git` _file_
 containing `gitdir: <path>`. `path.join(".git").is_dir()` silently misses both. Test existence,
 then resolve. Bare repos have no `.git` at all — detect via `HEAD` + `objects/` + `refs/`.
+
+**Do not hand-roll that resolution: `gix::discover::is_git` is it.** `gix/src/discover.rs` is
+`pub use gix_discover::*`, ungated by any feature, so `is_git(path)` and `repository::Kind` are
+public API. It follows a `.git` file, requires a valid HEAD plus `objects/` and `refs/`, and
+returns a `Kind` that maps onto `RepoKind` directly: `WorkTree { linked_git_dir: None }` is
+`Normal`, `Some(_)` is `LinkedWorktree`, `Submodule` is `Submodule`, `PossiblyBare` is `Bare`. It
+tells a worktree from a submodule by whether a `commondir` sits beside the private Git directory,
+which is correct where matching `worktrees/` or `modules/` in the path is merely usually right.
+Two caveats: `PossiblyBare` is documented as a guess that can misfire on a freshly `init`ed
+repository with no index, and it is only ever reached by probing a directory that has no `.git`,
+so gate that probe on `HEAD` existing or pay three `stat`s on every directory walked.
+
+**`filter_entry` cannot be where a repository is recorded.** Its contract is that a `false`
+predicate _drops the entry_ and does not descend — so detecting `.git` there means the repository
+never reaches the visitor and is silently omitted. The prune predicate handles names only;
+detection lives in the visitor, which records the row and returns `WalkState::Skip` to stop the
+descent. Related: `ignore::Error` exposes no `path()`, and nests the path up to three layers deep
+inside `WithPath` / `WithDepth` / `WithLineNumber`, so a permission error has to be unwrapped by
+hand before it can be reported against a path. And `WalkState::Quit` is documented as
+asynchronous — more entries can arrive after it, which matters for §6.4 cancellation.
+
+**Local-path submodules are refused by default, which breaks fixture builds.** Since the fix for
+CVE-2022-39253, `git submodule add` rejects the `file` transport, and a plain local path counts.
+The failure is a transport error that reads like a bad path, so it gets debugged as a fixture
+pathing bug. Every `git` invocation in `tests/support/fixtures.rs` passes
+`-c protocol.file.allow=always`. Those invocations also point `GIT_CONFIG_GLOBAL` and
+`GIT_CONFIG_SYSTEM` at a non-existent file, so the developer's own `core.autocrlf`, hooks, and
+templates cannot change the shape of the tree under test.
 
 **`gix::Repository::is_dirty()` ignores untracked files.** Its docs say so, and it disables the
 directory walk internally. A repo whose only change is a new file reports clean. The dirty flag

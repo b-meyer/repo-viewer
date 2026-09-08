@@ -20,10 +20,13 @@
 //! - **Tier 2** — full index-to-worktree counts. Lazy: expanded rows and explicit refresh only,
 //!   never in the default scan path.
 
+pub mod discover;
 pub mod error;
 pub mod model;
 
+pub use discover::{discover_roots, discover_roots_with};
 pub use error::{Error, Result};
 pub use model::{
-    CommitSummary, FileCounts, Head, RepoKind, RepoState, RepoStatus, SubmoduleStatus,
+    CommitSummary, DEFAULT_PRUNE_NAMES, DiscoveredRepo, FileCounts, Head, RepoKind, RepoState,
+    RepoStatus, ScanError, ScanOpts, ScanSummary, SubmoduleStatus,
 };

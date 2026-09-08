@@ -3,10 +3,11 @@
 A cross-platform desktop app: point it at a folder and get a live dashboard of every Git repo
 beneath it — branch, ahead/behind, dirty state, file counts — without opening each one in an IDE.
 
-Status: **Phase 0 complete.** The workspace, the toolchain, and the app shell build and run end to
+Status: **Phase 1 complete.** The workspace, the toolchain, and the app shell build and run end to
 end: `vp check`, `vp run typecheck`, `vp test run`, and `vp run rust` are green, `vp run types`
-generates the bindings, and `vp run build` produces both Windows installers. Next step is Phase 1,
-discovery.
+generates the bindings, and `vp run build` produces both Windows installers. Discovery finds and
+classifies every repository under a root; nothing reads Git objects yet. Next step is Phase 2,
+Tier 0 reads.
 
 ---
 
@@ -273,11 +274,17 @@ shared harness and setup.
 A nested `.git` cannot be committed inside the outer repo, and the cases most worth testing — a
 linked worktree, a submodule, a bare repo (§5.2) — are exactly the ones needing real git
 metadata. So `tests/support/fixtures.rs` builds the tree at test time into a `tempfile::TempDir`
-by shelling out to `git`, and nothing under `tests/fixtures/` is committed.
+by shelling out to `git`. No fixture is committed and none needs to be: the builder is the
+fixture. It carries two `git` invocation requirements that are not obvious and are recorded in
+[AGENTS.md](./AGENTS.md) — `protocol.file.allow=always`, without which a local-path submodule is
+refused, and a `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM` override so the developer's own config
+cannot change the shape of the tree.
 
-Two fixtures exist specifically to pin the §3.1 traps: a repo whose only change is one untracked
-file (Tier 1 must say dirty), and two ahead/behind topologies — a merge from upstream into local,
-and a criss-cross merge — asserted against `git rev-list --left-right --count local...upstream`.
+The tree it builds now covers all four repository kinds plus a pruned directory and a nested
+checkout. Two further fixtures pin the §3.1 traps and arrive with the phases that need them: a
+repo whose only change is one untracked file (Phase 4 — Tier 1 must say dirty), and two
+ahead/behind topologies, a merge from upstream into local and a criss-cross merge (Phase 2),
+asserted against `git rev-list --left-right --count local...upstream`.
 
 Frontend code that reaches `ipc.ts` is tested with `mockIPC` from `@tauri-apps/api/mocks`,
 which intercepts `invoke` and `Channel` traffic without a webview; no hand-rolled mocks.
@@ -333,12 +340,35 @@ Parallel walk from each configured root via `ignore::WalkBuilder`:
 - `max_depth` configurable, default 8.
 - `threads(n)` set explicitly. The walker and the rayon pool each default to the full core count,
   which doubles the thread population during a scan.
-- On finding a repo, record it and **stop descending** by default (config flag to continue).
-  Submodules are enumerated from the parent's config rather than by walking.
+- On finding a repo, record it and **stop descending** by default (config flag to continue). A
+  bare repo is never descended into either way — it _is_ a Git directory, so everything below it
+  is object storage.
+- The `submodules` list on a parent row comes from the parent's config in Tier 0, never from the
+  walk. Whether a submodule also gets a row of its own is exactly what the descend flag decides.
+
+An unspecified `threads` means **half** the core count, not all of it: from Tier 0 onwards the
+walk and the rayon pool run at the same time, so taking both defaults would put twice as many
+threads on the machine as it has cores.
+
+Discovery yields `DiscoveredRepo` — path, name, parent, kind, and the resolved Git directory —
+rather than a partial `RepoStatus`. The §8.1 Tier 0 fields are not `Option`, because a row that
+has been read always has them, and discovery has read nothing; a "partial" row would have to lie.
+This is what `RepoFound` carries, and Tier 0 turns it into a `RepoStatus`. `ScanOpts` and
+`ScanSummary` cross the same boundary and live in `model.rs` beside it.
+
+The Git directory is resolved once, here: `<path>/.git` for a normal repo, `<path>` itself when
+bare, and the private directory the `.git` _file_ names for a worktree or submodule. Later phases
+consume it rather than re-resolving — Tier 0 opens it, and §7.2's watch set is registered against
+it.
 
 ### 5.2 Cases that must be handled
 
 These are what make naive implementations wrong:
+
+The first three are `gix::discover::is_git`'s contract rather than something reimplemented here.
+It follows a `.git` _file_ to the directory it names and then requires a valid HEAD, an `objects/`
+and a `refs/`, and it separates a worktree from a submodule by whether a `commondir` sits beside
+the private Git directory — more robust than matching `worktrees/` or `modules/` in a path.
 
 - **`.git` is often a file, not a directory.** Linked worktrees and submodules write a `.git`
   _file_ containing `gitdir: <path>`. Testing `path.join(".git").is_dir()` silently misses both.
@@ -517,6 +547,11 @@ struct RepoStatus {
 `Option` on every tiered field is load-bearing: the UI must render a partial row honestly
 ("counting…") rather than showing `0` for "unknown". That is the most common bug in this class of
 app. Times are `u64` milliseconds and ids are hex strings for the reasons in §4.2.
+
+The Tier 0 fields are **not** `Option`, which is why discovery has a type of its own —
+`DiscoveredRepo`, with `ScanOpts` and `ScanSummary` beside it (§5.1). A row that has been read
+always has a head and a state; one that has not been read cannot produce them, and a partial
+`RepoStatus` would have to invent them.
 
 Persisted to the JSON store so launch paints last-known state immediately, then reconciles. Every
 cached row renders with its `scanned_at` age until refreshed.
@@ -712,7 +747,7 @@ the built bundle's `import.meta.env.PROD` flag (§3.3).
 
 Each phase gets a runbook in `docs/` when it starts, written against the tree as it exists then,
 and is deleted when the phase completes — durable facts move into README.md and AGENTS.md.
-No phase is currently open; Phase 1 gets the next one.
+No phase is currently open; Phase 2 gets the next one.
 
 **Phase 0 — Environment and structure.** The Cargo workspace with its root `[profile.release]`
 (§4.1), `pnpm-workspace.yaml` with the catalog and the `vite`→core override, `vite.config.ts`
@@ -730,9 +765,26 @@ compiler diagnostics for plain `.ts` through tsgolint, so the package is not a d
 repo. The app icons are still the Tauri placeholders; replacing them is a Phase 8 task, alongside
 signing.
 
-**Phase 1 — Discovery.** `ignore`-based parallel walk, prune list, `.git`-as-file handling,
-bare/worktree detection, `dunce` canonicalisation. _Deliverable:_ a Rust test that finds a
-fixture tree containing a worktree, a submodule, and a bare repo.
+**Phase 1 — Discovery.** One `ignore` parallel walk over every root at once, the §5.1 prune list,
+`.git`-as-file handling, bare/worktree/submodule classification, and `dunce` canonicalisation as
+the deduplication key. `discover_roots` collects and sorts; `discover_roots_with` streams, which
+is the entry point Phase 3 wires to the channel. Discovery has no fallible signature — an
+unreadable root, a permission error, and a broken `.git` are all `ScanSummary.errors` values, so
+one stale drive letter cannot cost the user the roots that did scan.
+
+_Verified:_ nine tests in `crates/repo-scan/tests/discover.rs` against a `git`-built fixture tree
+cover all four repository kinds, stop-at-first-`.git`, the descend flag, pruning with its count,
+overlapping-root and case-differing-root deduplication, a bad root alongside good ones, and
+`max_depth`. A real run over `C:/Working/Source` found 51 repositories across 566 directories in
+58 ms — discovery only, and not the number §2.2 defends, which is Phase 2's. The one §5.2 case with
+no test is a genuine permission failure, which has no portable way to stage; the code path it would
+take is the same one the unreadable-root test exercises.
+
+_Settled by those runs:_ `gix::discover::is_git` already implements every §5.2 classification
+case, so none of it is hand-rolled — see [AGENTS.md](./AGENTS.md). `dirs_pruned` was **0** on the
+real tree: because the walk stops at the first `.git`, the prune list only fires on generated
+directories sitting _outside_ a repository. It is insurance for oddly-shaped trees, not the main
+cost saving, and a future timing regression should not be blamed on it.
 
 **Phase 2 — Tier 0 reads.** `gix` refs, HEAD, upstream resolution, ahead/behind via
 `with_hidden` with the cap, stash count, state flags, `catch_unwind` per repo. _Deliverables:_
@@ -774,9 +826,11 @@ number rather than being removed, because §9 and elsewhere cite these by number
 1. **Write actions.** Read-only plus batch fetch is the §1.2 scope. Confirm it stays that way, or
    accept a much larger surface. _(Blocks Phase 7.)_
 2. ~~**Nested repos.**~~ **Settled:** stop at the first `.git`, with an opt-in flag to keep
-   descending — as §5.1 specifies. Submodules are still enumerated from the parent's config rather
-   than found by walking, so the flag only affects genuinely independent nested checkouts.
-   _(Phase 1 is unblocked.)_
+   descending — as §5.1 specifies. With the flag off a submodule is never reached, because the
+   parent's `.git` stops the descent above it; with the flag on a submodule gets its own row like
+   any other nested checkout. Either way the `submodules` list on the **parent** row is read from
+   the parent's config in Tier 0 rather than by walking, so the two never disagree.
+   _(Delivered in Phase 1.)_
 3. **Fetch policy.** Manual-only, or opt-in periodic background fetch? Recommend manual plus an
    explicit "fetch all"; auto-fetch over VPN on 300 repos is a support burden. _(Blocks Phase 7.)_
 4. **`gix` pin policy.** The exact-pin half is done — `Cargo.toml` pins `=0.87.1` and AGENTS.md

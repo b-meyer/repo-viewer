@@ -13,8 +13,10 @@ A Tauri 2 desktop app: Rust backend, Vue 3 frontend, native installer, no server
 - **[AGENTS.md](./AGENTS.md)** — conventions, hard rules, and the traps. Read before changing code.
 
 Status: the project structure is in place and the shell runs end to end — a window, a page, and a
-`ping` command across the IPC bridge. Discovery and the tiered Git reads are Phase 1 and Phase 2.
-Each phase gets its own runbook in `docs/` while it is being worked on.
+`ping` command across the IPC bridge. Discovery works: the `scan` example walks a tree and reports
+every repository under it, classified, with no GUI in the way. The tiered Git reads that turn those
+into rows are Phase 2, so nothing reads Git objects yet. Each phase gets its own runbook in `docs/`
+while it is being worked on.
 
 ---
 
@@ -43,7 +45,7 @@ flowchart TB
 
     subgraph L4["4 &nbsp;Discovery &mdash; ignore 0.4.33"]
         L4A["WalkBuilder::build_parallel<br/>genuinely parallel descent"]
-        L4B["prune node_modules, target, .venv<br/>resolve .git as file vs dir<br/>same_file_system, max_depth"]
+        L4B["prune node_modules, target, .venv &mdash; WalkState::Skip at the first .git<br/>gix::discover::is_git resolves .git-as-file, bare, worktree, submodule<br/>dunce canonicalisation is the dedup key &middot; same_file_system, max_depth"]
     end
 
     subgraph L5["5 &nbsp;Git reads &mdash; gix 0.87.1, fanned out by rayon 1.12.0, zero C dependencies"]
@@ -191,11 +193,11 @@ repo-viewer/
 │       ├── src/
 │       │   ├── model.rs          # RepoStatus and friends
 │       │   ├── error.rs
-│       │   ├── discover/         # ← Phase 1: parallel walk, prune, .git resolution
+│       │   ├── discover/         # parallel walk, prune, .git → DiscoveredRepo
 │       │   ├── status/           # ← Phase 2/4: tier0 / tier1 / tier2 / ahead_behind
 │       │   ├── watch/            # ← Phase 6: one debounced watcher
 │       │   └── fetch.rs          # ← Phase 7: git CLI subprocess
-│       └── tests/                # ← Phase 1: fixtures built into a TempDir, never committed
+│       └── tests/                # discover.rs + support/fixtures.rs, built into a TempDir
 │
 └── src-tauri/                    # ── THIN shell. Tauri glue only.
     ├── build.rs

@@ -11,7 +11,9 @@
 //! five-minute run fought with `sample_size`. Reach for it later on micro-level pieces
 //! (`ahead_behind` on one repo, the prune predicate) if they profile hot.
 
-use std::{env, path::PathBuf, process::ExitCode, time::Instant};
+use std::{env, path::PathBuf, process::ExitCode};
+
+use repo_scan::{RepoKind, ScanOpts, discover_roots};
 
 fn main() -> ExitCode {
     let Some(root) = env::args_os().nth(1).map(PathBuf::from) else {
@@ -24,14 +26,38 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    let started = Instant::now();
-    // Discovery and the tiered reads land in Phase 1 and Phase 2. Until then this reports the
-    // shape of the run rather than its results, so the harness itself stays compiled and honest.
-    let repos: Vec<repo_scan::RepoStatus> = Vec::new();
-    let elapsed = started.elapsed();
+    // Tier 0 lands in Phase 2 and reports its own timing; this is the discovery number alone.
+    let (repos, summary) = discover_roots(std::slice::from_ref(&root), &ScanOpts::default());
 
-    println!("root:    {}", root.display());
-    println!("repos:   {}", repos.len());
-    println!("elapsed: {elapsed:.3?}");
+    println!("root:      {}", root.display());
+    println!("repos:     {}", summary.repos_found);
+    println!("visited:   {} directories", summary.dirs_visited);
+    println!("pruned:    {} directories", summary.dirs_pruned);
+    println!("elapsed:   {} ms", summary.elapsed_ms);
+
+    let mut kinds = [0_usize; 4];
+    for repo in &repos {
+        let slot = match repo.kind {
+            RepoKind::Normal => 0,
+            RepoKind::Bare => 1,
+            RepoKind::LinkedWorktree => 2,
+            RepoKind::Submodule => 3,
+        };
+        kinds[slot] += 1;
+    }
+    println!(
+        "  normal {}, bare {}, worktree {}, submodule {}",
+        kinds[0], kinds[1], kinds[2], kinds[3]
+    );
+
+    // Never fatal, but never silent either: a pruned or unreadable directory may have held a
+    // repository the user is looking for.
+    if !summary.errors.is_empty() {
+        println!("\nerrors ({}):", summary.errors.len());
+        for error in &summary.errors {
+            println!("  {}: {}", error.path.display(), error.message);
+        }
+    }
+
     ExitCode::SUCCESS
 }

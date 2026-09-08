@@ -1,23 +1,18 @@
 //! Typed errors for the engine.
 //!
-//! Per-repo failures are values on [`crate::model::RepoStatus::error`], never panics and never
-//! fatal to a scan. The variants here are for failures that end an operation outright — a root
-//! that cannot be walked, a watcher that cannot be registered.
+//! Anything a scan can survive is a value rather than an error. A per-repo failure lands on
+//! [`crate::model::RepoStatus::error`]; an unreadable root, a permission failure, or a broken
+//! `.git` lands on [`crate::model::ScanSummary::errors`]. None of those is a panic and none ends
+//! a scan, because one bad path must not cost the user the paths that worked.
+//!
+//! The variants here are for operations that cannot return a partial result at all: a single
+//! named path that turns out not to be a repository, a watcher that cannot be registered.
 
 use std::path::PathBuf;
 
 /// Everything that can go wrong inside the engine.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// A configured root could not be read.
-    #[error("cannot read root `{path}`: {source}")]
-    Root {
-        /// The root that failed.
-        path: PathBuf,
-        /// The underlying I/O failure.
-        source: std::io::Error,
-    },
-
     /// A path that should have been a repository was not one.
     #[error("`{0}` is not a git repository")]
     NotARepository(PathBuf),
