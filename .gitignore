@@ -1,0 +1,32 @@
+# Rust / Cargo. The workspace moves the target directory to the repo root, so it is ignored here
+# rather than under src-tauri/.
+/target/
+
+# Tauri generates capability schemas on build.
+/src-tauri/gen/schemas/
+
+# Node
+node_modules/
+.pnpm-store/
+*.log
+npm-debug.log*
+pnpm-debug.log*
+
+# Build output
+/dist/
+dist-ssr/
+*.local
+
+# Editors and OS
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Playwright MCP session output
+.playwright-mcp/

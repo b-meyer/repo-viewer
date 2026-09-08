@@ -1,0 +1,76 @@
+# ---------------------------------------------------------------------------
+# EVERY VERSION IS EXACT. Deliberate, not incidental.
+#
+# A range that resolves differently six months from now is a build that breaks
+# for someone who cannot diagnose it, and `vite-plus` is 0.x, where a patch
+# bump is a real behaviour change. Bump deliberately via `vp update -L <pkg>`,
+# never by widening a range.
+#
+# `vite-plus`, the vite->core alias, and `vitest` move in LOCKSTEP
+# (`vp update -L vite-plus vite vitest`). Floating any of the three lets core
+# and vite-plus desync across releases, and the npm-alias + overrides scheme
+# does not re-resolve the alias on a range bump — pnpm keeps satisfying stale
+# peer variations from cache.
+#
+# Catalogs are a pnpm-workspace feature, so this file exists even though there
+# is exactly one package here and no `packages:` list.
+# ---------------------------------------------------------------------------
+catalog:
+  '@iconify-json/bi': 1.2.7
+  '@tailwindcss/vite': 4.3.3
+  '@tauri-apps/api': 2.11.1
+  '@tauri-apps/cli': 2.11.4
+  # Pinned to the runtime Node major (24) — do NOT bump above it.
+  '@types/node': 24.13.3
+  '@vitejs/plugin-vue': 6.0.8
+  # Required peer of pinia 4 (`^8.1.5`); pinia does not bundle it.
+  '@vue/devtools-api': 8.2.1
+  '@vue/test-utils': 2.5.0
+  '@vue/tsconfig': 0.9.1
+  '@vueuse/core': 14.4.0
+  bootstrap-icons: 1.13.1
+  jsdom: 30.0.1
+  minisearch: 7.2.0
+  pinia: 4.0.3
+  reka-ui: 2.10.4
+  tailwindcss: 4.3.3
+  # 6.0.3, NOT 7.0.2. TypeScript 7's Go-native compiler exposes no stable
+  # programmatic API, so Volar and vue-tsc cannot use it and SFC type-checking
+  # breaks. vue-tsc's peer range (`>=5.0.0`) will happily install the broken
+  # pair. Review at the TypeScript 7.1 release, not before.
+  typescript: 6.0.3
+  vite: npm:@voidzero-dev/vite-plus-core@0.3.0
+  vite-plus: 0.3.0
+  # 4.1.11, NOT 5.0.0. vite-plus 0.3.0 pins this and every @vitest/* internal
+  # to match.
+  vitest: 4.1.11
+  vue: 3.5.42
+  vue-router: 5.3.1
+  vue-tsc: 3.3.11
+
+catalogMode: prefer
+
+# Written LITERALLY, not as `catalog:`. pnpm does not expand a catalog reference into an `npm:`
+# alias inside `overrides`, so `vite: 'catalog:'` silently leaves real vite in the tree instead of
+# redirecting it to the Vite+ core — and the failure surfaces as a resolution error in an unrelated
+# transitive dependency, which reads like an upstream problem.
+overrides:
+  vite: npm:@voidzero-dev/vite-plus-core@0.3.0
+  vitest: 4.1.11
+
+peerDependencyRules:
+  allowAny:
+    - vite
+    - vitest
+  allowedVersions:
+    vite: '*'
+    vitest: '*'
+
+# pnpm 11+ blocks a dependency's install scripts unless it is named here, and fails the install
+# with ERR_PNPM_IGNORED_BUILDS rather than continuing quietly.
+#
+# `vue-demi` is pinia's Vue 2/3 compatibility shim. Its postinstall rewrites its own dist to point
+# at the Vue 3 entry points; skip it and the package resolves to the wrong build, so this has to be
+# true rather than merely allowed. It is the only dependency in this tree with a build script.
+allowBuilds:
+  vue-demi: true

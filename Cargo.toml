@@ -1,0 +1,46 @@
+[workspace]
+# Stated explicitly: this is a virtual manifest with no `[package]`, so there is no edition for
+# Cargo to infer the resolver from. Resolver 3 is MSRV-aware and needs Rust 1.84+.
+resolver = "3"
+members = ["crates/repo-scan", "src-tauri"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.85" # set by gix 0.87, which is itself edition 2024
+publish = false
+
+# Every version is exact and declared once. Bump deliberately; never widen a range.
+# gix is pre-1.0 and breaks on minor bumps, so treat its upgrades as tasks.
+[workspace.dependencies]
+tauri = "=2.11.5"
+gix = "=0.87.1" # default features only: no network/TLS, so no C dependency
+ignore = "=0.4.33"
+rayon = "=1.12.0"
+notify = "=8.2.0"
+notify-debouncer-full = "=0.7.0"
+tokio = { version = "=1.53.1", features = ["rt-multi-thread", "sync", "time"] }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"
+thiserror = "=2.0.20"
+anyhow = "=1.0.104"
+tracing = "=0.1.44"
+tracing-subscriber = "=0.3.23"
+ts-rs = { version = "=12.0.1", features = ["serde-compat"] }
+dunce = "=1.0.5"
+tempfile = "=3.27.0"
+tauri-build = "=2.6.3"
+tauri-plugin-dialog = "=2.7.3"
+tauri-plugin-store = "=2.4.4"
+tauri-plugin-opener = "=2.5.5"
+tauri-plugin-window-state = "=2.4.1"
+
+# Lives at the workspace root deliberately. Cargo ignores a `[profile.*]` section in a member crate
+# with only a warning, so the same block under src-tauri/ would silently ship an unoptimized binary.
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3 # not "s": this is a scanner, and Tauri's app-size guide is the wrong trade here
+strip = true
+# `panic` is deliberately absent, so it stays "unwind". Per-repo work runs under `catch_unwind` so a
+# gix panic on one corrupt repo becomes RepoStatus.error; "abort" would take the whole app down, and
+# rayon propagates worker panics.

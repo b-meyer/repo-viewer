@@ -1,0 +1,29 @@
+[package]
+name = "repo-scan"
+version = "0.1.0"
+description = "Git repository discovery and tiered status reads. No GUI, no Tauri."
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[features]
+# Off by default: ts-rs is a build-time concern for regenerating src/scripts/generated/, not
+# something the shipped binary needs. `cargo test -p repo-scan --features typescript` writes it.
+typescript = ["dep:ts-rs"]
+
+# NOTE: `tauri` must never appear here. All discovery, Git reads, watching, and fetch live in this
+# crate precisely so the boundary is compile-enforced rather than aspirational.
+[dependencies]
+dunce = { workspace = true }
+gix = { workspace = true }
+ignore = { workspace = true }
+notify = { workspace = true }
+notify-debouncer-full = { workspace = true }
+rayon = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+ts-rs = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

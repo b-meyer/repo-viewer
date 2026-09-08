@@ -2,9 +2,10 @@
 
 A Tauri 2 desktop app: Rust backend, Vue 3 frontend. Points at a folder, reports Git status for
 every repo beneath it. See [README.md](./README.md) for orientation and commands;
-**[PLAN.md](./PLAN.md) is the specification** — design decisions, roadmap, open questions. The
-phase currently being executed has a runbook in `docs/`, linked from PLAN.md §11; start there
-when picking up work.
+**[PLAN.md](./PLAN.md) is the specification** — design decisions, roadmap, open questions. Start
+with PLAN.md §11 when picking up work: it names the current phase, and while one is in progress
+that phase has a runbook in `docs/`. Between phases `docs/` is empty and §11 says so — a missing
+runbook is not a missing file.
 
 This app also exists to prove Tauri + Vue as a delivery pattern for offline client apps against a
 local SQL database. That is why the frontend stack matches `WPT.Dashboard` and why `src-tauri/`
@@ -17,21 +18,20 @@ directly**; `vp install` / `vp add` / `vp remove` / `vp run` delegate through th
 manager and preserve catalog overrides that ad-hoc calls corrupt. (CI uses `pnpm exec vp …` only
 because `vp` is not global on an ADO agent — a pipeline detail, not a pattern to copy.)
 
-| Need | Command |
-|---|---|
-| Dev, full app | `vp run dev` |
-| Dev, frontend only | `vp dev` |
-| Check everything (fmt, lint, `.ts` types) | `vp check` |
-| Auto-fix | `vp check --fix` |
-| Vue SFC type-check | `vp run typecheck` |
-| Tests | `vp test run` |
-| Build + installer | `vp run build`, then `vp run verify` asserts the bundle is a production build |
-| Regenerate TS types | `vp run types` |
-| Add a dependency | `vp add <pkg>` then pin it exact in the catalog |
-| Bump a dependency | `vp update -L <pkg>` |
-| Rust checks | `cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test` |
-| Engine without the GUI | `cargo run --release --example scan -- <path>` |
-| Regenerate TS types | `cargo test --features typescript` |
+| Need                                      | Command                                                                                        |
+| ----------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| Dev, full app                             | `vp run dev`                                                                                   |
+| Dev, frontend only                        | `vp dev`                                                                                       |
+| Check everything (fmt, lint, `.ts` types) | `vp check`                                                                                     |
+| Auto-fix                                  | `vp check --fix`                                                                               |
+| Vue SFC type-check                        | `vp run typecheck` — `vue-tsc` over `src/`; plain `.ts` is covered by `vp check`               |
+| Tests                                     | `vp test run`                                                                                  |
+| Build + installer                         | `vp run build`, then `vp run verify` asserts the bundle is a production build                  |
+| Regenerate TS types                       | `vp run types` — wraps `cargo test -p repo-scan --features typescript`                         |
+| Add a dependency                          | `vp add <pkg>` then pin it exact in the catalog                                                |
+| Bump a dependency                         | `vp update -L <pkg>`                                                                           |
+| Rust checks                               | `vp run rust` — `cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test` |
+| Engine without the GUI                    | `cargo run --release --example scan -- <path>`                                                 |
 
 Imports: configs from `vite-plus`, tests from `vite-plus/test`. **Never `vite` / `vitest`
 direct** — `vite-plus/oxlint-plugin` enforces this.
@@ -47,7 +47,8 @@ Break any of these and the design stops working. They are not style preferences.
   `@tauri-apps/plugin-*` package exists in the frontend.** Components and stores go through
   `ipc.ts`; dialog, opener, and store are reached through the app's own commands, from their
   Rust APIs. Keeps the IPC surface auditable, the capabilities file at `core:default`, and
-  components testable with `mockIPC`.
+  components testable with `mockIPC`. Test files are the one exception: they import
+  `@tauri-apps/api/mocks`, which is the harness rather than the API.
 - **The frontend does no Git logic, no path manipulation, and no filesystem access.** Rust owns
   all of it.
 - **Rust owns the canonical row state.** `src-tauri/src/state.rs` holds the one
@@ -118,25 +119,40 @@ A change notice never crosses IPC on its own: Rust refreshes and pushes the row.
 - **`typescript` stays at 6.0.3 until TypeScript 7.1 ships its programmatic API and `vue-tsc`
   runs on it.** `typescript@7.0.2` is `latest`, but its Go-native compiler exposes no stable API,
   so Volar and `vue-tsc` cannot use it and SFC type-checking breaks. `vue-tsc`'s peer range
-  (`>=5.0.0`) will let you install the broken pair. Two checkers: `vue-tsc` on TS 6 for `.vue`,
-  `tsgo` (from `@typescript/native-preview`) for plain `.ts`. `vp check` does **not** route Vue
-  through `vue-tsc` — that is the `typecheck` task (`vp run typecheck`), which `build` depends
-  on. Review the pin when 7.1 is released, not before; `vue-tsgo` is the interim bridge if it
-  is needed sooner.
+  (`>=5.0.0`) will let you install the broken pair. Review the pin when 7.1 is released, not
+  before; `vue-tsgo` is the interim bridge if it is needed sooner.
+- **Two type checkers, split by file kind.** `vp check` type-checks plain `.ts` — `vite.config.ts`
+  included — through tsgolint, which `lint.options.typeAware` + `typeCheck` enable and which ships
+  inside `vite-plus`; it reports real compiler diagnostics (`TS2322`, `TS2769`), not just lint
+  rules. It does **not** route Vue SFCs through `vue-tsc`; that is `vp run typecheck`, which
+  `build` depends on. A separate `@typescript/native-preview` / `tsgo` package is **not** needed —
+  verified redundant, and `tsgo` is not a dependency of this repo.
+- **`tsconfig.node.json` has no explicit consumer and is still required.** tsgolint discovers it to
+  resolve `@types/node` for `vite.config.ts`. Deleting it because nothing references it turns the
+  config file's type errors into silence.
 - **`vitest` stays at 4.1.11.** `vite-plus` 0.3.0 pins it and every `@vitest/*` internal to match.
   `vite` / `vite-plus` / `vitest` move in **lockstep**.
 - **Node is 24, pinned in `engines` and `.node-version`.** pnpm enforces the `packageManager`
-  field itself; corepack is not part of the setup and is not distributed with Node 25+.
+  field itself; corepack is not part of the setup and is not distributed with Node 25+. Pin and
+  activate with `vp env pin 24.20.0 --target node-version` — no elevated shell, and unlike
+  nvm-windows it actually reads the pin.
+- **Build scripts are allowlisted in `pnpm-workspace.yaml`'s `allowBuilds:`.** pnpm 11+ blocks a
+  dependency's install scripts unless it is named there. A blocked script is reported at install
+  and then forgotten, so the symptom arrives later as a missing native binary. Add the package
+  pnpm names; do not reach for `dangerouslyAllowAllBuilds`.
+- **`app.security.csp` is set in `tauri.conf.json`.** The default is `null`, which is no CSP.
+- **`bundle.active` is `true` in `tauri.conf.json`.** It defaults to **`false`**, and `tauri build`
+  then completes successfully having produced no installer at all.
 - **`[profile.release]` lives in the root `Cargo.toml`.** Cargo ignores profile sections in member
   crates with only a warning, so a `src-tauri`-local block silently ships an unoptimized binary.
 - **`panic = "unwind"` and `opt-level = 3` in that profile.** Per-repo work runs under
   `catch_unwind` so a `gix` panic on one corrupt repo becomes `RepoStatus.error`; `abort` would
   take the app down, and rayon propagates worker panics. Do not copy `panic = "abort"` /
   `opt-level = "s"` from Tauri's app-size guide.
-- **`app.security.csp` is set in `tauri.conf.json`.** The default is `null`, which is no CSP.
 - **`model.rs` types are `gix`-free and `ts-rs`-expressible.** Hex `String` for ids, `u64`
   epoch-ms for times (`ts-rs` has no `SystemTime` impl), `rename_all = "camelCase"`, internally
-  tagged enums.
+  tagged enums. `ts-rs` mirrors serde attributes through its default `serde-compat` feature, so
+  never restate `rename_all` or `tag` as `#[ts(...)]`.
 - **Keep `[lib] name = "..._lib"`** in `src-tauri/Cargo.toml`. The suffix prevents a lib/bin name
   collision on Windows specifically ([cargo#8519](https://github.com/rust-lang/cargo/issues/8519)).
 - `/target/` is gitignored at the **repo root**, not under `src-tauri/` — the workspace moves it.
@@ -144,7 +160,9 @@ A change notice never crosses IPC on its own: Rust refreshes and pushes the row.
 - `thiserror` for the engine's typed errors; `anyhow` only at the `src-tauri` edge. Per-repo
   failures are values on `RepoStatus.error`, never panics, and never fatal to a scan.
 - `ts-rs` output in `src/scripts/generated/` is **committed** so the frontend builds without Rust.
-  Regenerate with `cargo test --features typescript`; CI fails on a diff.
+  Regenerate with `vp run types` (`cargo test -p repo-scan --features typescript`); CI fails on a
+  diff. Keep the `-p`: the `typescript` feature belongs to the engine crate, and scoping to it
+  avoids building `src-tauri` and its whole tree for a type-generation run.
 - Bash under Windows: forward slashes, `/dev/null` (not `NUL`).
 - **Git is read-only for agents.** Prepare commands; do not commit, push, fetch, or pull.
 
@@ -180,8 +198,16 @@ Carried over from `WPT.Dashboard` — keep them identical so lessons transfer.
 
 Each of these has bitten. They are silent, which is why they are written down.
 
+**pnpm 12 is ESM-only, and old launchers cannot start it.** It ships `bin/pnpm.mjs` and no
+`pnpm.cjs`, and its `bin` map changed shape. Launchers that predate it still look for the CJS
+entry and die with `Cannot find module …\pnpm\12.3.4\bin\pnpm.cjs` — which reads as a corrupt
+download rather than a version mismatch, because the tarball did extract correctly. Two on this
+machine were too old: **corepack 0.34.0** (bundled with Node 22) and **`vp` 0.2.2**. `vp upgrade`
+to 0.3.1+ fixes it. Corepack is not part of this setup at all — if a `pnpm` on `PATH` turns out to
+be a corepack shim, that is the bug. Relevant to the Phase 8 CI leg, which installs pnpm itself.
+
 **Tauri's Vite guide has two wrong values.** They fail identically on plain Vite 8 and on
-`vite-plus`, since vite-plus-core 0.3.0 *is* Vite 8.2.2:
+`vite-plus`, since vite-plus-core 0.3.0 _is_ Vite 8.2.2:
 
 - `build.minify: 'esbuild'` is deprecated in Vite 8 and slated for removal; Oxc is the minifier.
   Use `'oxc'`, or omit the key — `'oxc'` is the default.
@@ -190,13 +216,20 @@ Each of these has bitten. They are silent, which is why they are written down.
   `import.meta.env.TAURI_ENV_PLATFORM` is `undefined`. Use `'TAURI_ENV_'`. Config-side
   `process.env.TAURI_ENV_PLATFORM` works either way, which is exactly why it goes unnoticed.
 
-**A production build needs `NODE_ENV=production` *and* `--mode production`.** The `vp` task runner
+**A production build needs `NODE_ENV=production` _and_ `--mode production`.** The `vp` task runner
 sets `NODE_ENV`, and Vite derives `isProduction` from it, overriding `--mode`. A bundle built via
 `vp run build` has `import.meta.env.DEV` **true** and `PROD` **false**, inverting every env guard
 silently. Tauri's `beforeBuildCommand` invokes commands directly rather than through `vp run`, so
 specify `vp build --mode production` there — and assert the built bundle's `PROD` flag in a test.
 
-**`.git` is often a file, not a directory.** Linked worktrees and submodules write a `.git` *file*
+**`ts-rs` generates `u64` as `bigint`, not `number`.** Every time in `model.rs` is `u64` epoch-ms,
+`serde_json` writes it as a JSON number, and `JSON.parse` hands the frontend a `number` — so the
+default binding is a type that is simply false, and the lie only surfaces where someone does
+arithmetic on it. `TS_RS_LARGE_INT = "number"` in `.cargo/config.toml` fixes it. Both entries there
+also set `force = true`, because Cargo's `[env]` defaults to **not** overriding an ambient value,
+which would otherwise redirect the generated output somewhere else entirely.
+
+**`.git` is often a file, not a directory.** Linked worktrees and submodules write a `.git` _file_
 containing `gitdir: <path>`. `path.join(".git").is_dir()` silently misses both. Test existence,
 then resolve. Bare repos have no `.git` at all — detect via `HEAD` + `objects/` + `refs/`.
 
@@ -214,7 +247,7 @@ so `refs/heads/feature/x` and every `refs/remotes/origin/*` update are invisible
 recursively (it is tiny), the git-dir root non-recursively, and `logs/HEAD`.
 
 **Windows long paths bite on the way out, not in.** `std::fs` already applies the `\\?\` prefix
-for long paths, so the walk does not fail on deep `node_modules`. `canonicalize()` *returns*
+for long paths, so the walk does not fail on deep `node_modules`. `canonicalize()` _returns_
 `\\?\C:\...` paths, which render badly, confuse `git` CLI arguments, and compare unequal to the
 typed form. Canonicalize through `dunce`. Junctions and reparse points are reported as symlinks
 by `std`, so `follow_links(false)` covers them.

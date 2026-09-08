@@ -1,0 +1,38 @@
+{
+  "name": "repo-viewer",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A live dashboard of every Git repository beneath a folder.",
+  "license": "UNLICENSED",
+  "type": "module",
+  "dependencies": {
+    "@tauri-apps/api": "catalog:",
+    "@vue/devtools-api": "catalog:",
+    "@vueuse/core": "catalog:",
+    "bootstrap-icons": "catalog:",
+    "minisearch": "catalog:",
+    "pinia": "catalog:",
+    "reka-ui": "catalog:",
+    "vue": "catalog:",
+    "vue-router": "catalog:"
+  },
+  "devDependencies": {
+    "@iconify-json/bi": "catalog:",
+    "@tailwindcss/vite": "catalog:",
+    "@tauri-apps/cli": "catalog:",
+    "@types/node": "catalog:",
+    "@vitejs/plugin-vue": "catalog:",
+    "@vue/test-utils": "catalog:",
+    "@vue/tsconfig": "catalog:",
+    "jsdom": "catalog:",
+    "tailwindcss": "catalog:",
+    "typescript": "catalog:",
+    "vite": "catalog:",
+    "vite-plus": "catalog:",
+    "vue-tsc": "catalog:"
+  },
+  "engines": {
+    "node": ">=24.11.0 <25"
+  },
+  "packageManager": "pnpm@12.3.4"
+}

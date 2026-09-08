@@ -1,0 +1,13 @@
+# `relative = true` resolves the value against the parent of the `.cargo` directory holding this
+# file — i.e. the repo root — and exports it as an absolute path. That makes
+# `cargo test -p repo-scan --features typescript` write to the same place from any working
+# directory. `force = true` because these entries default to NOT overriding an existing
+# environment variable, and an ambient value would silently redirect the output.
+[env]
+TS_RS_EXPORT_DIR = { value = "src/scripts/generated", relative = true, force = true }
+
+# ts-rs 12 maps u64/i64/u128/i128 to `bigint` by default. Every time in model.rs is u64 epoch-ms,
+# serde_json writes it as a JSON number, and JSON.parse hands the frontend a `number` — so a
+# `bigint` binding would be a type that is simply false. This makes the generated TypeScript match
+# the wire.
+TS_RS_LARGE_INT = { value = "number", force = true }

@@ -11,8 +11,10 @@ A Tauri 2 desktop app: Rust backend, Vue 3 frontend, native installer, no server
 
 - **[PLAN.md](./PLAN.md)** — the specification: design decisions, roadmap, open questions.
 - **[AGENTS.md](./AGENTS.md)** — conventions, hard rules, and the traps. Read before changing code.
-- **[docs/phase-0.md](./docs/phase-0.md)** — the current runbook: scaffold the repo. Status is
-  planning; no code yet.
+
+Status: the project structure is in place and the shell runs end to end — a window, a page, and a
+`ping` command across the IPC bridge. Discovery and the tiered Git reads are Phase 1 and Phase 2.
+Each phase gets its own runbook in `docs/` while it is being worked on.
 
 ---
 
@@ -87,12 +89,12 @@ flowchart TB
 
 Nothing. The frontend is bundled into the native binary — no Node, no Rust.
 
-| Platform | Notes |
-|---|---|
-| Windows 11 | WebView2 is inbox; nothing to install |
-| Windows 10 1803+ | WebView2 present on almost all devices; the installer's bootstrapper covers the rest |
-| macOS 10.15+ | WKWebView is part of the OS |
-| Ubuntu 22.04+ / Debian 12+ | `apt` pulls `libwebkit2gtk-4.1-0` from the `.deb` |
+| Platform                   | Notes                                                                                |
+| -------------------------- | ------------------------------------------------------------------------------------ |
+| Windows 11                 | WebView2 is inbox; nothing to install                                                |
+| Windows 10 1803+           | WebView2 present on almost all devices; the installer's bootstrapper covers the rest |
+| macOS 10.15+               | WKWebView is part of the OS                                                          |
+| Ubuntu 22.04+ / Debian 12+ | `apt` pulls `libwebkit2gtk-4.1-0` from the `.deb`                                    |
 
 Ubuntu 20.04 and Debian 11 are **not supported** — Tauri 2 needs webkit2gtk **4.1**, which those
 releases do not ship. See [PLAN.md §10](./PLAN.md) for the full platform matrix.
@@ -102,13 +104,13 @@ disable themselves with an explanation if it is absent.
 
 ### To build it
 
-| | |
-|---|---|
-| Node.js | **24** (Active LTS), pinned in `.node-version`. Install pnpm with `npm i -g pnpm`; it enforces the version in `packageManager` itself. Corepack is not used |
-| Rust | via `rustup`, MSVC host (`x86_64-pc-windows-msvc`). MSRV **1.85**, set by `gix` |
-| Windows | VS C++ build tools — `MSVC v… C++ x64/x86 build tools (Latest)` + `Windows 11 SDK`. Nothing else from the C++ workload is needed |
-| macOS | Xcode Command Line Tools |
-| Linux | `libwebkit2gtk-4.1-dev`, `build-essential`, `libssl-dev`, `librsvg2-dev`, `libxdo-dev` |
+|         |                                                                                                                                                                                                                         |
+| ------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Node.js | **24** (Active LTS), pinned in `.node-version`. `vp env pin 24.20.0 --target node-version` installs and activates it with no elevated shell. pnpm enforces the version in `packageManager` itself; corepack is not used |
+| Rust    | via `rustup`, MSVC host (`x86_64-pc-windows-msvc`). MSRV **1.85**, set by `gix`                                                                                                                                         |
+| Windows | VS C++ build tools — `MSVC v… C++ x64/x86 build tools (Latest)` + `Windows 11 SDK`. Nothing else from the C++ workload is needed                                                                                        |
+| macOS   | Xcode Command Line Tools                                                                                                                                                                                                |
+| Linux   | `libwebkit2gtk-4.1-dev`, `build-essential`, `libssl-dev`, `librsvg2-dev`, `libxdo-dev`                                                                                                                                  |
 
 Verify a Windows toolchain with a real link, not a version print:
 
@@ -124,69 +126,88 @@ and NSIS on the first `tauri build`, so that build needs network access.
 ## Getting started
 
 ```sh
-pnpm install            # or: vp install
+vp env pin 24.20.0 --target node-version    # Node 24, no elevated shell needed
+vp install
 ```
 
 `vp` is the entry point for every command — it fronts Vite, Vitest, oxlint, oxfmt, and the task
 runner. Never call `pnpm` / `npm` / `yarn` scripts directly; see [AGENTS.md](./AGENTS.md).
 
-| Task | Command |
-|---|---|
-| Dev (Vite + Tauri window, hot reload) | `vp run dev` |
-| Frontend only, in a browser | `vp dev` |
-| Type-check, lint, format, test | `vp check` |
-| Fix what is auto-fixable | `vp check --fix` |
-| Unit tests | `vp test run` |
-| Production build + installer | `vp run build` |
-| Rust checks | `cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test` |
-| Scan a tree without the GUI | `cargo run --release --example scan -- C:/Working/Source` |
+The first `vp install` may report dependency build scripts that pnpm has blocked. Add what it names
+to `allowBuilds:` in `pnpm-workspace.yaml`.
+
+| Task                                  | Command                                                   |
+| ------------------------------------- | --------------------------------------------------------- |
+| Dev (Vite + Tauri window, hot reload) | `vp run dev`                                              |
+| Frontend only, in a browser           | `vp dev`                                                  |
+| Format, lint, `.ts` types             | `vp check`                                                |
+| Fix what is auto-fixable              | `vp check --fix`                                          |
+| Vue SFC + config type-check           | `vp run typecheck`                                        |
+| Unit tests                            | `vp test run`                                             |
+| Production build + installer          | `vp run build`, then `vp run verify`                      |
+| Regenerate the TypeScript types       | `vp run types`                                            |
+| Rust checks                           | `vp run rust`                                             |
+| Scan a tree without the GUI           | `cargo run --release --example scan -- C:/Working/Source` |
 
 ---
 
 ## Layout
 
+The target shape. Entries marked with a phase do not exist yet — see the
+[roadmap](./PLAN.md#11-roadmap). Everything unmarked is in the repo now.
+
 ```
 repo-viewer/
-├── Cargo.toml                    # [workspace] + [workspace.dependencies]
+├── Cargo.toml                    # [workspace] + [workspace.dependencies] + [profile.release]
+├── Cargo.lock                    # workspace root, committed
+├── .cargo/config.toml            # TS_RS_EXPORT_DIR + TS_RS_LARGE_INT for type generation
+├── .node-version                 # 24.20.0
+├── index.html                    # <body> is the mount target
 ├── package.json                  # one package; vp fronts every command
-├── pnpm-workspace.yaml           # catalog: only — every version exact, declared once
+├── pnpm-workspace.yaml           # catalog + overrides + allowBuilds — every version exact
 ├── vite.config.ts                # vp config: vite + test + lint + fmt + run.tasks
-├── azure-pipelines.yml
+├── tsconfig.json                 # the app; vue-tsc runs on this
+├── tsconfig.node.json            # node types for vite.config.ts; tsgolint discovers it
+├── tools/scripts/                # build-frontend.mjs, verify-prod-bundle.mjs
+├── azure-pipelines.yml           # ← Phase 8
 │
 ├── src/                          # ── Vue frontend
-│   ├── layout/                   # App.vue shell, Header
+│   ├── layout/                   # App.vue shell, Header.vue
 │   ├── pages/                    # file-based routes; index.vue = /
-│   ├── components/
-│   │   ├── inputs/               # App*.vue reka-ui wrappers — always use at call sites
-│   │   ├── repos/                # RepoTable, RepoRow, FilterBar, DetailDrawer …
-│   │   └── feedback/             # AppToaster, ScanProgress
-│   ├── scripts/                  # ipc.ts, scan.ts, search.ts, router.ts, utils.ts
+│   ├── components/               # ← Phase 3+
+│   │   ├── inputs/               #    App*.vue reka-ui wrappers — always use at call sites
+│   │   ├── repos/                #    RepoTable, RepoRow, FilterBar, DetailDrawer …
+│   │   └── feedback/             #    AppToaster, ScanProgress
+│   ├── scripts/                  # ipc.ts, router.ts  (+ scan.ts, search.ts, utils.ts — Phase 3+)
 │   │   └── generated/            # ts-rs output, committed
-│   ├── stores/                   # Pinia: repos, filters, settings
+│   ├── stores/                   # Pinia: repos  (+ filters, settings — Phase 5)
 │   ├── styles/                   # main.css, theme.css (custom palette)
 │   ├── tests/                    # shared harness only — unit tests sit beside their subject
-│   └── types/                    # ambient .d.ts only
+│   └── types/                    # ambient .d.ts only; route-map.d.ts is generated, committed
 │
 ├── crates/
 │   └── repo-scan/                # ── THE ENGINE. Zero Tauri dependency.
 │       ├── examples/scan.rs      # run the engine without the GUI
 │       ├── src/
-│       │   ├── discover/         # parallel walk, prune, .git resolution
-│       │   ├── status/           # tier0 / tier1 / tier2 / ahead_behind
-│       │   ├── watch/            # one debounced watcher
-│       │   ├── fetch.rs          # git CLI subprocess
 │       │   ├── model.rs          # RepoStatus and friends
-│       │   └── error.rs
-│       └── tests/                # fixtures are built into a TempDir, never committed
+│       │   ├── error.rs
+│       │   ├── discover/         # ← Phase 1: parallel walk, prune, .git resolution
+│       │   ├── status/           # ← Phase 2/4: tier0 / tier1 / tier2 / ahead_behind
+│       │   ├── watch/            # ← Phase 6: one debounced watcher
+│       │   └── fetch.rs          # ← Phase 7: git CLI subprocess
+│       └── tests/                # ← Phase 1: fixtures built into a TempDir, never committed
 │
 └── src-tauri/                    # ── THIN shell. Tauri glue only.
+    ├── build.rs
     ├── tauri.conf.json
     ├── capabilities/             # core:default only — plugins are called from Rust
+    ├── icons/                    # placeholder set; replaced in Phase 8
     └── src/
-        ├── lib.rs                # run(): builder, plugins, state, invoke_handler
-        ├── state.rs              # canonical HashMap<PathBuf, RepoStatus>, tier merge, session channel
-        ├── stream.rs             # domain events → tauri::ipc::Channel
-        └── commands/             # scan, repo, fetch, open, config
+        ├── main.rs               # calls run(); windows_subsystem = "windows" in release
+        ├── lib.rs                # run(): builder, plugins, invoke_handler
+        ├── state.rs              # ← Phase 3: canonical HashMap<PathBuf, RepoStatus>, tier merge
+        ├── stream.rs             # ← Phase 3: domain events → tauri::ipc::Channel
+        └── commands/             # ← Phase 3+: scan, repo, fetch, open, config
 ```
 
 Coming from .NET: there is no `.sln` and no `.csproj`. The root `Cargo.toml` is the workspace

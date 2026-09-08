@@ -1,0 +1,61 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Repo Viewer",
+  "mainBinaryName": "repo-viewer",
+  "version": "0.1.0",
+  "identifier": "net.citsolutions.repoviewer",
+  "build": {
+    "beforeDevCommand": "vp dev",
+    "beforeBuildCommand": "node tools/scripts/build-frontend.mjs",
+    "devUrl": "http://localhost:1420",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "withGlobalTauri": false,
+    "windows": [
+      {
+        "label": "main",
+        "title": "Repo Viewer",
+        "width": 1200,
+        "height": 800,
+        "minWidth": 720,
+        "minHeight": 480,
+        "resizable": true,
+        "center": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis", "msi"],
+    "publisher": "CIT Solutions",
+    "copyright": "Internal to CIT Solutions.",
+    "category": "DeveloperTool",
+    "shortDescription": "A live dashboard of every Git repository beneath a folder.",
+    "longDescription": "Point it at a folder and get a live dashboard of every Git repository beneath it — branch, ahead/behind, dirty state, file counts — without opening each one in an IDE.",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "windows": {
+      "webviewInstallMode": {
+        "type": "downloadBootstrapper",
+        "silent": true
+      }
+    },
+    "macOS": {
+      "minimumSystemVersion": "10.15"
+    },
+    "linux": {
+      "deb": {
+        "depends": ["libwebkit2gtk-4.1-0", "libgtk-3-0"]
+      }
+    }
+  }
+}
