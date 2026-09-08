@@ -13,10 +13,11 @@ A Tauri 2 desktop app: Rust backend, Vue 3 frontend, native installer, no server
 - **[AGENTS.md](./AGENTS.md)** — conventions, hard rules, and the traps. Read before changing code.
 
 Status: the project structure is in place and the shell runs end to end — a window, a page, and a
-`ping` command across the IPC bridge. Discovery works: the `scan` example walks a tree and reports
-every repository under it, classified, with no GUI in the way. The tiered Git reads that turn those
-into rows are Phase 2, so nothing reads Git objects yet. Each phase gets its own runbook in `docs/`
-while it is being worked on.
+`ping` command across the IPC bridge. The engine works without a GUI: the `scan` example walks a
+tree, classifies every repository under it, and reads Tier 0 for each one — branch, upstream,
+ahead/behind, stash count, in-progress state, tip commit, last-fetched age. None of it reaches the
+UI yet; streaming those rows over IPC into a table is Phase 3. Each phase gets its own runbook in
+`docs/` while it is being worked on.
 
 ---
 
@@ -49,7 +50,7 @@ flowchart TB
     end
 
     subgraph L5["5 &nbsp;Git reads &mdash; gix 0.87.1, fanned out by rayon 1.12.0, zero C dependencies"]
-        L5A["Tier 0 &mdash; refs only, sub-ms per repo with a commit-graph<br/>head_ref &middot; rev_walk.with_hidden, capped &middot; commit_graph"]
+        L5A["Tier 0 &mdash; refs only, ~3 ms per repo<br/>head.try_peel_to_id &middot; rev_walk.with_hidden, capped &middot; commit-graph is worth 10x"]
         L5B["Tier 1 &mdash; dirty flag incl. untracked, conflicted from index<br/>status iterator, first item, early exit"]
         L5C["Tier 2 &mdash; full counts, lazy<br/>status, index-to-worktree diff"]
     end
@@ -149,7 +150,8 @@ to `allowBuilds:` in `pnpm-workspace.yaml`.
 | Production build + installer          | `vp run build`, then `vp run verify`                      |
 | Regenerate the TypeScript types       | `vp run types`                                            |
 | Rust checks                           | `vp run rust`                                             |
-| Scan a tree without the GUI           | `cargo run --release --example scan -- C:/Working/Source` |
+| Scan a tree without the GUI           | `cargo run --release --example scan -- C:/Working --rows` |
+| Generate a tree to time against       | `cargo run --release --example synth -- <dir> 120 200`    |
 
 ---
 
@@ -189,15 +191,15 @@ repo-viewer/
 │
 ├── crates/
 │   └── repo-scan/                # ── THE ENGINE. Zero Tauri dependency.
-│       ├── examples/scan.rs      # run the engine without the GUI
+│       ├── examples/             # scan.rs — the engine without a GUI; synth.rs — timing trees
 │       ├── src/
 │       │   ├── model.rs          # RepoStatus and friends
 │       │   ├── error.rs
 │       │   ├── discover/         # parallel walk, prune, .git → DiscoveredRepo
-│       │   ├── status/           # ← Phase 2/4: tier0 / tier1 / tier2 / ahead_behind
+│       │   ├── status/           # tier0.rs + ahead_behind.rs  (tier1 / tier2 — Phase 4)
 │       │   ├── watch/            # ← Phase 6: one debounced watcher
 │       │   └── fetch.rs          # ← Phase 7: git CLI subprocess
-│       └── tests/                # discover.rs + support/fixtures.rs, built into a TempDir
+│       └── tests/                # discover.rs, tier0.rs + support/fixtures.rs, built into TempDirs
 │
 └── src-tauri/                    # ── THIN shell. Tauri glue only.
     ├── build.rs

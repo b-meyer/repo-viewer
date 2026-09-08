@@ -2,5 +2,12 @@
 
 /**
  * An in-progress operation that changes what actions make sense on a row.
+ *
+ * `gix` distinguishes ten operations; these six collapse the ones a dashboard treats alike. A
+ * mailbox application and an interactive rebase are both "rebasing" to a reader deciding whether
+ * a repository is safe to touch, and the sequence variants differ from their single-commit form
+ * only in how many commits remain. Nothing is folded into `Clean`: an operation in progress must
+ * never render as no operation, which is why mapping `gix`'s enum has no wildcard arm — a new
+ * variant upstream becomes a compile error rather than a silent "nothing going on".
  */
-export type RepoState = "clean" | "merging" | "rebasing" | "bisecting" | "cherryPicking";
+export type RepoState = "clean" | "merging" | "rebasing" | "bisecting" | "cherryPicking" | "reverting";

@@ -38,6 +38,13 @@ pub enum RepoKind {
 }
 
 /// An in-progress operation that changes what actions make sense on a row.
+///
+/// `gix` distinguishes ten operations; these six collapse the ones a dashboard treats alike. A
+/// mailbox application and an interactive rebase are both "rebasing" to a reader deciding whether
+/// a repository is safe to touch, and the sequence variants differ from their single-commit form
+/// only in how many commits remain. Nothing is folded into `Clean`: an operation in progress must
+/// never render as no operation, which is why mapping `gix`'s enum has no wildcard arm — a new
+/// variant upstream becomes a compile error rather than a silent "nothing going on".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS), ts(export))]
@@ -46,12 +53,14 @@ pub enum RepoState {
     Clean,
     /// A merge is in progress.
     Merging,
-    /// A rebase is in progress.
+    /// A rebase is in progress, including a mailbox application and an interactive rebase.
     Rebasing,
     /// A bisect is in progress.
     Bisecting,
-    /// A cherry-pick is in progress.
+    /// A cherry-pick is in progress, whether one commit or a sequence.
     CherryPicking,
+    /// A revert is in progress, whether one commit or a sequence.
+    Reverting,
 }
 
 /// Where HEAD points.
@@ -112,6 +121,10 @@ pub struct FileCounts {
 ///
 /// Enumerated from the parent's config rather than by walking, so a submodule is never discovered
 /// twice.
+///
+/// Wholly a Tier 2 value, because none of it can be had from refs. The name and path come from
+/// `.gitmodules`, which is a worktree file and falls back to a full index parse when missing;
+/// `recorded_id` is an index entry; and `head_id` means opening the submodule's own repository.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS), ts(export))]
@@ -149,10 +162,20 @@ pub struct RepoStatus {
     /// Where HEAD points.
     pub head: Head,
     /// Upstream tracking ref, e.g. `origin/main`. `None` when none is configured.
+    ///
+    /// `Some` here with `ahead`/`behind` both `None` is a real and distinct state: the branch has
+    /// an upstream configured, but no local `refs/remotes/*` ref to count against — never fetched,
+    /// or the remote branch was deleted. The name is worth showing; the counts would be invented.
     pub upstream: Option<String>,
-    /// Commits ahead of upstream. `None` when there is no upstream. Capped; see the walk cap.
+    /// Commits ahead of upstream. `None` when there is no upstream configured.
+    ///
+    /// Counted against `refs/remotes/*`, so it is only as fresh as `last_fetched_ms` — never
+    /// present one without the other. A value equal to
+    /// [`AHEAD_BEHIND_CAP`](crate::status::AHEAD_BEHIND_CAP) means "at least that many" and
+    /// renders as `1000+`: the walk stops there because disjoint histories can otherwise traverse
+    /// every commit in the repository.
     pub ahead: Option<u32>,
-    /// Commits behind upstream. `None` when there is no upstream.
+    /// Commits behind upstream. `None` when there is no upstream configured. Capped like `ahead`.
     pub behind: Option<u32>,
     /// The tip commit.
     pub last_commit: Option<CommitSummary>,
@@ -176,8 +199,16 @@ pub struct RepoStatus {
     // ---- Tier 2: full counts. Lazy — expanded rows and explicit refresh only. ----
     /// Full index-to-worktree counts. `None` = not yet computed.
     pub counts: Option<FileCounts>,
-    /// Submodules recorded by this repository.
-    pub submodules: Vec<SubmoduleStatus>,
+
+    /// Submodules recorded by this repository, enumerated from its config rather than by walking.
+    ///
+    /// `None` = not yet computed; `Some(vec![])` = read, and there are none. An empty `Vec` alone
+    /// could not tell those apart, which is the same mistake as rendering an uncomputed count
+    /// as `0`.
+    ///
+    /// Tier 2, in full. Reading it is not a refs operation at any granularity: `.gitmodules` is a
+    /// worktree file, and when it is absent the lookup falls back to parsing the whole index.
+    pub submodules: Option<Vec<SubmoduleStatus>>,
 
     /// When this row was last read, epoch milliseconds. Rendered as an age until refreshed.
     pub scanned_at_ms: u64,
@@ -292,6 +323,24 @@ pub struct ScanError {
     pub path: PathBuf,
     /// Rendered cause. A string because this crosses IPC.
     pub message: String,
+}
+
+/// What a completed Tier 0 pass did, as opposed to what it read.
+///
+/// Deliberately shaped like [`ScanSummary`]: a count, the failures as values, and a duration. The
+/// errors here are repositories that could not be read *at all* — one that was read but whose
+/// ahead/behind or stash count failed carries its own message on [`RepoStatus::error`] instead and
+/// is counted in `repos_read`.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS), ts(export))]
+pub struct Tier0Summary {
+    /// Repositories that produced a row.
+    pub repos_read: u32,
+    /// Repositories that could not be opened or whose HEAD could not be read. Never fatal.
+    pub errors: Vec<ScanError>,
+    /// Wall-clock duration of the pass, milliseconds.
+    pub elapsed_ms: u64,
 }
 
 /// What a completed walk did, as opposed to what it found.

@@ -18,20 +18,21 @@ directly**; `vp install` / `vp add` / `vp remove` / `vp run` delegate through th
 manager and preserve catalog overrides that ad-hoc calls corrupt. (CI uses `pnpm exec vp …` only
 because `vp` is not global on an ADO agent — a pipeline detail, not a pattern to copy.)
 
-| Need                                      | Command                                                                                        |
-| ----------------------------------------- | ---------------------------------------------------------------------------------------------- |
-| Dev, full app                             | `vp run dev`                                                                                   |
-| Dev, frontend only                        | `vp dev`                                                                                       |
-| Check everything (fmt, lint, `.ts` types) | `vp check`                                                                                     |
-| Auto-fix                                  | `vp check --fix`                                                                               |
-| Vue SFC type-check                        | `vp run typecheck` — `vue-tsc` over `src/`; plain `.ts` is covered by `vp check`               |
-| Tests                                     | `vp test run`                                                                                  |
-| Build + installer                         | `vp run build`, then `vp run verify` asserts the bundle is a production build                  |
-| Regenerate TS types                       | `vp run types` — wraps `cargo test -p repo-scan --features typescript`                         |
-| Add a dependency                          | `vp add <pkg>` then pin it exact in the catalog                                                |
-| Bump a dependency                         | `vp update -L <pkg>`                                                                           |
-| Rust checks                               | `vp run rust` — `cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test` |
-| Engine without the GUI                    | `cargo run --release --example scan -- <path>`                                                 |
+| Need                                      | Command                                                                                         |
+| ----------------------------------------- | ----------------------------------------------------------------------------------------------- |
+| Dev, full app                             | `vp run dev`                                                                                    |
+| Dev, frontend only                        | `vp dev`                                                                                        |
+| Check everything (fmt, lint, `.ts` types) | `vp check`                                                                                      |
+| Auto-fix                                  | `vp check --fix`                                                                                |
+| Vue SFC type-check                        | `vp run typecheck` — `vue-tsc` over `src/`; plain `.ts` is covered by `vp check`                |
+| Tests                                     | `vp test run`                                                                                   |
+| Build + installer                         | `vp run build`, then `vp run verify` asserts the bundle is a production build                   |
+| Regenerate TS types                       | `vp run types` — wraps `cargo test -p repo-scan --features typescript`                          |
+| Add a dependency                          | `vp add <pkg>` then pin it exact in the catalog                                                 |
+| Bump a dependency                         | `vp update -L <pkg>`                                                                            |
+| Rust checks                               | `vp run rust` — `cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test`  |
+| Engine without the GUI                    | `cargo run --release --example scan -- <path>` (add `--rows` for one line per repo)             |
+| A tree to time against                    | `cargo run --release --example synth -- <dir> [count] [depth]` — generated, so safe to write to |
 
 Imports: configs from `vite-plus`, tests from `vite-plus/test`. **Never `vite` / `vitest`
 direct** — `vite-plus/oxlint-plugin` enforces this.
@@ -67,7 +68,18 @@ Break any of these and the design stops working. They are not style preferences.
   worktree or submodule whose `.git` is a file. Do not re-resolve it.
 - **Uncomputed tiers render as unknown, never as `0`.** Every tiered field is `Option`, and the UI
   must say "counting…" rather than showing a number it does not have. This is the most common bug
-  in this class of app.
+  in this class of app. The corollary for a repository that cannot be read at all: it produces
+  **no** `RepoStatus`. Tier 0's fields are not `Option`, so a row for it would have to invent a
+  `head`; it stays a `DiscoveredRepo` and the failure is a value on `Tier0Summary.errors`. A
+  repository that _was_ read but lost one field keeps its row, with that field `None` and the cause
+  on `RepoStatus.error`.
+- **Ahead/behind lives in exactly one module.** `status/ahead_behind.rs` is the only file that
+  names `rev_walk`; if that primitive changes, this file is the blast radius. There is deliberately
+  no backend trait. Its `ahead_behind` is the one public function in the engine whose signature
+  names a `gix` type, so that the walk can be exercised on a single repository with a small cap
+  instead of a thousand-commit fixture. `src-tauri` does not call it and has no `gix` dependency to
+  call it with — keep it that way, and do not widen the exception: `model.rs` stays `gix`-free, so
+  nothing from a pre-1.0 crate can cross IPC.
 
 ### The tiered scan
 
@@ -91,7 +103,7 @@ sequenceDiagram
     Note over V: rows paint immediately<br/>tiered fields render as "unknown", never 0
 
     T->>G: Tier 0 - refs only
-    G-->>V: branch, ahead/behind, state, last commit
+    G-->>V: branch, ahead/behind, state, last commit, stash, last-fetched
     Note over V: "what have I not pushed?" answered<br/>with zero worktree I/O
 
     T->>G: Tier 1 - status iterator, first item, early exit
@@ -102,7 +114,7 @@ sequenceDiagram
     U->>V: expand a row
     V->>T: invoke full_status
     T->>G: Tier 2 - full index-to-worktree diff
-    G-->>V: staged / unstaged / untracked / conflicted
+    G-->>V: staged / unstaged / untracked / conflicted, submodule list
 
     W-->>T: debounced change on a git dir
     T->>G: Tier 0 + 1 for that repo
@@ -270,7 +282,72 @@ comes from the status iterator with `untracked_files(Collapsed)`, first item, `s
 **`gix`'s `with_boundary` is not `^rev`.** It stops the walk at the given commits but does not
 hide their ancestors, so ahead/behind over any merged history overcounts. Use `with_hidden`,
 which the docs equate to `^branch-to-not-list`, and cap the walk — disjoint histories can make
-it visit everything.
+it visit everything. It also forces `Sorting::ByCommitTimeCutoff`, which drops commits older than
+the cutoff, so the trap has an undercounting half too.
+
+**`Head::id()` reports the tag, not the commit, on a detached HEAD.** It resolves
+`Detached { peeled, target }` as `peeled.unwrap_or(target)`, and `peeled` is only ever populated
+from a `packed-refs` `^` line — a loose `.git/HEAD` holding a bare object id gives `peeled: None`.
+So a HEAD detached onto an annotated tag hands back the tag's id and calls it a commit. Use
+`Head::try_peel_to_id()`, which reads the object header and peels tags to their end; it costs
+nothing extra on the common symbolic case. `git checkout <annotated-tag>` writes the commit id, so
+git will not put a repository into this state on its own — the fixture for it writes the tag id
+into `.git/HEAD` by hand, because nothing short of that reproduces it.
+
+**`Commit::time()` is the committer's time, not the author's.** Its own doc says to use
+`commit.author()?.time()` for authorship. A rebase rewrites committer time and leaves authorship
+alone, so the committer's clock makes old work look new. And `gix_date::Time.seconds` is a signed
+`i64` that can predate 1970, so converting to `u64` epoch-ms must saturate rather than wrap —
+otherwise a bogus clock lands in the year 584 million.
+
+**`gix` 0.87.1 has no stash API.** The only occurrence of "stash" in the crate is a sample hook
+asset. The count is what `git stash list` reads: the `refs/stash` reflog, one line per entry, via
+`try_find_reference("refs/stash")` then `Reference::log_iter().all()`. Use `all()` and not `rev()`,
+whose own docs call it expensive and only suitable for the last few entries. An absent `refs/stash`
+is a count of zero, not a failure — it is the overwhelmingly common case.
+
+**`FETCH_HEAD` lives in the common directory, not the Git directory.** For a linked worktree
+`Repository::git_dir()` is the private `worktrees/<name>` directory, which never holds one, so
+reading it there reports "never fetched" forever. Use `Repository::common_dir()`. `state()` is the
+opposite case — it reads `git_dir()`, which is correct, because a parked rebase _is_ per-worktree.
+The two accessors are not interchangeable.
+
+**`gix::state::InProgress` has ten variants; `RepoState` has five plus `Clean`.** Map it with **no
+wildcard arm**, so a new variant on the next `gix` bump is a compile error rather than a silent
+`Clean` — reporting an in-progress operation as "nothing going on" is the
+uncomputed-renders-as-zero bug in enum form. `Clean` comes only from `state()` returning `None`.
+The sequence variants fold into their single-commit form, `ApplyMailbox*` into `Rebasing` (git's
+own prompt shows those as `AM`/`AM/REBASE`), and `Revert`/`RevertSequence` into `Reverting`.
+
+**`open_opts` re-runs discovery unless you tell it not to.** By default it joins `.git` onto the
+path and calls `gix_discover::is_git`, repeating per repository the classification the walk already
+did — and `Path::ends_with` compares whole components, so `mirror.git` does not look like a `.git`
+directory to it. Pass `open::Options::default().open_path_as_is(true)` against the resolved
+`git_dir`. `ThreadSafeRepository::open_from_paths` is `pub(crate)`, so one `is_git` validation is
+the floor. Leave the ownership-based trust check alone: it is what downgrades config trust for a
+repository owned by someone else, which is a real case on a share. What cannot be avoided is
+`gix::open` re-parsing the global and system config for every repository; 0.87.1 exposes no shared
+snapshot, and it is the residual per-repo cost in the §11 numbers.
+
+**`Repository::submodules()` is not a refs read at any granularity.** It reads `.gitmodules` from
+the **worktree**, and when that file is absent it falls back to parsing the whole `.git/index` and
+then the HEAD tree. `Submodule::index_id()` parses the index; `head_id()` opens the submodule's own
+repository. So the submodule list is Tier 2 in full — not even names and paths belong in Tier 0.
+`Submodule` also holds an `Rc`, so it is `!Send` and cannot cross a rayon boundary.
+
+**`catch_unwind` around an already-open `Repository` needs `AssertUnwindSafe`,** because the
+repository holds interior mutability for its object caches. A caught panic still runs the process
+panic hook, so a corrupt repository prints a message and a backtrace even on a passing test run —
+the engine does not install a hook, because a library must not own the process's.
+
+**git writes commit-graphs on its own, which invalidates a naive baseline measurement.**
+`git commit` runs `git maintenance run --auto`, and the commit-graph task's threshold
+(`maintenance.commit-graph.auto`) is 100 commits not yet in the graph. A seed repository deep
+enough for a revision walk to be worth measuring therefore writes itself a chained commit-graph
+unasked, `git clone --local` hardlinks it into every clone, and a "without a commit-graph" run
+silently becomes a second "with" one — off by 10× and in the flattering direction. Any generator
+for that comparison passes `-c maintenance.auto=false -c gc.auto=0`, and deletes
+`objects/info/commit-graph{,s}` afterwards to be sure.
 
 **A non-recursive watch on `.git/refs/` misses most ref updates.** It sees only direct children,
 so `refs/heads/feature/x` and every `refs/remotes/origin/*` update are invisible. Watch `refs/`

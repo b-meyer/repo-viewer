@@ -3,11 +3,12 @@
 A cross-platform desktop app: point it at a folder and get a live dashboard of every Git repo
 beneath it — branch, ahead/behind, dirty state, file counts — without opening each one in an IDE.
 
-Status: **Phase 1 complete.** The workspace, the toolchain, and the app shell build and run end to
+Status: **Phase 2 complete.** The workspace, the toolchain, and the app shell build and run end to
 end: `vp check`, `vp run typecheck`, `vp test run`, and `vp run rust` are green, `vp run types`
 generates the bindings, and `vp run build` produces both Windows installers. Discovery finds and
-classifies every repository under a root; nothing reads Git objects yet. Next step is Phase 2,
-Tier 0 reads.
+classifies every repository under a root, and Tier 0 turns each one into a row from refs alone —
+branch, upstream, ahead/behind, stash count, in-progress state, tip commit, last-fetched age. None
+of it is wired to the UI yet. Next step is Phase 3, streaming IPC and a minimal table.
 
 ---
 
@@ -76,11 +77,11 @@ TypeScript and the other a Rust crate.
 Most of what the dashboard shows costs almost nothing; only file counts are expensive. Three
 tiers stream independently, so a row appears before any worktree is touched.
 
-| Tier                | Cost per repo                                                                                                                                  | Yields                                                                                               | When                                                                     |
-| ------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------ |
-| **0 — refs only**   | sub-millisecond; reads `.git/HEAD`, `packed-refs`, loose refs, revwalk with commit-graph                                                       | branch, ahead/behind, upstream, stash count, state flags (rebase/merge/bisect/detached), last commit | immediately, every scan                                                  |
-| **1 — dirty flag**  | early-exit: first item from the status iterator, **untracked files included**; conflicted count read from index stage entries, no worktree I/O | clean/dirty boolean, conflicted count                                                                | streams in right after Tier 0                                            |
-| **2 — full counts** | full index↔worktree diff                                                                                                                       | staged / unstaged / untracked / conflicted                                                           | lazily: expanded rows, explicit refresh — never in the default scan path |
+| Tier                | Cost per repo                                                                                                                                  | Yields                                                                                                                        | When                                                                     |
+| ------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------ |
+| **0 — refs only**   | ~3 ms measured (§11); reads `.git/HEAD`, `packed-refs`, loose refs, `refs/stash` reflog, `FETCH_HEAD` mtime, revwalk with commit-graph         | branch, ahead/behind, upstream, stash count, state flags (rebase/merge/bisect/revert/detached), last commit, last-fetched age | immediately, every scan                                                  |
+| **1 — dirty flag**  | early-exit: first item from the status iterator, **untracked files included**; conflicted count read from index stage entries, no worktree I/O | clean/dirty boolean, conflicted count                                                                                         | streams in right after Tier 0                                            |
+| **2 — full counts** | full index↔worktree diff                                                                                                                       | staged / unstaged / untracked / conflicted                                                                                    | lazily: expanded rows, explicit refresh — never in the default scan path |
 
 Tier 0 alone answers "which repos have unpushed commits?" with zero worktree I/O. This tiering
 matters more to perceived performance than any library choice.
@@ -112,7 +113,7 @@ Two views live outside this document so they sit where they are used:
 | `serde` / `serde_json`           | 1.0.229 / 1.0.151 | IPC payloads                                                               |
 | `thiserror`                      | 2.0.20            | engine errors                                                              |
 | `anyhow`                         | 1.0.104           | `src-tauri` layer only                                                     |
-| `tracing` / `tracing-subscriber` | 0.1.44 / 0.3.23   | scan timings                                                               |
+| `tracing` / `tracing-subscriber` | 0.1.44 / 0.3.23   | structured diagnostics — declared, not yet instrumented                    |
 | `ts-rs`                          | 12.0.1            | TypeScript type generation (§4.2)                                          |
 | `dunce`                          | 1.0.5             | strips the `\\?\` prefix `canonicalize()` returns on Windows (§5.2)        |
 | `tempfile`                       | 3.27.0            | dev-only, test fixtures                                                    |
@@ -140,9 +141,14 @@ Three `gix` traps and their handling:
   exclusive revspecs" — it stops the walk at the given ids but does not hide their ancestors, so
   any merged history overcounts. Ahead/behind is `rev_walk([local]).with_hidden([upstream])`
   counted, then swapped. `with_hidden` warns that disjoint histories may traverse everything, so
-  the walk is capped (~1000, shown as "1000+"). Cost depends on a commit-graph being present;
-  without one every commit is an object decode. Isolated in one module — that module is the seam
-  if the primitive changes; there is no backend trait.
+  the walk is capped (1000, shown as "1000+"). Cost depends on a commit-graph being present;
+  without one every commit is an object decode, and §11 measures that at roughly **10×**. The seam
+  is `crates/repo-scan/src/status/ahead_behind.rs` — the only file naming `rev_walk` — and there
+  is no backend trait. Two settled choices there: `Sorting::BreadthFirst`, because a count needs
+  no ordering and the time-based sortings decode a commit time per commit; and never
+  `first_parent_only`, which would disagree with the `git rev-list` oracle the tests assert
+  against. Equal tips short-circuit to `(0, 0)` with no walk at all, which on a real tree is the
+  common case and where most of the budget is saved.
 - **Pre-1.0, breaks on minor bumps** ([gix#470](https://github.com/GitoxideLabs/gitoxide/issues/470)).
   Pin exact and treat upgrades as tasks.
 
@@ -280,29 +286,53 @@ fixture. It carries two `git` invocation requirements that are not obvious and a
 refused, and a `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM` override so the developer's own config
 cannot change the shape of the tree.
 
-The tree it builds now covers all four repository kinds plus a pruned directory and a nested
-checkout. Two further fixtures pin the §3.1 traps and arrive with the phases that need them: a
-repo whose only change is one untracked file (Phase 4 — Tier 1 must say dirty), and two
-ahead/behind topologies, a merge from upstream into local and a criss-cross merge (Phase 2),
-asserted against `git rev-list --left-right --count local...upstream`.
+There are **two** trees, and they are separate on purpose: `discover.rs` asserts exact
+`repos_found` and `dirs_visited` counts, so adding a repository to the discovery tree would make
+every one of those counts a maintenance tax on tests that do not care about it.
+
+- `build()` — the discovery tree: all four repository kinds, a pruned directory, a nested checkout.
+- `status_tree()` — the Tier 0 tree: a shared bare upstream and clones off it for every ahead/behind
+  topology (in sync, ahead, behind, diverged, a merge from upstream, a criss-cross with two merge
+  bases, no upstream, and a deleted tracking ref), every parked operation, an unborn HEAD, a HEAD
+  detached onto an annotated tag object, stash entries, a bare repo, and a linked worktree. Built
+  once per test binary behind a `OnceLock`, because sixty-odd `git` spawns is not something to
+  repeat per test on Windows.
+
+Ahead/behind is asserted against `git rev-list --left-right --count HEAD...@{upstream}` rather
+than against hand-counted numbers. That is the point: a literal encodes what the author believed
+the topology was, and the topologies worth testing are exactly the ones where that belief is
+unreliable — while git's answer cannot drift from git's behaviour. The literals are kept _as well_,
+so an implementation returning `(0, 0)` everywhere cannot pass by agreeing with an oracle that
+also reads zero.
+
+One fixture still to come: a repo whose only change is one untracked file (Phase 4 — Tier 1 must
+say dirty).
 
 Frontend code that reaches `ipc.ts` is tested with `mockIPC` from `@tauri-apps/api/mocks`,
 which intercepts `invoke` and `Channel` traffic without a webview; no hand-rolled mocks.
 
 **No `criterion`.** Its repeated-sampling model is the wrong shape for a whole-tree scan — 100
-samples of a multi-second operation is a five-minute run fought with `sample_size`. The Phase 2
-deliverable is one recorded number, which is `std::time::Instant` in the example below. Reach for
-`criterion` later for micro-level pieces (`ahead_behind` on one repo, the prune predicate) if
-they profile hot.
+samples of a multi-second operation is a five-minute run fought with `sample_size`. A tier's timing
+is one recorded number, taken with `std::time::Instant` in the examples below. Reach for
+`criterion` only for micro-level pieces if they profile hot; `ahead_behind` takes its cap as a
+parameter, so it is already callable in isolation on a single repository.
 
 ### 4.4 Running the engine without the GUI
 
-`crates/repo-scan/examples/scan.rs`, run as
-`cargo run --release --example scan -- C:/Working/Source`. Cargo compiles `examples/` during
-`cargo test`, so it cannot rot, and it needs no extra crate, manifest, or `clap`. That covers
-producing the timing number, debugging one repo without a webview in the way, and checking
-behaviour in a CI container. Promote to `crates/repo-scan-cli/` with `clap` only once it wants
-subcommands and flags.
+Two examples, and Cargo compiles `examples/` during `cargo test`, so neither can rot. Both need no
+extra crate, manifest, or `clap`. Promote to `crates/repo-scan-cli/` with `clap` only once one of
+them wants subcommands and flags.
+
+- **`scan.rs`** — `cargo run --release --example scan -- C:/Working [--rows]`. Discovery and
+  Tier 0 over a real tree, each timed separately, with the commit-graph population printed beside
+  the timing because a number recorded without it cannot be interpreted. `--rows` prints one line
+  per repository, which is the "debug one repo without a webview in the way" case.
+- **`synth.rs`** — `cargo run --release --example synth -- <dir> [count] [depth]`. Generates a tree
+  of diverged repositories, for the two measurements a real tree cannot give: scale beyond what is
+  on the machine, and a with/without commit-graph pair. Because every repository in it is
+  generated, writing commit-graphs into them is unobjectionable in a way that writing into the
+  user's own repositories is not. It disables git's auto-maintenance for the reason recorded in
+  [AGENTS.md](./AGENTS.md), and refuses to write into a directory that already exists.
 
 ### 4.5 How this maps onto WPT.Dashboard
 
@@ -343,8 +373,10 @@ Parallel walk from each configured root via `ignore::WalkBuilder`:
 - On finding a repo, record it and **stop descending** by default (config flag to continue). A
   bare repo is never descended into either way — it _is_ a Git directory, so everything below it
   is object storage.
-- The `submodules` list on a parent row comes from the parent's config in Tier 0, never from the
-  walk. Whether a submodule also gets a row of its own is exactly what the descend flag decides.
+- The `submodules` list on a parent row comes from the parent's config, never from the walk, so
+  the two can never disagree. Reading it is Tier 2 work rather than Tier 0: `.gitmodules` is a
+  worktree file, and when it is absent the lookup falls back to parsing the whole index. Whether a
+  submodule also gets a row of its own is exactly what the descend flag decides.
 
 An unspecified `threads` means **half** the core count, not all of it: from Tier 0 onwards the
 walk and the rayon pool run at the same time, so taking both defaults would put twice as many
@@ -413,6 +445,11 @@ the Rust side is trusted — which is why all fs access stays in Rust and `tauri
 used. The corollary is that commands validate their own inputs: `open_in`, `refresh_repo` and
 `full_status` accept only a path that is already a key in the canonical repo map (§6.3), never
 an arbitrary string from the webview.
+
+`refresh_repo` is fallible for the §8.1 total-failure grade: a repository that will not open, or
+whose HEAD is unreadable, has no honest `RepoStatus` to return. It reports that failure rather than
+synthesising a row, and the existing row keeps its last-known values with its `scanned_at` age
+showing — which is the same thing a scan does when one repository in a tree cannot be read.
 
 ### 6.2 `Channel<T>` for scan results, not events
 
@@ -523,12 +560,13 @@ struct RepoStatus {
 
     // Tier 0
     head: Head,                  // Branch { name } | Detached { id: String } | Unborn — tagged
-    upstream: Option<String>,
-    ahead: Option<u32>,          // None = no upstream configured; capped, see §3.1
+    upstream: Option<String>,    // Some with ahead/behind None = configured, no tracking ref
+    ahead: Option<u32>,          // None = not computable; == the cap means "at least the cap"
     behind: Option<u32>,
     last_commit: Option<CommitSummary>,
     stash_count: u32,
     state: RepoState,            // Clean | Merging | Rebasing | Bisecting | CherryPicking
+                                 //   | Reverting
     last_fetched_ms: Option<u64>,  // mtime of FETCH_HEAD; None if never fetched (§8.2)
 
     // Tier 1
@@ -537,7 +575,7 @@ struct RepoStatus {
 
     // Tier 2
     counts: Option<FileCounts>,  // staged, unstaged, untracked, conflicted
-    submodules: Vec<SubmoduleStatus>,
+    submodules: Option<Vec<SubmoduleStatus>>,  // names+paths+ids all Tier 2; see below
 
     scanned_at_ms: u64,
     error: Option<String>,       // per-repo failure, never fatal to the scan
@@ -552,6 +590,21 @@ The Tier 0 fields are **not** `Option`, which is why discovery has a type of its
 `DiscoveredRepo`, with `ScanOpts` and `ScanSummary` beside it (§5.1). A row that has been read
 always has a head and a state; one that has not been read cannot produce them, and a partial
 `RepoStatus` would have to invent them.
+
+That splits per-repository failure into two grades, and the split follows from the sentence above
+rather than being an extra rule:
+
+- **Total** — the repository will not open, or its HEAD is unreadable. No `RepoStatus` exists,
+  because there is no honest `head` to give one. The row stays a `DiscoveredRepo` rendering every
+  tiered field as unknown, and the cause lands in `Tier0Summary.errors`. Do not reach for a
+  `Head::Unknown` variant to paper over this: the absence of a row _is_ the signal, and a variant
+  would make every consumer handle a state that means "ignore everything else here".
+- **Partial** — the repository was read, but its upstream, ahead/behind, or stash count failed.
+  The row survives with those fields `None` and the cause on `RepoStatus.error`. Losing one field
+  is not worth losing the row.
+
+`stash_count` is the one non-`Option` field that can be wrong: it has to report a number, so a
+failed read reports `0` and sets `error`. A count is only trustworthy on a row without an error.
 
 Persisted to the JSON store so launch paints last-known state immediately, then reconciles. Every
 cached row renders with its `scanned_at` age until refreshed.
@@ -735,7 +788,8 @@ pipeline detail, not a local pattern. Agents use Node 24 (the Active LTS line) v
 `NodeTool@0` reading `.node-version`, and install pnpm with `npm i -g pnpm@<pinned>`; pnpm then
 enforces the `packageManager` field itself. Rust legs run `cargo fmt --check`,
 `cargo clippy --all-targets -- -D warnings`, and `cargo test` alongside the frontend's
-`vp check`.
+`vp check`. They also run `vp run types` and fail on a diff, which is what actually prevents the
+committed bindings in `src/scripts/generated/` from drifting from `model.rs` (§4.2).
 
 Add a per-platform smoke test that launches the binary headless and asserts the webview
 initializes, so a missing-runtime regression is caught in CI rather than by a user. Also assert
@@ -747,7 +801,7 @@ the built bundle's `import.meta.env.PROD` flag (§3.3).
 
 Each phase gets a runbook in `docs/` when it starts, written against the tree as it exists then,
 and is deleted when the phase completes — durable facts move into README.md and AGENTS.md.
-No phase is currently open; Phase 2 gets the next one.
+No phase is currently open; Phase 3 gets the next one.
 
 **Phase 0 — Environment and structure.** The Cargo workspace with its root `[profile.release]`
 (§4.1), `pnpm-workspace.yaml` with the catalog and the `vite`→core override, `vite.config.ts`
@@ -787,10 +841,34 @@ directories sitting _outside_ a repository. It is insurance for oddly-shaped tre
 cost saving, and a future timing regression should not be blamed on it.
 
 **Phase 2 — Tier 0 reads.** `gix` refs, HEAD, upstream resolution, ahead/behind via
-`with_hidden` with the cap, stash count, state flags, `catch_unwind` per repo. _Deliverables:_
-the topology fixtures of §4.3 passing against `git rev-list`, and a recorded timing over a real
-tree of 100+ repos via `examples/scan.rs`, taken twice — with and without
-`.git/objects/info/commit-graph` present. This is the number the whole design defends.
+`with_hidden` with the cap, stash count, state flags, `catch_unwind` per repo. `read_tier0` for one
+repository; `read_tier0_all` / `read_tier0_all_with` fan out over rayon with the §6.4 cancellation
+check between repos. The submodule list is **not** here — see §5.1.
+
+_Verified:_ twenty tests in `crates/repo-scan/tests/tier0.rs`, with every ahead/behind topology
+agreeing with `git rev-list --left-right --count` and the merge-from-upstream case additionally
+pinned by literal, so the `with_boundary` overcount cannot come back. Timings over the real
+53-repo tree at `C:/Working`: discovery 107 ms, Tier 0 **146 ms** warm and 479 ms cold, one of the
+53 carrying a commit-graph. The commit-graph pair comes from `examples/synth.rs` over a generated
+tree of 120 clones, each 100 commits ahead of its upstream over 200 commits of history:
+**≈3000 ms without a commit-graph, ≈290 ms with**.
+
+_Settled by those runs:_ **Tier 0 costs about 2.8 ms per repository, not a fraction of one**, and
+the residual is `gix::open` re-parsing the global and system config for every repository — gix
+0.87.1 exposes no shared snapshot, so that floor stands until it does. The commit-graph is the
+single biggest lever on top of it, worth roughly **10×**, which is a good deal more than `gix`'s
+own source comment calling it a micro-optimisation suggests. The two numbers look inconsistent
+until you notice what the real tree is: almost none of it has a commit-graph, yet it still lands at
+2.8 ms/repo, because most repositories are in sync and the equal-tips short-circuit skips the walk
+entirely. A tree with genuinely unpushed work pays for the walk, and that is the ≈3000 ms figure.
+So the short-circuit, not the commit-graph, is what makes a typical tree fast — and the
+commit-graph is what stops an atypical one from being slow.
+
+Both measurements are needed because neither tree alone can give both: no real tree on this machine
+reaches 100 repositories, and writing commit-graphs into repositories the user owns is not
+something this project does, so scale and the with/without pair are measured on a generated tree
+instead. `examples/synth.rs` disables git's own auto-maintenance to keep that baseline honest —
+see the trap in [AGENTS.md](./AGENTS.md).
 
 **Phase 3 — Streaming IPC and minimal UI.** Canonical state map and tier merge (§6.3),
 `subscribe` session channel, `scan_roots` with `ScanId` and `cancel_scan` (§6.4), `pick_root`
@@ -829,8 +907,8 @@ number rather than being removed, because §9 and elsewhere cite these by number
    descending — as §5.1 specifies. With the flag off a submodule is never reached, because the
    parent's `.git` stops the descent above it; with the flag on a submodule gets its own row like
    any other nested checkout. Either way the `submodules` list on the **parent** row is read from
-   the parent's config in Tier 0 rather than by walking, so the two never disagree.
-   _(Delivered in Phase 1.)_
+   the parent's config rather than by walking, so the two never disagree — as Tier 2 work, because
+   reading it touches the worktree and the index (§5.1). _(Delivered in Phase 1.)_
 3. **Fetch policy.** Manual-only, or opt-in periodic background fetch? Recommend manual plus an
    explicit "fetch all"; auto-fetch over VPN on 300 repos is a support burden. _(Blocks Phase 7.)_
 4. **`gix` pin policy.** The exact-pin half is done — `Cargo.toml` pins `=0.87.1` and AGENTS.md

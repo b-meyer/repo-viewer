@@ -37,14 +37,24 @@ kind: RepoKind,
 head: Head, 
 /**
  * Upstream tracking ref, e.g. `origin/main`. `None` when none is configured.
+ *
+ * `Some` here with `ahead`/`behind` both `None` is a real and distinct state: the branch has
+ * an upstream configured, but no local `refs/remotes/*` ref to count against — never fetched,
+ * or the remote branch was deleted. The name is worth showing; the counts would be invented.
  */
 upstream: string | null, 
 /**
- * Commits ahead of upstream. `None` when there is no upstream. Capped; see the walk cap.
+ * Commits ahead of upstream. `None` when there is no upstream configured.
+ *
+ * Counted against `refs/remotes/*`, so it is only as fresh as `last_fetched_ms` — never
+ * present one without the other. A value equal to
+ * [`AHEAD_BEHIND_CAP`](crate::status::AHEAD_BEHIND_CAP) means "at least that many" and
+ * renders as `1000+`: the walk stops there because disjoint histories can otherwise traverse
+ * every commit in the repository.
  */
 ahead: number | null, 
 /**
- * Commits behind upstream. `None` when there is no upstream.
+ * Commits behind upstream. `None` when there is no upstream configured. Capped like `ahead`.
  */
 behind: number | null, 
 /**
@@ -80,9 +90,16 @@ conflicted: number | null,
  */
 counts: FileCounts | null, 
 /**
- * Submodules recorded by this repository.
+ * Submodules recorded by this repository, enumerated from its config rather than by walking.
+ *
+ * `None` = not yet computed; `Some(vec![])` = read, and there are none. An empty `Vec` alone
+ * could not tell those apart, which is the same mistake as rendering an uncomputed count
+ * as `0`.
+ *
+ * Tier 2, in full. Reading it is not a refs operation at any granularity: `.gitmodules` is a
+ * worktree file, and when it is absent the lookup falls back to parsing the whole index.
  */
-submodules: Array<SubmoduleStatus>, 
+submodules: Array<SubmoduleStatus> | null, 
 /**
  * When this row was last read, epoch milliseconds. Rendered as an age until refreshed.
  */

@@ -1,6 +1,7 @@
 //! Run the engine without the GUI.
 //!
-//!     cargo run --release --example scan -- C:/Working/Source
+//!     cargo run --release --example scan -- C:/Working
+//!     cargo run --release --example scan -- C:/Working --rows
 //!
 //! This exists to produce the timing number the whole design defends, to debug one repository
 //! without a webview in the way, and to check behaviour in a CI container. Cargo compiles
@@ -11,32 +12,73 @@
 //! five-minute run fought with `sample_size`. Reach for it later on micro-level pieces
 //! (`ahead_behind` on one repo, the prune predicate) if they profile hot.
 
-use std::{env, path::PathBuf, process::ExitCode};
+use std::{
+    env,
+    path::PathBuf,
+    process::ExitCode,
+    sync::atomic::AtomicBool,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
-use repo_scan::{RepoKind, ScanOpts, discover_roots};
+use repo_scan::{
+    DiscoveredRepo, Head, RepoKind, RepoStatus, ScanOpts, discover_roots, read_tier0_all,
+};
 
 fn main() -> ExitCode {
-    let Some(root) = env::args_os().nth(1).map(PathBuf::from) else {
-        eprintln!("usage: scan <path>");
+    let mut args = env::args_os().skip(1);
+    let Some(root) = args.next().map(PathBuf::from) else {
+        eprintln!("usage: scan <path> [--rows]");
         return ExitCode::FAILURE;
     };
+    let rows = args.any(|arg| arg == *"--rows");
 
     if !root.is_dir() {
         eprintln!("not a directory: {}", root.display());
         return ExitCode::FAILURE;
     }
 
-    // Tier 0 lands in Phase 2 and reports its own timing; this is the discovery number alone.
     let (repos, summary) = discover_roots(std::slice::from_ref(&root), &ScanOpts::default());
 
     println!("root:      {}", root.display());
     println!("repos:     {}", summary.repos_found);
     println!("visited:   {} directories", summary.dirs_visited);
     println!("pruned:    {} directories", summary.dirs_pruned);
-    println!("elapsed:   {} ms", summary.elapsed_ms);
+    println!("discovery: {} ms", summary.elapsed_ms);
+    print_kinds(&repos);
 
+    // Never fatal, but never silent either: a pruned or unreadable directory may have held a
+    // repository the user is looking for.
+    print_errors("discovery", &summary.errors);
+
+    println!();
+    let graphs = repos.iter().filter(|repo| has_commit_graph(repo)).count();
+    let (statuses, tier0) = read_tier0_all(&repos, &AtomicBool::new(false));
+
+    // The commit-graph population is printed beside the timing because it is the single biggest
+    // influence on the ahead/behind walk, and a number recorded without it is uninterpretable.
+    println!(
+        "tier 0:    {} ms over {} repos",
+        tier0.elapsed_ms, tier0.repos_read
+    );
+    println!(
+        "  graph:     {graphs} of {} repos have a commit-graph",
+        repos.len()
+    );
+    print_tier0_stats(&statuses);
+    print_errors("tier 0", &tier0.errors);
+
+    if rows {
+        println!();
+        print_rows(&statuses);
+    }
+
+    ExitCode::SUCCESS
+}
+
+/// Print the discovered repositories by kind.
+fn print_kinds(repos: &[DiscoveredRepo]) {
     let mut kinds = [0_usize; 4];
-    for repo in &repos {
+    for repo in repos {
         let slot = match repo.kind {
             RepoKind::Normal => 0,
             RepoKind::Bare => 1,
@@ -49,15 +91,115 @@ fn main() -> ExitCode {
         "  normal {}, bare {}, worktree {}, submodule {}",
         kinds[0], kinds[1], kinds[2], kinds[3]
     );
+}
 
-    // Never fatal, but never silent either: a pruned or unreadable directory may have held a
-    // repository the user is looking for.
-    if !summary.errors.is_empty() {
-        println!("\nerrors ({}):", summary.errors.len());
-        for error in &summary.errors {
-            println!("  {}: {}", error.path.display(), error.message);
-        }
+/// Print what Tier 0 actually found, not just how long it took.
+///
+/// The slowest single repository is called out because one pathological repository is exactly what
+/// a total hides, and it is the thing worth opening next.
+fn print_tier0_stats(statuses: &[RepoStatus]) {
+    let tracked = statuses
+        .iter()
+        .filter(|status| status.upstream.is_some())
+        .count();
+    let unpushed = statuses
+        .iter()
+        .filter(|status| status.ahead.is_some_and(|ahead| ahead > 0))
+        .count();
+    let stale = statuses
+        .iter()
+        .filter(|status| status.behind.is_some_and(|behind| behind > 0))
+        .count();
+    let unknown = statuses
+        .iter()
+        .filter(|status| status.upstream.is_some() && status.ahead.is_none())
+        .count();
+    let degraded = statuses
+        .iter()
+        .filter(|status| status.error.is_some())
+        .count();
+
+    println!(
+        "  upstream:  {tracked} tracked, {} without, {unknown} with no tracking ref",
+        statuses.len() - tracked
+    );
+    println!("  unpushed:  {unpushed} ahead, {stale} behind");
+
+    let stashes: u32 = statuses.iter().map(|status| status.stash_count).sum();
+    println!("  stashes:   {stashes} across the tree");
+
+    let oldest = statuses
+        .iter()
+        .filter_map(|status| status.last_fetched_ms)
+        .min();
+    match oldest {
+        Some(fetched) => println!("  fetched:   oldest is {} days ago", days_since(fetched)),
+        None => println!("  fetched:   none of these have ever been fetched"),
     }
 
-    ExitCode::SUCCESS
+    if degraded > 0 {
+        println!("  degraded:  {degraded} rows carry a field-level error");
+    }
+}
+
+/// One line per row, for debugging a single repository without a webview in the way.
+fn print_rows(statuses: &[RepoStatus]) {
+    for status in statuses {
+        let head = match &status.head {
+            Head::Branch { name } => name.clone(),
+            Head::Detached { id } => format!("detached@{}", &id[..7.min(id.len())]),
+            Head::Unborn => "unborn".to_string(),
+        };
+        let counts = match (status.ahead, status.behind) {
+            (Some(ahead), Some(behind)) => format!("+{ahead}/-{behind}"),
+            _ => "?/?".to_string(),
+        };
+        println!(
+            "  {:<28} {:<22} {:<10} stash {:<3} {:?}{}",
+            truncate(&status.name, 28),
+            truncate(&head, 22),
+            counts,
+            status.stash_count,
+            status.state,
+            status
+                .error
+                .as_deref()
+                .map(|err| format!("  !! {err}"))
+                .unwrap_or_default(),
+        );
+    }
+}
+
+/// Print a list of non-fatal failures, if there are any.
+fn print_errors(stage: &str, errors: &[repo_scan::ScanError]) {
+    if errors.is_empty() {
+        return;
+    }
+    println!("\n{stage} errors ({}):", errors.len());
+    for error in errors {
+        println!("  {}: {}", error.path.display(), error.message);
+    }
+}
+
+/// Whether a repository has a commit-graph on disk, in either layout.
+fn has_commit_graph(repo: &DiscoveredRepo) -> bool {
+    let info = repo.git_dir.join("objects").join("info");
+    info.join("commit-graph").is_file() || info.join("commit-graphs").is_dir()
+}
+
+/// Whole days between `epoch_ms` and now.
+fn days_since(epoch_ms: u64) -> u64 {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|since| since.as_millis() as u64)
+        .unwrap_or(0);
+    now.saturating_sub(epoch_ms) / (1000 * 60 * 60 * 24)
+}
+
+/// Clip `text` to `width` characters so the row table stays aligned.
+fn truncate(text: &str, width: usize) -> String {
+    if text.chars().count() <= width {
+        return text.to_string();
+    }
+    text.chars().take(width - 1).chain(['…']).collect()
 }

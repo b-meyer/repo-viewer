@@ -5,6 +5,10 @@
  *
  * Enumerated from the parent's config rather than by walking, so a submodule is never discovered
  * twice.
+ *
+ * Wholly a Tier 2 value, because none of it can be had from refs. The name and path come from
+ * `.gitmodules`, which is a worktree file and falls back to a full index parse when missing;
+ * `recorded_id` is an index entry; and `head_id` means opening the submodule's own repository.
  */
 export type SubmoduleStatus = { 
 /**

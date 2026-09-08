@@ -26,4 +26,5 @@ tracing = { workspace = true }
 ts-rs = { workspace = true, optional = true }
 
 [dev-dependencies]
+gix = { workspace = true } # integration tests cannot see a regular dependency; same workspace pin
 tempfile = { workspace = true }

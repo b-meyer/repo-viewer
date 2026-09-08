@@ -23,10 +23,12 @@
 pub mod discover;
 pub mod error;
 pub mod model;
+pub mod status;
 
 pub use discover::{discover_roots, discover_roots_with};
 pub use error::{Error, Result};
 pub use model::{
     CommitSummary, DEFAULT_PRUNE_NAMES, DiscoveredRepo, FileCounts, Head, RepoKind, RepoState,
-    RepoStatus, ScanError, ScanOpts, ScanSummary, SubmoduleStatus,
+    RepoStatus, ScanError, ScanOpts, ScanSummary, SubmoduleStatus, Tier0Summary,
 };
+pub use status::{AHEAD_BEHIND_CAP, ahead_behind, read_tier0, read_tier0_all, read_tier0_all_with};
