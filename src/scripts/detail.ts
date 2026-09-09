@@ -18,6 +18,7 @@
  */
 import type { RepoStatus } from '@/scripts/generated/RepoStatus';
 import * as ipc from '@/scripts/ipc';
+import type { OpenTarget } from '@/scripts/ipc';
 import { isRead, useReposStore } from '@/stores/repos';
 
 /// Methods
@@ -57,6 +58,27 @@ export async function ToggleRow(path: string): Promise<void> {
  */
 export async function RefreshDetail(path: string): Promise<void> {
   await Read(path, () => ipc.refreshRepo(path, 'two'));
+}
+
+/**
+ * Opens one row in an external tool.
+ *
+ * Not a read, so it touches none of the tier state: the failure it can produce is a launch failure
+ * and lands in its own map, cleared by the next attempt. There is nothing to show while it runs —
+ * the answer is a window appearing somewhere else — so there is no busy state either.
+ *
+ * @param path - The row whose button was pressed.
+ * @param target - Where to open it.
+ */
+export async function OpenIn(path: string, target: OpenTarget): Promise<void> {
+  const repos = useReposStore();
+  repos.SetOpenError(path, null);
+
+  try {
+    await ipc.openIn(path, target);
+  } catch (error) {
+    repos.SetOpenError(path, error instanceof Error ? error.message : String(error));
+  }
 }
 
 /**

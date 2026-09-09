@@ -115,6 +115,44 @@ describe('repos store', () => {
    * A rescan of the same tree must not collapse the drawers the user has open: expansion describes
    * what they are looking at, not what the previous scan found.
    */
+  /**
+   * What a reconciling scan needs: the rows on screen came from the cache, and the window is
+   * painting them. Clearing them would make it flash empty for the length of a scan.
+   */
+  it('keeps the rows but drops the summaries when only the session is reset', () => {
+    const store = useReposStore();
+    store.Upsert(MakeStatus({ path: 'C:/work/a' }));
+    store.SetTotals(MakeTotals());
+    store.AddRepoErrors([{ path: 'C:/work/b', message: 'HEAD unreadable' }]);
+    store.SetOpenError('C:/work/a', 'could not run `code`');
+
+    store.ResetSummaries();
+
+    expect(store.count).toBe(1);
+    expect(store.totals).toBeNull();
+    expect(store.repoErrors.size).toBe(0);
+    expect(store.openErrors.size).toBe(0);
+  });
+
+  /**
+   * A launch failure has a map of its own. The row's one `error` slot is owned by the tiers that
+   * run during a scan, and the drawer's Tier 2 failures are a third thing again — collapsing any
+   * two of them means one cause erases another.
+   */
+  it('keeps launch failures apart from read failures', () => {
+    const store = useReposStore();
+    store.Upsert(MakeStatus({ path: 'C:/work/a' }));
+
+    store.SetOpenError('C:/work/a', 'could not run `code`');
+
+    expect(store.openErrors.get('C:/work/a')).toBe('could not run `code`');
+    expect(store.detailErrors.size).toBe(0);
+    expect(store.byPath.get('C:/work/a')).toMatchObject({ error: null });
+
+    store.SetOpenError('C:/work/a', null);
+    expect(store.openErrors.size).toBe(0);
+  });
+
   it('keeps expanded rows across a reset', () => {
     const store = useReposStore();
     store.ToggleExpanded('C:/work/alpha');

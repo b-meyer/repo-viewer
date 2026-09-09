@@ -11,6 +11,7 @@
 //! is what keeps a filesystem read from ever parking a runtime worker.
 
 use std::{
+    collections::HashSet,
     path::PathBuf,
     sync::{
         Arc, Mutex, PoisonError,
@@ -21,8 +22,8 @@ use std::{
 };
 
 use repo_scan::{
-    DiscoveredRepo, ScanError, ScanEvent, ScanId, ScanOpts, ScanTotals, discover_roots_with,
-    read_tier0_all_with, read_tier1_all_with,
+    DiscoveredRepo, RepoEvent, ScanError, ScanEvent, ScanId, ScanOpts, ScanTotals,
+    discover_roots_with, read_tier0_all_with, read_tier1_all_with,
 };
 use tauri::ipc::Channel;
 
@@ -36,6 +37,26 @@ use crate::{
 /// Returns when the walk and every Tier 0 batch are done, or when `cancel` is flipped. Either way
 /// the scan is deregistered and exactly one terminal event — [`ScanEvent::Finished`] or
 /// [`ScanEvent::Cancelled`] — reaches the frontend.
+///
+/// # `on_done`, and why it is a closure rather than a trait
+///
+/// The one thing that has to happen after a scan and cannot happen here is writing the row cache,
+/// which needs an `AppHandle` this module deliberately does not have — nothing in it is `async` and
+/// nothing in it knows about Tauri beyond the channel. `scan_roots` has the handle, so it passes a
+/// closure that captures one, and the tests below pass `|_| {}` and keep running with no Tauri
+/// application at all. A trait would buy nothing and cost exactly that property.
+///
+/// It runs on the cancelled path too: rows already read are real, and there is no reason to throw
+/// away a session's worth of them because the user stopped the walk.
+///
+/// # Eviction
+///
+/// A completed scan is the only thing that can know a repository is *gone* rather than merely
+/// unvisited, so it is where rows the walk did not see are dropped — see
+/// [`AppState::retain_scanned`]. Without it a row restored from the cache for a folder that has
+/// since been deleted would survive every scan. The evicted paths go out on the **session** channel
+/// as [`RepoEvent::Removed`], not as a scan event: it is a fact about the map rather than a result
+/// of this scan, and the frontend already applies that variant.
 pub fn run_scan(
     state: Arc<AppState>,
     id: ScanId,
@@ -43,10 +64,13 @@ pub fn run_scan(
     opts: ScanOpts,
     cancel: Arc<AtomicBool>,
     events: Channel<ScanEvent>,
+    on_done: impl FnOnce(&AppState),
 ) {
     let started = Instant::now();
     let mut guard = ScanGuard::new(Arc::clone(&state), id, events.clone());
 
+    // The walker thread takes ownership of `roots`, and eviction needs them again afterwards.
+    let scanned_roots = roots.clone();
     let (found_tx, found_rx) = mpsc::channel::<DiscoveredRepo>();
 
     // The walk runs on its own thread so this one can drain and read at the same time. `found_tx`
@@ -78,6 +102,9 @@ pub fn run_scan(
     let mut errors: Vec<ScanError> = Vec::new();
     let mut tier0_ms = 0_u64;
     let mut tier1_ms = 0_u64;
+    // Every path the walk reported, which is what eviction compares the map against. Discovery
+    // found it, so it exists — whether or not any tier could then read it.
+    let mut seen: HashSet<PathBuf> = HashSet::new();
 
     while let Some(batch) = next_batch(&found_rx, BATCH_MAX, BATCH_WINDOW) {
         if cancel.load(Ordering::Relaxed) {
@@ -85,6 +112,7 @@ pub fn run_scan(
         }
 
         guard.found += batch.len() as u32;
+        seen.extend(batch.iter().map(|repo| repo.path.clone()));
         // Recorded before the batch is emitted, so a `full_status` or `refresh_repo` arriving the
         // instant a row paints can already resolve its Git directory.
         state.record_found(&batch);
@@ -188,7 +216,16 @@ pub fn run_scan(
     }
 
     if cancel.load(Ordering::Relaxed) {
-        return; // The guard emits `Cancelled` with the counts it holds.
+        // No eviction: a cancelled walk has not seen the whole tree, so what it missed is not the
+        // same as what is gone. The guard emits `Cancelled` with the counts it holds.
+        on_done(&state);
+        return;
+    }
+
+    let evicted = state.retain_scanned(&scanned_roots, &seen);
+    if !evicted.is_empty() {
+        tracing::debug!(count = evicted.len(), "evicted rows the scan did not find");
+        state.push(RepoEvent::Removed { paths: evicted });
     }
 
     guard.finish(ScanTotals {
@@ -205,6 +242,8 @@ pub fn run_scan(
         tier0_ms,
         tier1_ms,
     });
+
+    on_done(&state);
 }
 
 /// Lock through a poison rather than cascading one worker's panic into the pipeline.
@@ -353,6 +392,7 @@ mod tests {
             shallow_opts(),
             cancel,
             channel,
+            |_| {},
         );
 
         let events = seen.lock().unwrap_or_else(PoisonError::into_inner).clone();
@@ -420,6 +460,7 @@ mod tests {
             shallow_opts(),
             cancel,
             channel,
+            |_| {},
         );
 
         let events = seen.lock().unwrap_or_else(PoisonError::into_inner).clone();

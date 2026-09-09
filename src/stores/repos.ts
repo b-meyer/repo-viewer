@@ -146,6 +146,16 @@ export const useReposStore = defineStore('repos', () => {
   const detailErrors = ref(new Map<string, string>());
 
   /**
+   * Why a row's last open-in launch failed, by path.
+   *
+   * A third error map rather than a reuse of either of the others, for the reason the row itself
+   * has only one `error` slot and a rule about who may write it: a failed launch is not a failed
+   * read, and it is not a failed command in the page-wide sense either. It belongs to one row and
+   * one button, and it is cleared by the next attempt.
+   */
+  const openErrors = ref(new Map<string, string>());
+
+  /**
    * A failed command — not a per-repository failure, which rides on the row itself.
    */
   const scanError = ref<string | null>(null);
@@ -159,8 +169,9 @@ export const useReposStore = defineStore('repos', () => {
   /**
    * Every row, ordered by folder then name.
    *
-   * The parallel walk emits in an arbitrary order, so unsorted rows look random. This is
-   * presentation ordering only; Phase 5's sort store replaces it.
+   * The parallel walk emits in an arbitrary order, so unsorted rows look random. This is the base
+   * order the table is built from rather than the order it renders: `view.ts` sorts by the column
+   * the user chose, and falls back to exactly this pair when that column has nothing to compare.
    */
   const rows = computed<RepoRow[]>(() =>
     [...byPath.value.values()].toSorted(
@@ -244,20 +255,33 @@ export const useReposStore = defineStore('repos', () => {
   }
 
   /**
-   * Drops every row and every summary, for a fresh scan.
+   * Drops everything the previous scan reported, keeping the rows.
+   *
+   * What a **reconciling** scan needs — the one at launch, over rows restored from the cache. Those
+   * rows are what the window is painting, so clearing them would make them flash and vanish, which
+   * is worse than never having cached them. The scan overwrites each row as it re-reads it, and
+   * Rust evicts the ones it does not find.
    *
    * `expanded` survives on purpose: it describes what the user has open, and a rescan of the same
    * tree should not collapse their drawers. Everything derived from the _previous_ scan's reads
    * goes, including the Tier 2 failures — a fresh scan is a fresh chance for that read to work.
    */
-  function Reset(): void {
-    byPath.value.clear();
+  function ResetSummaries(): void {
     discovery.value = null;
     totals.value = null;
     scanError.value = null;
     repoErrors.value.clear();
     loadingDetail.value.clear();
     detailErrors.value.clear();
+    openErrors.value.clear();
+  }
+
+  /**
+   * Drops every row and every summary, for a scan that starts over.
+   */
+  function Reset(): void {
+    byPath.value.clear();
+    ResetSummaries();
   }
 
   /**
@@ -335,6 +359,17 @@ export const useReposStore = defineStore('repos', () => {
   }
 
   /**
+   * Records why a row's open-in launch failed, or clears it.
+   *
+   * @param path - The row whose button was pressed.
+   * @param message - The failure, or `null` to clear it.
+   */
+  function SetOpenError(path: string, message: string | null): void {
+    if (message === null) openErrors.value.delete(path);
+    else openErrors.value.set(path, message);
+  }
+
+  /**
    * Records a command failure.
    *
    * @param message - The failure, or `null` to clear it.
@@ -361,6 +396,7 @@ export const useReposStore = defineStore('repos', () => {
     expanded,
     loadingDetail,
     detailErrors,
+    openErrors,
     scanError,
     roots,
     rows,
@@ -374,6 +410,7 @@ export const useReposStore = defineStore('repos', () => {
     Remove,
     Clear,
     Reset,
+    ResetSummaries,
     SetPhase,
     SetDiscoverySummary,
     SetTotals,
@@ -381,6 +418,7 @@ export const useReposStore = defineStore('repos', () => {
     ToggleExpanded,
     SetLoadingDetail,
     SetDetailError,
+    SetOpenError,
     SetScanError,
     SetRoots,
   };

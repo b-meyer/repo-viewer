@@ -4,8 +4,8 @@ A Tauri 2 desktop app: Rust backend, Vue 3 frontend. Points at a folder, reports
 every repo beneath it. See [README.md](./README.md) for orientation and commands;
 **[PLAN.md](./PLAN.md) is the specification** — design decisions, roadmap, open questions. Start
 with PLAN.md §11 when picking up work: it names the current phase, and while one is in progress
-that phase has a runbook in `docs/`. Between phases `docs/` is empty and §11 says so — a missing
-runbook is not a missing file.
+that phase has a runbook in `docs/`. Between phases §11 says no phase is open and `docs/` is empty
+— or absent, since git does not track an empty directory. A missing runbook is not a missing file.
 
 This app also exists to prove Tauri + Vue as a delivery pattern for offline client apps against a
 local SQL database. That is why the frontend stack matches `WPT.Dashboard` and why `src-tauri/`
@@ -52,6 +52,31 @@ Break any of these and the design stops working. They are not style preferences.
   `@tauri-apps/api/mocks`, which is the harness rather than the API.
 - **The frontend does no Git logic, no path manipulation, and no filesystem access.** Rust owns
   all of it.
+- **`src-tauri/src/persist.rs` is the only file that uses `tauri_plugin_store`**, beyond the one
+  line in `lib.rs` that registers it. Two files under
+  it, because they have two lifetimes: `settings.json` is what the user meant — roots, the
+  `openIn` commands, and the view state — and is left on the plugin's own auto-save; `cache.json`
+  is the whole row map, written once at the end of a scan and again on exit, with auto-save
+  **disabled**. Everything else asks `persist` for a value or hands it one.
+
+  The view state is the **one shape on the wire `ts-rs` does not generate**. Chips, sort keys and
+  grouping are vocabulary of the table, Rust never reads inside the object, and typing it in Rust
+  would mean either putting UI concepts in the engine crate — the crate the SQL appendix swaps out —
+  or a `ts-rs` derive in `src-tauri` that breaks `vp run types`' `-p` scoping. So it crosses as
+  opaque JSON and `src/scripts/settings.ts` owns the shape, the way `CommandError` crosses as a
+  bare string. The cost is real and is paid there: the file is hand-editable, nothing validates it
+  on the way in, and `parseUiSettings` therefore treats every field as absent until proven
+  otherwise, field by field.
+
+- **A cached row is a claim about the past, and its `scanned_at` age is what makes it honest.**
+  Nothing on the load path refreshes it. Tier 2 is the exception and is dropped on load, because
+  the drawer shows its counts with no age beside them — dropped, the first expand reads them again
+  and says `counting…` while it does, which is true.
+- **Only a completed scan may evict a row.** `AppState::retain_scanned` drops rows the walk did not
+  see, scoped to the roots it walked, and the evicted paths go out on the session channel as
+  `RepoEvent::Removed`. A cancelled walk has not seen the whole tree, so what it missed is not the
+  same as what is gone. This is what lets a launch reconcile remove a repository deleted between
+  sessions — every other row change is an upsert.
 - **Rust owns the canonical row state.** `src-tauri/src/state.rs` holds the one
   `HashMap<PathBuf, RepoStatus>`, merges each tier into it, and sends the full merged row — on the
   scan's `Channel<ScanEvent>` for a scan result, on the session `Channel<RepoEvent>` for a watcher,
@@ -66,8 +91,10 @@ Break any of these and the design stops working. They are not style preferences.
   produced and must not be re-derived. It is a **superset** of the rows — a repository whose HEAD
   was unreadable has an entry here and no row — and which map a command checks follows from what it
   needs: `full_status` requires a row to merge Tier 2 into, so it checks the rows; `refresh_repo`
-  checks this one, which is what lets the §8.1 total-failure grade be retried without rescanning the
-  tree. `remove_root` evicts from both.
+  and `open_in` check this one. For `refresh_repo` that is what lets the §8.1 total-failure grade be
+  retried without rescanning the tree; for `open_in` it is what lets a user reveal the repository
+  that would not open, which is the one they most need to go and look at. `remove_root` evicts from
+  both, and so does the eviction a completed scan performs.
 
 - **The merge is tier ownership, not option preference.** Each tier replaces every field it owns,
   `None` included, and leaves other tiers' fields alone. `upstream`, `ahead`, `behind`,
@@ -114,6 +141,15 @@ Break any of these and the design stops working. They are not style preferences.
 
   And a computed `false` is not an absence: a clean worktree is `Some(false)` and reads "clean".
 
+- **A filter and a sort are two more places the same lie can be told.** Excluding a row whose tier
+  has not run reports it as one that did not match — a `dirty` chip applied mid-scan would silently
+  call every uncounted row clean. So a chip has **three** answers per row in `src/scripts/view.ts`,
+  not two: matched, not matched, and not yet knowable, with the third counted and shown as
+  "N still counting". A row that produced no `RepoStatus` at all is never hidden by a status chip,
+  because it has no field to judge and is the row most worth looking at. And `null` sorts **last in
+  both directions**: it is not a small number, it is no answer, so reversing a sort must not promote
+  every uncomputed value to the top.
+
 - **Ahead/behind lives in exactly one module.** `status/ahead_behind.rs` is the only file that
   names `rev_walk`; if that primitive changes, this file is the blast radius. There is deliberately
   no backend trait. Its `ahead_behind` is the one public function in the engine whose signature
@@ -140,7 +176,10 @@ sequenceDiagram
     participant G as Git reads / gix + rayon
     participant W as Watcher / notify
 
-    U->>V: pick root folder
+    T-->>V: subscribe returns the cached rows
+    Note over V: a launch paints before it scans<br/>each row carries the age of the read that made it
+
+    U->>V: pick root folder, or a launch reconciles
     V->>T: invoke scan_roots with Channel
     T->>D: parallel walk, prune heavy dirs
     D-->>T: DiscoveredRepo streamed - path, kind, resolved git dir
@@ -157,6 +196,9 @@ sequenceDiagram
 
     T-->>V: RepoErrors - repos that produced no row, per batch
     Note over V: so a broken row reads "unreadable" now,<br/>not "counting…" until the scan ends
+
+    T->>T: evict rows the walk did not find, then write the cache
+    Note over T: only a completed scan may evict<br/>a cancelled one has not seen the whole tree
 
     T->>W: register one watcher over N git dirs
 
@@ -566,6 +608,55 @@ opaquely. Always ship the ~60 s poll and refresh-on-focus.
 
 **Ahead/behind is relative to the last fetch, not the remote.** It is measured against
 `refs/remotes/origin/*`. Never present it without the `last_fetched` age beside it.
+
+**`tauri-plugin-store` auto-saves 100 ms after every `set`.** `StoreBuilder::new` defaults to
+`auto_save: Some(Duration::from_millis(100))` and every `set` restarts that debounce, which is
+right for a settings file and wrong for anything large: left on, one scan would serialise the whole
+row map after every write. `cache.json` is built with `disable_auto_save()` and saved explicitly.
+`build` also returns an already-loaded store for the same path, so opening that file once with the
+defaults would leave auto-save on for the rest of the session — which is why `persist.rs` is the
+only place either file is opened.
+
+**`tauri-plugin-window-state` needs no code beyond registering it.** Its `StateFlags::default()` is
+`all()`, it restores in `on_window_ready`, and it saves on `RunEvent::Exit`. Reaching for
+`WindowExt::restore_state` in `setup` adds a second restore rather than the missing one.
+
+Its `.window-state.json` is **not** necessarily beside this app's own two files: the plugin resolves
+`app_config_dir` where `tauri-plugin-store` resolves `app_data_dir`. `dirs` maps both to
+`%APPDATA%` on Windows and both to `Application Support` on macOS, so they coincide there — on
+Linux the window state lands in `~/.config/<identifier>` and `settings.json` in
+`~/.local/share/<identifier>`. Anything documenting "where the app keeps its files" has to say both.
+
+**Windows' `PATH` search inside `std::process::Command` only appends `.exe`.** So
+`Command::new("code")` cannot find `code.cmd` — the shim every VS Code install actually puts on
+`PATH` — and fails with "program not found" as though nothing were installed.
+`commands/open.rs`'s `resolve_in` walks `PATH` against `PATHEXT` instead, which is what the shell
+does. Going through `cmd.exe /C` also works and is the obvious fix; it is not used, because it puts
+a second layer of argument parsing between a repository path and the program meant to receive it.
+Note that the resolved path carries the casing of the extension that matched rather than the one on
+disk — `code.CMD` for a `code.cmd` — because Windows compares them case-insensitively, so a test
+asserting the exact path fails for a reason that has nothing to do with the lookup.
+
+**`CREATE_NO_WINDOW` is exactly wrong for a terminal.** Every `git` invocation needs it or the
+fetch flashes a console; a spawned terminal must not have it, because the console is the point of
+the launch. Same platform, same flag, opposite answers — which is why `commands/open.rs` decides it
+per target rather than setting it once in a helper.
+
+**`vue-tsc` type-checks the props object, so a fallthrough attribute on an `App*` wrapper is a
+compile error.** Passing `:title` to a wrapper that does not declare it fails the typecheck even
+though Vue would happily land it on the root element at runtime — so a wrapper has to declare every
+attribute its call sites use. Two consequences worth knowing before hitting them: a `reka-ui`
+primitive that declares no such prop needs `as-child` and a real element of ours underneath, which
+is how `AppToggle` carries a tooltip; and a prop must not be called `ariaLabel`, because
+`aria-label` is a genuine HTML attribute and Volar resolves the call site as the attribute rather
+than as the prop. `AppInput` calls it `label` for that reason.
+
+**A component whose template has a comment before its root element is multi-root.** There is then no
+single root to hang attributes on, and `wrapper.attributes()` in a test stops seeing them, so
+rationale above the root belongs in the `<script setup>` doc block instead. Moving it is not always
+enough: a `reka-ui` primitive can make a component multi-root on its own — `Toggle` renders a
+trailing `<!--v-if-->` beside the button — so a test for a wrapped primitive should find the element
+it means rather than trust the root.
 
 ## External docs — fetch, do not guess
 

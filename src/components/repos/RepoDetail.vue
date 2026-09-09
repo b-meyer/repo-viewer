@@ -60,8 +60,8 @@
       {{ detailError }}
     </app-alert>
 
-    <!-- Refresh -->
-    <div class="flex items-center gap-8">
+    <!-- Actions -->
+    <repo-actions :open-error="openError" @open="emit('open', $event)">
       <app-button
         label="Re-read"
         variant="outline"
@@ -71,7 +71,7 @@
         @click="emit('refresh')"
       />
       <span class="text-11 text-gray-500" v-text="`Read ${formatAge(row.scannedAtMs, now)}`" />
-    </div>
+    </repo-actions>
   </div>
 </template>
 
@@ -80,8 +80,10 @@ import { computed } from 'vue';
 import AppAlert from '@/components/feedback/AppAlert.vue';
 import AppUnknown, { type UnknownReason } from '@/components/feedback/AppUnknown.vue';
 import AppButton from '@/components/inputs/AppButton.vue';
+import RepoActions from '@/components/repos/RepoActions.vue';
 import type { FileCounts } from '@/scripts/generated/FileCounts';
 import type { RepoStatus } from '@/scripts/generated/RepoStatus';
+import type { OpenTarget } from '@/scripts/ipc';
 import { formatAge, shortId } from '@/scripts/utils';
 
 /// Setup
@@ -100,6 +102,10 @@ const props = defineProps<{
    */
   detailError: string | null;
   /**
+   * Why the last open-in launch failed, if it did.
+   */
+  openError: string | null;
+  /**
    * The current time, for the age line.
    */
   now: number;
@@ -110,6 +116,10 @@ const emit = defineEmits<{
    * The user asked for a fresh read.
    */
   refresh: [];
+  /**
+   * The user asked to open this repository elsewhere.
+   */
+  open: [target: OpenTarget];
 }>();
 
 /// Computed

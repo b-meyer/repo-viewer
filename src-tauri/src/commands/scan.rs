@@ -4,7 +4,7 @@ use std::{path::PathBuf, sync::Arc};
 
 use anyhow::anyhow;
 use repo_scan::{ScanEvent, ScanId, ScanOpts};
-use tauri::{State, ipc::Channel};
+use tauri::{AppHandle, State, ipc::Channel};
 
 use crate::{error::CommandResult, state::AppState};
 
@@ -20,8 +20,12 @@ use crate::{error::CommandResult, state::AppState};
 /// `async` so the handler never runs inline on the event-loop thread. It does not await the
 /// pipeline — `spawn_blocking` is fired and the id returned, because the id is what the caller
 /// needs in order to cancel.
+///
+/// Not awaiting the pipeline is also why the row cache is written from a closure handed *to* it
+/// rather than after an await here: by the time this command returns, the scan has not started.
 #[tauri::command]
 pub async fn scan_roots(
+    app: AppHandle,
     state: State<'_, Arc<AppState>>,
     roots: Vec<PathBuf>,
     opts: ScanOpts,
@@ -44,7 +48,10 @@ pub async fn scan_roots(
     // `JoinHandle` is deliberately dropped: nothing awaits the pipeline, and the task runs on.
     let handle = Arc::clone(&state);
     tauri::async_runtime::spawn_blocking(move || {
-        crate::pipeline::run_scan(handle, id, roots, opts, cancel, on_event);
+        crate::pipeline::run_scan(handle, id, roots, opts, cancel, on_event, |state| {
+            // After the terminal event, so nothing a user is waiting for is behind this write.
+            crate::persist::save_cache(&app, state);
+        });
     });
 
     Ok(id)

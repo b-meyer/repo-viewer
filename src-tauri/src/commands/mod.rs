@@ -7,16 +7,20 @@
 //! regardless of where the webview says it came from: `scan_roots` accepts only a configured root,
 //! and commands taking a repository path accept only a key of the canonical map.
 
+mod open;
 mod repo;
 mod roots;
 mod scan;
 mod session;
+mod settings;
 
 // Glob re-exports, not named ones. `#[tauri::command]` generates a `__cmd__<name>` macro beside
 // each function and `generate_handler!` needs both; a named `pub use` carries the function and
 // leaves the macro behind, which fails as "cannot find `__cmd__<name>`" at the registration site
 // rather than at the export.
+pub use open::*;
 pub use repo::*;
 pub use roots::*;
 pub use scan::*;
 pub use session::*;
+pub use settings::*;

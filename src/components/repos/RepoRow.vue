@@ -7,20 +7,19 @@
     <!-- Repository -->
     <td class="px-10">
       <div class="flex items-center gap-8">
-        <!-- Only a row with a status has anything to expand: Tier 2 fills fields on a `RepoStatus`,
-             and Rust refuses the command without one. A failed row keeps its place in the layout
-             rather than shifting its name left. -->
+        <!-- Every row expands, including one Tier 0 could not read. That row has no counts to
+             fetch — `ToggleRow` issues no command for it — but its drawer is where its failure is
+             explained and where the buttons that open it elsewhere live, which is what a user
+             actually wants from a broken row. -->
         <button
-          v-if="status"
           class="text-11 flex h-16 w-16 items-center justify-center rounded text-gray-500 hover:bg-gray-100 hover:text-gray-700"
           type="button"
           :aria-expanded="expanded"
-          :title="expanded ? 'Hide details' : 'Show file counts and submodules'"
+          :title="expandTitle"
           @click="emit('toggle')"
         >
           <i :class="['bi', expanded ? 'bi-chevron-down' : 'bi-chevron-right']" />
         </button>
-        <span v-else class="h-16 w-16" />
 
         <i
           v-if="failed"
@@ -121,27 +120,44 @@
        that spans the table, and `colspan` is how a table says "full width". A plain `v-if` and not
        a `reka-ui` Collapsible — that primitive wraps its content in elements of its own, which are
        not valid between a `<tr>` and its cells. -->
-  <tr v-if="status && expanded" :class="rowTone">
+  <tr v-if="expanded" :class="rowTone">
     <td :colspan="colspan" class="p-0">
       <repo-detail
+        v-if="status"
         :row="status"
         :loading="loadingDetail"
         :detail-error="detailError"
+        :open-error="openError"
         :now="now"
         @refresh="emit('refresh')"
+        @open="emit('open', $event)"
       />
+
+      <!-- No status, so there is nothing to count and nothing to re-read. What is left is the
+           reason, and the ways out of the app. -->
+      <div v-else class="bg-gray-25 border-gray-150 flex flex-col gap-12 border-b px-10 py-12">
+        <app-alert v-if="failed" tone="error" title="This repository could not be read">
+          {{ readError ?? 'Its HEAD could not be read, so no row could be produced for it.' }}
+        </app-alert>
+        <app-unknown v-else reason="pending" hint="Tier 0 has not reached this repository yet." />
+
+        <repo-actions :open-error="openError" @open="emit('open', $event)" />
+      </div>
     </td>
   </tr>
 </template>
 
 <script setup lang="ts">
 import { computed } from 'vue';
+import AppAlert from '@/components/feedback/AppAlert.vue';
 import AppUnknown from '@/components/feedback/AppUnknown.vue';
 import AheadBehind from '@/components/repos/AheadBehind.vue';
+import RepoActions from '@/components/repos/RepoActions.vue';
 import RepoDetail from '@/components/repos/RepoDetail.vue';
 import RepoHead from '@/components/repos/RepoHead.vue';
 import RepoStateBadge from '@/components/repos/RepoStateBadge.vue';
 import type { RepoKind } from '@/scripts/generated/RepoKind';
+import type { OpenTarget } from '@/scripts/ipc';
 import { formatAge } from '@/scripts/utils';
 import { type RepoRow, isRead } from '@/stores/repos';
 
@@ -176,6 +192,10 @@ const props = defineProps<{
    */
   detailError: string | null;
   /**
+   * Why this row's last open-in launch failed, if it did.
+   */
+  openError: string | null;
+  /**
    * How many columns the table has, for the drawer's `colspan`.
    *
    * Passed rather than restated here: `RepoTable` owns the column list, and a second copy of its
@@ -194,6 +214,10 @@ const emit = defineEmits<{
    * The user asked the drawer for a fresh read.
    */
   refresh: [];
+  /**
+   * The user asked to open this repository elsewhere.
+   */
+  open: [target: OpenTarget];
 }>();
 
 /// Computed
@@ -226,6 +250,16 @@ const failed = computed(
  * Which absence the tiered cells show, before Tier 0 finishes and after.
  */
 const absent = computed(() => (failed.value ? ('unreadable' as const) : ('pending' as const)));
+
+/**
+ * What the expander offers, which is not the same thing on every row.
+ */
+const expandTitle = computed(() => {
+  if (props.expanded) return 'Hide details';
+  return status.value === null
+    ? 'Show why this repository could not be read'
+    : 'Show file counts and submodules';
+});
 
 /**
  * A failed row is tinted red, a partial one orange.

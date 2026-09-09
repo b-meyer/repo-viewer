@@ -10,6 +10,19 @@
       @remove="Remove"
     />
 
+    <filter-bar
+      :chips="view.chips"
+      :query="view.query"
+      :group-by-folder="view.groupByFolder"
+      :counts="repoView"
+      :total="repos.count"
+      :disabled="!bridgeReady"
+      @chip="view.ToggleChip"
+      @update:query="view.SetQuery"
+      @update:group-by-folder="view.SetGroupByFolder"
+      @clear="view.ClearFilters"
+    />
+
     <div v-if="repos.scanError" class="px-20 pt-10">
       <app-alert tone="error" title="The scan failed">{{ repos.scanError }}</app-alert>
     </div>
@@ -23,34 +36,45 @@
     />
 
     <repo-table
-      :rows="repos.rows"
+      :groups="repoView.groups"
+      :sort-key="view.sortKey"
+      :sort-direction="view.sortDirection"
       :now="now"
       :repo-errors="repos.repoErrors"
       :tier0-done="repos.tier0Done"
       :expanded="repos.expanded"
       :loading-detail="repos.loadingDetail"
       :detail-errors="repos.detailErrors"
+      :open-errors="repos.openErrors"
       :empty-message="emptyMessage"
       @toggle="ToggleRow"
       @refresh="RefreshDetail"
+      @open="OpenIn"
+      @sort="view.SortBy"
     />
   </div>
 </template>
 
 <script setup lang="ts">
-import { useNow } from '@vueuse/core';
-import { computed, inject, onMounted, ref } from 'vue';
+import { useNow, watchDebounced } from '@vueuse/core';
+import { computed, inject, ref, watch } from 'vue';
 import AppAlert from '@/components/feedback/AppAlert.vue';
 import ScanProgress from '@/components/feedback/ScanProgress.vue';
+import FilterBar from '@/components/repos/FilterBar.vue';
 import RepoTable from '@/components/repos/RepoTable.vue';
 import RootBar from '@/components/repos/RootBar.vue';
-import { RefreshDetail, ToggleRow } from '@/scripts/detail';
+import { OpenIn, RefreshDetail, ToggleRow } from '@/scripts/detail';
 import * as ipc from '@/scripts/ipc';
-import { CancelScan, StartScan } from '@/scripts/scan';
+import { CancelScan, ReconcileOnLaunch, StartScan } from '@/scripts/scan';
+import { indexVersion, searchPaths } from '@/scripts/search';
+import { parseUiSettings } from '@/scripts/settings';
+import { buildView } from '@/scripts/view';
 import { useReposStore } from '@/stores/repos';
+import { useViewStore } from '@/stores/view';
 
 /// Composed
 const repos = useReposStore();
+const view = useViewStore();
 
 /**
  * One clock for the whole page, passed down as a prop.
@@ -66,6 +90,24 @@ const clock = useNow({ interval: 30_000 });
  */
 const bridgeReady = inject('bridgeReady', ref(true));
 
+/// Data
+/**
+ * The view as last written to disk, serialised.
+ *
+ * What the persisting watcher compares against, and it earns its place twice over. `view.settings`
+ * is a `computed` that builds a new object every evaluation, so a watcher on it fires on any
+ * dependency change rather than on a real one — and {@link Hydrate} applying the saved view is
+ * itself such a change, which would make the first thing every launch does a write-back of what it
+ * just read.
+ */
+let persisted = '';
+
+/**
+ * Whether {@link Hydrate} has been started. Not a `ref`: nothing renders it, and it exists only to
+ * keep the watcher below from running twice.
+ */
+let hydrating = false;
+
 /// Computed
 /**
  * The clock as epoch milliseconds, which is what every row field is measured in.
@@ -73,14 +115,73 @@ const bridgeReady = inject('bridgeReady', ref(true));
 const now = computed(() => clock.value.getTime());
 
 /**
+ * Paths the search matched, or `null` when there is no query.
+ *
+ * `indexVersion` is read here rather than inside the search: the index is a `shallowRef` whose
+ * mutations notify nothing, so this is where the table declares that its results depend on a corpus
+ * that is still streaming in.
+ */
+const matches = computed(() => searchPaths(view.query, indexVersion.value));
+
+/**
+ * What the table renders, and what it is withholding.
+ */
+const repoView = computed(() => buildView(repos.rows, view.settings, now.value, matches.value));
+
+/**
  * What the table says when it has no rows, which depends on why it has none.
+ *
+ * The filtered case comes first among the ones that can coexist: with rows in the store and none on
+ * screen, the filters are the explanation, and "No repositories found under the configured folders"
+ * would blame the tree for something the toolbar did.
  */
 const emptyMessage = computed(() => {
+  if (repos.count > 0 && view.filtering) return 'No repositories match the current filters.';
   if (repos.roots.length === 0) return 'Add a folder to scan.';
   if (repos.phase === 'idle') return 'Ready. Press Scan.';
   if (repos.scanning) return 'Searching…';
   return 'No repositories found under the configured folders.';
 });
+
+/// Watchers
+/**
+ * Hydrates as soon as the bridge is up, and not before.
+ *
+ * A watcher rather than `onMounted`, because a child's `onMounted` runs **before** its parent's:
+ * the layout has not finished its `ping` by the time this page mounts, so `bridgeReady` is still
+ * false here and a mount-time check would give up on a bridge that was merely still connecting.
+ * With persisted roots that is the difference between a launch that reconciles and one that shows
+ * an empty table until the user presses Scan.
+ *
+ * `immediate` for the case where the bridge is already up — a route change back to this page — and
+ * guarded, so neither path can run it twice.
+ */
+watch(
+  bridgeReady,
+  (ready) => {
+    if (ready && !hydrating) {
+      hydrating = true;
+      void Hydrate();
+    }
+  },
+  { immediate: true },
+);
+
+/**
+ * Persists the view whenever it differs from what is on disk.
+ *
+ * Debounced because a chip is often two clicks and a sort three, and each would otherwise be its
+ * own command. The delay is invisible: nothing reads this back until the next launch.
+ */
+watchDebounced(
+  () => JSON.stringify(view.settings),
+  (next) => {
+    if (next === persisted) return;
+    persisted = next;
+    void Persist();
+  },
+  { debounce: 400 },
+);
 
 /// Methods
 /**
@@ -110,7 +211,7 @@ async function Remove(root: string): Promise<void> {
 }
 
 /**
- * Scans every configured root.
+ * Scans every configured root, starting over.
  */
 async function Scan(): Promise<void> {
   await StartScan(repos.roots);
@@ -123,9 +224,39 @@ async function Cancel(): Promise<void> {
   await CancelScan();
 }
 
-/// Lifecycle
-onMounted(async () => {
-  if (!bridgeReady.value) return;
+/**
+ * Writes the view state.
+ *
+ * A failure is logged and not shown. The user's click has already taken effect on screen — what
+ * failed is only its persistence — so an alert would report a problem they cannot act on about an
+ * action that appeared to work.
+ */
+async function Persist(): Promise<void> {
+  try {
+    await ipc.saveUiSettings(view.settings);
+  } catch (error) {
+    console.warn('could not save the view settings', error);
+  }
+}
+
+/**
+ * Applies the saved view, then reconciles the cached rows against the disk.
+ *
+ * In that order: the settings decide how the rows Rust restored are ordered and filtered, and doing
+ * it the other way round would sort the table twice and show the user the wrong one first.
+ */
+async function Hydrate(): Promise<void> {
   repos.SetRoots(await ipc.listRoots());
-});
+
+  try {
+    view.Apply(parseUiSettings(await ipc.uiSettings()));
+  } catch (error) {
+    // A view that could not be read is not worth a visible failure: the defaults are a working
+    // table, which is more than an error message would give.
+    console.warn('could not read the saved view settings', error);
+  }
+  persisted = JSON.stringify(view.settings);
+
+  await ReconcileOnLaunch(repos.roots);
+}
 </script>

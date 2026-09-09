@@ -66,10 +66,11 @@ Rust (crates/ + src-tauri/) ..... all system work
   - tiered Git reads
   - canonical row state: one map of path -> RepoStatus, merged per tier (§6.3)
   - filesystem watching and debounce
-  - `git` CLI subprocess for fetch/pull/push only
+  - `git` CLI subprocess for fetch/pull/push, and the configured editor/terminal for `open_in`
   - path normalization, editor/terminal/file-manager launch
   - plugin calls (dialog, opener, store) — the frontend never imports a plugin package
-  - settings and cache persistence
+  - settings and cache persistence: the roots, the `open_in` commands, the view state, and a
+    snapshot of both row maps, all through `persist.rs` (§6.3)
 ```
 
 The boundary is structural, not aspirational: `src/` cannot import the engine, because one is
@@ -123,7 +124,7 @@ Two views live outside this document so they sit where they are used:
 | `dunce`                          | 1.0.5             | strips the `\\?\` prefix `canonicalize()` returns on Windows (§5.2)        |
 | `tempfile`                       | 3.27.0            | dev-only, test fixtures                                                    |
 | `tauri-plugin-dialog`            | 2.7.3             | native folder picker                                                       |
-| `tauri-plugin-store`             | 2.4.4             | JSON cache                                                                 |
+| `tauri-plugin-store`             | 2.4.4             | settings and the row cache (§6.3)                                          |
 | `tauri-plugin-opener`            | 2.5.5             | reveal in Explorer/Finder, open in editor                                  |
 | `tauri-plugin-window-state`      | 2.4.1             | window geometry                                                            |
 
@@ -219,8 +220,9 @@ ahead of that catalog and serves as the proving ground for bumps later applied t
 
 `oxlint` 1.79.0, `oxfmt` 0.64.0, `oxlint-tsgolint` 7.0.2001 and `tsdown` 0.22.14 arrive inside
 `vite-plus` — do not add them as catalog entries. No `@tauri-apps/plugin-*` package and no schema
-validator: plugins are reached through Rust commands (§3.1), and everything the frontend receives
-is typed end to end by `ts-rs` (§4.2).
+validator: plugins are reached through Rust commands (§3.1), and every value the frontend receives
+_about a repository_ is typed end to end by `ts-rs` (§4.2), which names the two exceptions and what
+stands in for a type where there is none.
 
 **Every version exact, declared once** in the root `pnpm-workspace.yaml` `catalog:` block.
 Catalogs are a pnpm-workspace feature, so that file exists even though this is a single package.
@@ -290,6 +292,18 @@ diff, which is what actually prevents drift.
 `tauri-specta` would additionally type the command bindings but couples the engine to Tauri and
 has roughly a tenth of the adoption. The handful of command signatures in `src/scripts/ipc.ts`
 are cheap to hand-write and rarely change.
+
+**Two shapes are hand-mirrored, and both exceptions are narrow on purpose.** `OpenTarget` is three
+string variants, mirrored as a union in `ipc.ts` beside the signature that takes it; a mismatch
+fails immediately and loudly, because Rust refuses to deserialise anything else. The view state
+(§6.1's `ui_settings`) is the larger one: it is vocabulary of the table, Rust keeps it without
+reading inside it, and typing it in Rust would mean either putting `FilterChip` and `SortKey` in
+the engine crate — the crate the appendix swaps out for a different domain — or a `ts-rs` derive in
+`src-tauri`, which would put that crate's whole dependency tree behind `vp run types`. So
+`src/scripts/settings.ts` owns it, and pays for owning it: the settings file is hand-editable,
+nothing validates it on the way in, and `parseUiSettings` therefore narrows field by field with a
+default for each. Do not widen either exception to anything a tier writes — that is what the
+paragraph above is about.
 
 **`model.rs` types are `gix`-free and `ts-rs`-expressible.** Object ids are hex `String`, not
 `gix::ObjectId`; timestamps are `u64` epoch milliseconds, not `SystemTime` (`ts-rs` has no impl
@@ -492,9 +506,11 @@ full_status(path: PathBuf) -> RepoStatus          // Tier 2, on demand; the merg
 fetch_repos(paths: Vec<PathBuf>, on_event: Channel<FetchEvent>)   // git CLI
 open_in(path: PathBuf, target: OpenTarget)        // editor | terminal | file manager
 pick_root() -> Option<PathBuf>                    // native folder dialog, via the plugin's Rust API
-add_root(path) -> Vec<PathBuf>                    // canonicalises and validates; returns the list
+add_root(path) -> Vec<PathBuf>                    // canonicalises, validates, persists; returns the list
 remove_root(path) -> Vec<PathBuf>                 // evicts its rows, pushed as RepoEvent::Removed
 list_roots() -> Vec<PathBuf>
+ui_settings() -> JsonValue                        // the persisted view state, opaque to Rust
+save_ui_settings(ui: JsonValue)
 ```
 
 The root commands return the new list rather than `()`, so the frontend mirrors it exactly as it
@@ -505,17 +521,31 @@ capability declaration. Because the plugins are reached only from Rust (§3.1), 
 permission is declared either: `src-tauri/capabilities/default.json` grants `core:default` and
 nothing else. Filesystem work inside our own commands is not constrained by any plugin scope —
 the Rust side is trusted — which is why all fs access stays in Rust and `tauri-plugin-fs` is not
-used. The corollary is that commands validate their own inputs: `open_in` and `full_status` accept
-only a path that is already a key in the canonical repo map (§6.3), never an arbitrary string from
-the webview.
+used. The corollary is that commands validate their own inputs: a command taking a repository path
+accepts only a key of one of Rust's two maps (§6.3), never an arbitrary string from the webview.
 
-`refresh_repo` is the one exception, and it validates against a **superset**: the map of what
-discovery found, which `src-tauri/src/state.rs` keeps beside the rows because `RepoStatus` carries
-no `git_dir` and every engine entry point needs the resolved one. That map holds repositories whose
-HEAD could not be read and which therefore have no row — which is exactly the case worth retrying,
-and `merge_tier0` already inserts where there was nothing. So the §8.1 total-failure grade is
-recoverable without rescanning the tree. Both maps are keyed identically, so the check is no looser
-than the row map's for anything that does have a row.
+**Which map depends on what the command needs.** `full_status` requires a row to merge Tier 2 into,
+so it checks the rows. `refresh_repo` and `open_in` check the **superset**: the map of what discovery
+found, which `src-tauri/src/state.rs` keeps beside the rows because `RepoStatus` carries no
+`git_dir` and every engine entry point needs the resolved one. That map holds repositories whose HEAD
+could not be read and which therefore have no row. For `refresh_repo` that is exactly the case worth
+retrying — `merge_tier0` already inserts where there was nothing, so the §8.1 total-failure grade is
+recoverable without rescanning the tree. For `open_in` it is sharper still: a repository that will
+not open is the one a user most needs to go and look at, and refusing to reveal it in the file
+manager would be the wrong reading of this rule. Both maps are keyed identically, so neither check is
+looser than the row map's for anything that does have a row.
+
+`open_in`'s file-manager target is the opener plugin's `reveal_item_in_dir`. Its other two are not:
+neither has a platform API to ask for, and on Windows the default association for a _folder_ is
+Explorer, so "open with the system default" would open the file manager three times over. They run a
+command from the settings file instead, which makes `open_in` the second place in the app that spawns
+a process after §8.2's fetch — with the flag inverted, since a terminal must keep the console that a
+fetch must suppress.
+
+`ui_settings` / `save_ui_settings` carry the chips, the sort and the grouping. Rust keeps that object
+without reading inside it, and it is the one value crossing this boundary that `ts-rs` does not
+generate — see the `persist.rs` invariant in [AGENTS.md](./AGENTS.md) for why, and for what that
+costs.
 
 `full_status` returns the **merged row** rather than a payload of its own. `counts` and `submodules`
 are fields of `RepoStatus` (§8.1) and Rust owns the canonical copy, so a separate shape carrying the
@@ -567,8 +597,14 @@ The merge therefore happens once, in Rust. `src-tauri/src/state.rs` holds
 `HashMap<PathBuf, RepoStatus>`, and the **full merged row** is what goes over the channel — on the
 scan's `Channel<ScanEvent>` for a scan result, on the session `Channel<RepoEvent>` for a watcher,
 poll, or fetch push (§6.2). The Pinia store is a mirror keyed by path
-— it never merges, never infers, and never holds a value Rust does not. The same map is what the
-JSON cache serialises, so there is exactly one source of truth on each side of the IPC boundary.
+— it never merges, never infers, and never holds a value Rust does not. So there is exactly one
+source of truth on each side of the IPC boundary.
+
+**The cache serialises both of Rust's maps**, not just the rows. `RepoStatus` carries no `git_dir`
+and every engine entry point needs the resolved one, so a cache of rows alone would restore a table
+whose every row refused to refresh or expand until a scan had rediscovered it. `persist.rs` writes
+the pair and `AppState::restore` seeds both, once, before any command can run — which is what makes
+plain insertion correct there and a merge unnecessary.
 
 **The rule is tier ownership, not field-wise option preference.** Each tier replaces every field
 it owns, `None` included, and leaves fields owned by other tiers untouched. The distinction is
@@ -711,8 +747,16 @@ rather than being an extra rule:
 `stash_count` is the one non-`Option` field that can be wrong: it has to report a number, so a
 failed read reports `0` and sets `error`. A count is only trustworthy on a row without an error.
 
-Persisted to the JSON store so launch paints last-known state immediately, then reconciles. Every
-cached row renders with its `scanned_at` age until refreshed.
+Persisted to the JSON store so launch paints last-known state immediately, then reconciles: Rust
+restores both maps into state before any command can run, so `subscribe` returns the cached rows and
+no new command is needed to show them, and the launch scan then overwrites each row as it re-reads it
+— **without** clearing them first, which would make the window flash empty for the length of a scan.
+Rows the completed scan does not find are evicted, which is what removes a repository deleted between
+sessions.
+
+Every cached row renders with its `scanned_at` age until refreshed, and nothing on the load path
+touches that age. `counts` and `submodules` are the exception and are dropped on load: the drawer
+shows them with no age beside it, so a cached count would read as freshly measured.
 
 ### 8.2 Ahead/behind is relative to the last fetch
 
@@ -742,9 +786,15 @@ short strings a `String.includes` filter in a `computed` would also do; MiniSear
 parity with the qdocs pattern, not because the corpus needs it.
 
 1. **`shallowRef`, never `ref`, for the instance.** The index is a large nested structure; deep
-   reactivity over it is a performance disaster.
-2. **Module-scoped singleton.** Instance and UI state (`open`, `query`, `selectedIndex`) at
-   module scope; the composable returns handles. One index, shared.
+   reactivity over it is a performance disaster. The corollary is that mutating it notifies
+   nothing, so `src/scripts/search.ts` exports an `indexVersion` counter beside it and bumps it on
+   every change: that is what a `computed` depends on to re-run its search as rows stream in, and
+   the page reads it at the call site rather than hiding the dependency inside the search.
+2. **Module-scoped singleton.** One index, shared, in a module of plain functions — the same shape
+   as `scan.ts` and for the same reason: nothing about the index is rendered. What _is_ rendered is
+   the query, which is why it lives in the view store with the chips and the sort rather than here.
+   The search is an inline filter over the table, so there is no open/closed state and no selected
+   index to keep.
 3. **`fields` vs `storeFields` are different lists.** `fields` is searched; `storeFields` is what
    comes back — set it and results are flat (`r.slug`), unset and you dig through `r.obj.*`.
 4. **Length-conditional fuzziness:** `fuzzy: (term) => term.length >= 5 ? 0.2 : false`, plus
@@ -756,9 +806,13 @@ Also carry `boost` for field weighting (repo name over its path), `MIN_QUERY_LEN
 `results` as a `computed` over `query`.
 
 **The corpus is live, not static.** qdocs fetches a prebuilt index once; here the corpus _is_ the
-repo set, streaming in tier by tier and mutating on watcher events. So build from the Pinia store
-with no `fetch` and no build-time artifact; `add` on `ReposFound` batches and **`replace(doc)`**
-when a row changes. MiniSearch 7 has the full incremental surface — `add`, `addAll`,
+repo set, streaming in tier by tier and mutating on watcher events. So there is no `fetch` and no
+build-time artifact: the index is fed from `scan.ts`, which is already the one file that turns
+events into store writes, so the mirror and the index are updated from the same place and cannot
+disagree. `add` for a row that is new and **`replace(doc)`** for one that changed — guarded per row
+rather than per batch, because `add` throws on an id it holds and `replace` on one it does not, and
+both cases are normal here: the `subscribe` snapshot repeats rows a scan already sent, and a rescan
+repeats every row it sent last time. MiniSearch 7 has the full incremental surface — `add`, `addAll`,
 `addAllAsync`, `remove`, `removeAll`, `replace`, `discard`, `discardAll`, `vacuum`, `has`,
 `getStoredFields`, `search`, `autoSuggest`, plus `toJSON` / static `loadJSON`. Prefer `discard`
 over `remove` and let auto-vacuum reclaim; do not rebuild on every change.
@@ -850,11 +904,18 @@ Declare Ubuntu 22.04 / Debian 12 as the floor and build Linux artifacts in a 22.
 glibc compatibility is forward-only, so building on a newer system raises the minimum glibc and
 produces binaries that fail on the stated floor.
 
-### 10.2 The Git CLI is a real but graceful dependency
+### 10.2 External tools are real but graceful dependencies
 
 Viewing status needs no Git — that is in-process `gix`. Fetch/pull/push do (§8.2). Detect its
 absence at startup and disable those actions with an explanation rather than failing at click
 time; the rest of the app stays fully functional.
+
+`open_in`'s editor and terminal are the same kind of dependency and degrade differently, on
+purpose. What they run is configured rather than fixed (§6.1), so there is nothing to detect at
+startup that would still be true at click time — a `PATH` can change and the file can be edited
+while the app runs. They report the failure against the row whose button was pressed instead,
+which is also the only honest answer for a command a user chose themselves. Revealing a folder in
+the file manager depends on nothing.
 
 ### 10.3 No native dependencies
 
@@ -905,8 +966,9 @@ the built bundle's `import.meta.env.PROD` flag (§3.3).
 ## 11. Roadmap
 
 Each phase gets a runbook in `docs/` when it starts, written against the tree as it exists then,
-and is deleted when the phase completes — durable facts move into README.md and AGENTS.md.
-No phase is currently open; Phase 5 gets the next one.
+and is deleted when the phase completes — durable facts move into README.md and AGENTS.md, which is
+why `docs/` is empty or absent whenever no phase is open.
+No phase is currently open; Phase 6 gets the next one.
 
 **Phase 0 — Environment and structure.** The Cargo workspace with its root `[profile.release]`
 (§4.1), `pnpm-workspace.yaml` with the catalog and the `vite`→core override, `vite.config.ts`
@@ -1060,9 +1122,64 @@ principle have ended a whole scan and reported it as cancelled. It presented as 
 [AGENTS.md](./AGENTS.md); `status::private_interrupt` is the fix and `tier1.rs` has a repeat-run
 regression test.
 
-**Phase 5 — Filters, sort, grouping, search, persistence.** Filter chips, MiniSearch (§8.3), JSON
-cache and settings via the store plugin from Rust, window state, `open_in` with the repo-map
-check.
+**Phase 5 — Filters, sort, grouping, search, persistence.** Filter chips and an inline search over
+MiniSearch (§8.3), sortable column headers, group-by-folder, three kinds of persistence — window
+geometry, settings, and a row cache — through `persist.rs`, and `open_in` for an editor, a terminal
+and the file manager. **The point at which the app stops starting from nothing.**
+
+_Verified:_ 112 Rust tests (10 discovery, 20 Tier 0, 12 Tier 1, 14 Tier 2, 56 in `src-tauri`) and 196
+frontend tests across 26 files, with `vp check`, `vp run typecheck`, `vp run build` and `vp run verify`
+clean and `vp run types` producing no diff — nothing new is generated, because nothing new crosses
+the boundary as a generated type.
+
+The persistence was driven end to end against the real app rather than only through tests, by seeding
+the app data directory and reading the log and the files back. A first launch with no cache reports
+one and behaves exactly as the app did before there was one. A launch over a seeded cache returns its
+rows through `subscribe` **before any scan**, so the window paints immediately; the reconcile then
+evicts the one repository that was no longer on disk and rewrites the cache without it. A
+hand-written view survives a launch untouched, cached Tier 2 counts are dropped on load, and the exit
+write fires on window close. The cache is ~1 KB per repository, so a 500-repo tree is a single
+half-megabyte write at the end of a scan.
+
+Engine timings are unchanged, and by construction: `crates/repo-scan/` has no diff in this phase.
+Over `C:/Working/Source`, 52 repositories, warm: discovery 36 ms, Tier 0 137 ms, Tier 1 948 ms —
+Tier 0 on the nose against Phase 4's table and Tier 1 a hair above the spread it recorded, which is
+run-to-run noise on the tier that has 18 dirty worktrees to walk.
+
+_Settled by writing it:_ five things, three of them corrections to this document.
+
+**A launch reconcile must not clear the rows first.** A scan starting over drops them before the
+first new one can arrive, which is right for the Scan button and wrong here: the rows on screen are
+the ones just restored from the cache, and clearing them would make the window flash empty for the
+length of a scan — worse than never having cached them. So `StartScan` takes a `keepRows` option, and
+eviction becomes load-bearing rather than hygiene: with no `Reset`, `AppState::retain_scanned` is the
+only thing that can remove a repository deleted between sessions.
+
+**The cache has to hold both maps, not just the rows.** `RepoStatus` carries no `git_dir` and every
+engine entry point needs the resolved one, so a cache of rows alone would paint a table whose every
+row refused to refresh or expand until a scan had rediscovered it — a window that looks ready and is
+not.
+
+**A filter is a third place the uncomputed-is-not-zero rule applies, and a sort a fourth.** Excluding
+a row whose Tier 1 has not run reports it as one that did not match, so a `dirty` chip applied
+mid-scan would quietly call every uncounted row clean. A chip therefore has three answers per row,
+not two, and the third is counted and shown. Sorting has the same trap pointed at ordering: `null` is
+no answer rather than a small number, so it sorts last in **both** directions.
+
+**§6.1's validation rule needed one more amendment.** `open_in` checks the discovered map, not the
+rows: a repository whose HEAD could not be read has no row, and revealing it in the file manager is
+exactly how a user finds out why it will not open. That row also gained a drawer of its own for the
+same reason — it is the only place its failure is explained and the only place those buttons can be.
+
+**A page's `onMounted` runs before its layout's**, which had been hiding a defect since Phase 3: the
+page gave up on the bridge if it was not ready at mount, and it never is, because the layout's
+`ping` has not returned yet. Nothing depended on it while roots lived only in memory; with roots
+persisted it is the difference between a launch that reconciles and one that shows an empty table.
+The page now hydrates on the bridge becoming ready rather than on being mounted.
+
+Also settled, and cheaper than expected: `stale-fetch` needed no new threshold — `fetchStaleness` and
+its bands already existed for the fetch-age column, so the chip and the badge cannot disagree. And
+`tauri-plugin-window-state` needed no code at all beyond the registration it already had.
 
 **Phase 6 — Watching.** Single debounced watcher over the §7.2 watch set, Rust-side refresh
 (§7.5), poll fallback, focus refresh, inotify-limit error handling.

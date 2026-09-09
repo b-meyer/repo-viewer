@@ -8,16 +8,33 @@ const NOW = 1_700_000_000_000;
 
 function mountDetail(
   row: RepoStatus,
-  extra: { loading?: boolean; detailError?: string | null } = {},
+  extra: { loading?: boolean; detailError?: string | null; openError?: string | null } = {},
 ) {
   return mount(RepoDetail, {
     props: {
       row,
       loading: extra.loading ?? false,
       detailError: extra.detailError ?? null,
+      openError: extra.openError ?? null,
       now: NOW,
     },
   });
+}
+
+/**
+ * The button whose label contains `label`.
+ */
+function button(wrapper: ReturnType<typeof mountDetail>, label: string) {
+  const found = wrapper.findAll('button').find((candidate) => candidate.text().includes(label));
+  if (found === undefined) throw new Error(`no button labelled ${label}`);
+  return found;
+}
+
+/**
+ * The Re-read button specifically, which is no longer the first one in the drawer.
+ */
+function reRead(wrapper: ReturnType<typeof mountDetail>) {
+  return button(wrapper, 'Re-read');
 }
 
 describe('RepoDetail', () => {
@@ -180,7 +197,7 @@ describe('RepoDetail', () => {
   it('emits refresh when the re-read button is pressed', async () => {
     const wrapper = mountDetail(MakeStatus({ counts: MakeCounts(), submodules: [] }));
 
-    await wrapper.find('button').trigger('click');
+    await reRead(wrapper).trigger('click');
 
     expect(wrapper.emitted('refresh')).toHaveLength(1);
   });
@@ -190,6 +207,32 @@ describe('RepoDetail', () => {
       loading: true,
     });
 
-    expect(wrapper.find('button').attributes('disabled')).toBeDefined();
+    expect(reRead(wrapper).attributes('disabled')).toBeDefined();
+  });
+
+  /**
+   * The three ways out of the app sit in the drawer beside Re-read, and each reports which one was
+   * pressed rather than being wired to a target of its own.
+   */
+  it('emits the target when an open-in button is pressed', async () => {
+    const wrapper = mountDetail(MakeStatus({ counts: MakeCounts(), submodules: [] }));
+
+    await button(wrapper, 'Terminal').trigger('click');
+
+    expect(wrapper.emitted('open')).toEqual([['terminal']]);
+  });
+
+  /**
+   * A launch failure is not a read failure: it belongs to the button that produced it and must not
+   * be reported as a re-read that went wrong.
+   */
+  it('shows a launch failure without claiming a read failed', () => {
+    const wrapper = mountDetail(MakeStatus({ counts: MakeCounts(), submodules: [] }), {
+      openError: 'could not run `code`',
+    });
+
+    expect(wrapper.text()).toContain('Could not open');
+    expect(wrapper.text()).toContain('could not run `code`');
+    expect(wrapper.text()).not.toContain('Re-read failed');
   });
 });

@@ -8,7 +8,8 @@
 //! # Plugins are called from Rust
 //!
 //! `dialog`, `opener`, `store`, and `window-state` are registered below and reached through this
-//! app's own commands. The frontend installs none of the `@tauri-apps/plugin-*` packages, so
+//! app's own commands — `store` only ever through [`persist`], which is the one module that names
+//! it. The frontend installs none of the `@tauri-apps/plugin-*` packages, so
 //! `capabilities/default.json` grants `core:default` and nothing else — the ACL is enforced only
 //! on webview-initiated calls, so a Rust-side plugin call never consults it.
 //!
@@ -18,6 +19,7 @@
 
 mod commands;
 mod error;
+mod persist;
 mod pipeline;
 mod state;
 mod stream;
@@ -40,8 +42,21 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         // store and window-state expose no `init()` — only a builder.
         .plugin(tauri_plugin_store::Builder::new().build())
+        // Registration is the whole of window-state: its default `StateFlags` is `all()`, it
+        // restores on window-ready, and it saves on `RunEvent::Exit`. There is no restore call to
+        // make, and adding one would run it twice.
         .plugin(tauri_plugin_window_state::Builder::default().build())
         .manage(Arc::new(AppState::default()))
+        // Runs once, before any command can be invoked, which is what lets [`AppState::restore`]
+        // insert rather than merge. A cached row paints as soon as `subscribe` returns it, so
+        // showing one needs no new command and no change on the other side of the boundary.
+        .setup(|app| {
+            use tauri::Manager as _;
+
+            let state = app.state::<Arc<AppState>>();
+            persist::load(app.handle(), state.inner());
+            Ok(())
+        })
         // Closing the window flips every live scan's flag, so the blocking threads unwind while
         // the runtime is still up. `CloseRequested` and not `Destroyed` for that reason. This is
         // about not burning cores on results nobody will see: a send into a dead webview returns
@@ -63,9 +78,23 @@ pub fn run() {
             commands::add_root,
             commands::remove_root,
             commands::list_roots,
+            commands::open_in,
+            commands::ui_settings,
+            commands::save_ui_settings,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building the tauri application")
+        // `build` then `run`, rather than `Builder::run`, for the one event the builder cannot
+        // hand over: `Exit`. A scan writes the cache when it ends, but a `refresh_repo` or an
+        // expanded drawer changes rows afterwards, and this is what keeps those.
+        .run(|app, event| {
+            if matches!(event, tauri::RunEvent::Exit) {
+                use tauri::Manager as _;
+
+                let state = app.state::<Arc<AppState>>();
+                persist::save_cache(app, state.inner());
+            }
+        });
 }
 
 /// Install the log subscriber.

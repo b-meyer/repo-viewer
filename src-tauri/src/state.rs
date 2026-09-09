@@ -7,7 +7,7 @@
 //! reconcile them would eventually show a stale value as a fresh one.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard,
@@ -28,7 +28,7 @@ use tauri::ipc::Channel;
 pub struct AppState {
     /// The canonical rows, keyed by the same absolute path the frontend uses.
     ///
-    /// `RwLock` and not `Mutex` because path validation and the Phase 5 cache snapshot are reads.
+    /// `RwLock` and not `Mutex` because path validation and the cache snapshot are both reads.
     /// Not `dashmap`: the write side takes the lock once per batch rather than once per row, so
     /// per-key sharding buys nothing here — and a sharded map cannot cheaply produce the coherent
     /// snapshot the cache needs.
@@ -46,7 +46,10 @@ pub struct AppState {
     /// entry here and no row, which is what gives `refresh_repo` something to retry.
     found: RwLock<HashMap<PathBuf, DiscoveredRepo>>,
 
-    /// The configured roots, canonicalised. In memory only; persistence is Phase 5.
+    /// The configured roots, canonicalised.
+    ///
+    /// Persisted by [`crate::persist`] from the two commands that change them, and read back into
+    /// here by `setup` before any command can run.
     roots: RwLock<Vec<PathBuf>>,
 
     /// Live scans and their cancellation flags. An entry exists exactly while its pipeline runs.
@@ -143,6 +146,17 @@ impl AppState {
         self.read_found().get(path).cloned()
     }
 
+    /// Every entry discovery produced, sorted by path.
+    ///
+    /// The other half of the cache snapshot. Sorted for the same reason [`AppState::snapshot`] is:
+    /// the file is rewritten whole on every scan, and an unstable order would make its diff mean
+    /// nothing.
+    pub fn discovered_all(&self) -> Vec<DiscoveredRepo> {
+        let mut found: Vec<DiscoveredRepo> = self.read_found().values().cloned().collect();
+        found.sort_by(|left, right| left.path.cmp(&right.path));
+        found
+    }
+
     /// Whether `path` is a key of the canonical map.
     ///
     /// The validator for commands that need an existing row to work on. A repository discovery
@@ -191,6 +205,28 @@ impl AppState {
         rows
     }
 
+    /// Seed both maps from the persisted cache.
+    ///
+    /// Insertion rather than a merge, which is correct here and nowhere else: this runs once from
+    /// `setup`, before any command can be invoked and so before any tier can have written a row.
+    ///
+    /// `scanned_at_ms` is left exactly as it was written. The age of a cached row is what the table
+    /// renders beside it, so stamping it fresh here would turn last week's answer into this
+    /// morning's — the same lie as rendering an uncomputed count as `0`.
+    pub fn restore(&self, rows: Vec<RepoStatus>, found: Vec<DiscoveredRepo>) {
+        {
+            let mut repos = self.write_repos();
+            for row in rows {
+                repos.insert(row.path.clone(), row);
+            }
+        }
+
+        let mut discovered = self.write_found();
+        for repo in found {
+            discovered.insert(repo.path.clone(), repo);
+        }
+    }
+
     /// Add an already-canonicalised root. Returns the new list. Idempotent.
     pub fn add_root(&self, path: PathBuf) -> Vec<PathBuf> {
         let mut roots = self.write_roots();
@@ -229,6 +265,40 @@ impl AppState {
         self.write_found().retain(|key, _| !key.starts_with(path));
 
         (roots, evicted)
+    }
+
+    /// Drop rows a **completed** scan of `roots` did not see, and return their paths.
+    ///
+    /// Every other row change is an upsert, which is all a scan of a live tree needs. A scan that
+    /// starts from cache-restored rows is the case that needs more: a repository deleted or moved
+    /// between sessions has a row and no longer has a folder, and nothing short of removing its
+    /// root would ever take that row away.
+    ///
+    /// Scoped to the roots that were walked, so scanning one root cannot evict another's rows — and
+    /// only ever called for a scan that finished, because a cancelled walk has not seen the whole
+    /// tree and what it missed is not the same as what is gone.
+    pub fn retain_scanned(&self, roots: &[PathBuf], seen: &HashSet<PathBuf>) -> Vec<PathBuf> {
+        let walked = |key: &Path| roots.iter().any(|root| key.starts_with(root));
+
+        let evicted: Vec<PathBuf> = {
+            let mut repos = self.write_repos();
+            let gone: Vec<PathBuf> = repos
+                .keys()
+                .filter(|key| walked(key) && !seen.contains(*key))
+                .cloned()
+                .collect();
+            for key in &gone {
+                repos.remove(key);
+            }
+            gone
+        };
+
+        // `found` goes on the same terms, or a removed repository would keep exactly the entry
+        // that lets a command reach into it.
+        self.write_found()
+            .retain(|key, _| !walked(key) || seen.contains(key));
+
+        evicted
     }
 
     /// The configured roots.
@@ -913,5 +983,93 @@ mod tier2_tests {
 
         assert!(state.discovered(Path::new("C:/work/a")).is_none());
         assert!(!state.has_repo(Path::new("C:/work/a")));
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::{tests::row, *};
+
+    /// The cache paints at launch and its rows must carry their original ages, or a week-old
+    /// answer reads as this morning's.
+    #[test]
+    fn restore_seeds_both_maps_without_touching_the_ages() {
+        let state = AppState::default();
+        let mut cached = row("C:/work/a");
+        cached.scanned_at_ms = 42;
+
+        state.restore(
+            vec![cached],
+            vec![repo_scan::DiscoveredRepo {
+                path: PathBuf::from("C:/work/a"),
+                name: "a".into(),
+                parent: PathBuf::from("C:/work"),
+                kind: repo_scan::RepoKind::Normal,
+                git_dir: PathBuf::from("C:/work/a/.git"),
+            }],
+        );
+
+        assert_eq!(
+            state
+                .row(Path::new("C:/work/a"))
+                .expect("restored")
+                .scanned_at_ms,
+            42,
+            "the age is the claim, and nothing here refreshes it"
+        );
+        assert!(
+            state.discovered(Path::new("C:/work/a")).is_some(),
+            "and the git dir came back too, or the row could not be refreshed or expanded"
+        );
+    }
+
+    /// A repository that was deleted between sessions has a cached row and no folder. A completed
+    /// scan is the only thing that can know that, and this is how the row goes away.
+    #[test]
+    fn retain_scanned_evicts_a_row_the_scan_did_not_see() {
+        let state = AppState::default();
+        state.add_root(PathBuf::from("C:/work"));
+        state.merge_tier0_batch(vec![row("C:/work/gone"), row("C:/work/still-here")]);
+
+        let seen = HashSet::from([PathBuf::from("C:/work/still-here")]);
+        let evicted = state.retain_scanned(&[PathBuf::from("C:/work")], &seen);
+
+        assert_eq!(evicted, vec![PathBuf::from("C:/work/gone")]);
+        assert!(!state.has_repo(Path::new("C:/work/gone")));
+        assert!(state.has_repo(Path::new("C:/work/still-here")));
+    }
+
+    /// Scanning one root must not evict another's rows. The scan saw nothing under `C:/other`
+    /// because it never looked there.
+    #[test]
+    fn retain_scanned_leaves_rows_under_a_root_it_did_not_walk() {
+        let state = AppState::default();
+        state.merge_tier0_batch(vec![row("C:/work/a"), row("C:/other/b")]);
+
+        let evicted = state.retain_scanned(
+            &[PathBuf::from("C:/work")],
+            &HashSet::from([PathBuf::from("C:/work/a")]),
+        );
+
+        assert!(evicted.is_empty());
+        assert!(state.has_repo(Path::new("C:/other/b")));
+    }
+
+    /// The discovered map is evicted on the same terms, for the reason `remove_root` evicts it:
+    /// otherwise a gone repository keeps the entry that lets a command reach into it.
+    #[test]
+    fn retain_scanned_evicts_the_discovered_map_too() {
+        let state = AppState::default();
+        state.record_found(&[repo_scan::DiscoveredRepo {
+            path: PathBuf::from("C:/work/gone"),
+            name: "gone".into(),
+            parent: PathBuf::from("C:/work"),
+            kind: repo_scan::RepoKind::Normal,
+            git_dir: PathBuf::from("C:/work/gone/.git"),
+        }]);
+
+        state.retain_scanned(&[PathBuf::from("C:/work")], &HashSet::new());
+
+        assert!(state.discovered(Path::new("C:/work/gone")).is_none());
     }
 }

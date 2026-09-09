@@ -7,7 +7,7 @@ use repo_scan::RepoEvent;
 use tauri::{AppHandle, State, WebviewWindow};
 use tauri_plugin_dialog::DialogExt;
 
-use crate::{error::CommandResult, state::AppState};
+use crate::{error::CommandResult, persist, state::AppState};
 
 /// Show the native folder picker. `None` when the user cancels.
 ///
@@ -64,8 +64,13 @@ pub async fn pick_root(
 /// `async` with the filesystem work on `spawn_blocking`: canonicalising is a syscall, and on a
 /// stale drive letter or a disconnected share it can block for seconds. Inline on the event loop
 /// that would freeze the window.
+///
+/// This is the single place a new path enters the app, so it is also where the root list is
+/// persisted. The write is best-effort — the root is already in memory and this command has
+/// succeeded, so a failed write is a log line rather than a refusal.
 #[tauri::command]
 pub async fn add_root(
+    app: AppHandle,
     state: State<'_, Arc<AppState>>,
     path: PathBuf,
 ) -> CommandResult<Vec<PathBuf>> {
@@ -81,7 +86,9 @@ pub async fn add_root(
     .await
     .context("the folder check did not finish")??;
 
-    Ok(state.add_root(resolved))
+    let roots = state.add_root(resolved);
+    persist::save_roots(&app, &roots);
+    Ok(roots)
 }
 
 /// Remove a root and evict every row beneath it. Returns the new list.
@@ -91,6 +98,7 @@ pub async fn add_root(
 /// refusing to normalise is the correct behaviour.
 #[tauri::command]
 pub async fn remove_root(
+    app: AppHandle,
     state: State<'_, Arc<AppState>>,
     path: PathBuf,
 ) -> CommandResult<Vec<PathBuf>> {
@@ -99,6 +107,7 @@ pub async fn remove_root(
         .context("the folder check did not finish")?;
 
     let (roots, evicted) = state.remove_root(&resolved);
+    persist::save_roots(&app, &roots);
     if !evicted.is_empty() {
         // A row change untied to any scan, which is exactly what the session channel is for.
         state.push(RepoEvent::Removed { paths: evicted });

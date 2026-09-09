@@ -24,6 +24,16 @@ import type { ScanEvent } from '@/scripts/generated/ScanEvent';
 import type { ScanId } from '@/scripts/generated/ScanId';
 import type { ScanOpts } from '@/scripts/generated/ScanOpts';
 import type { Tier } from '@/scripts/generated/Tier';
+import type { UiSettings } from '@/scripts/settings';
+
+/**
+ * Where {@link openIn} can open a repository.
+ *
+ * Hand-mirrored from `OpenTarget` in `src-tauri/src/commands/open.rs`, like every signature in this
+ * file. Three variants are not worth widening `vp run types` past the engine crate for, and a
+ * mismatch fails immediately and loudly: Rust refuses to deserialise anything else.
+ */
+export type OpenTarget = 'fileManager' | 'editor' | 'terminal';
 
 /**
  * Round-trips a call to the Rust backend.
@@ -154,4 +164,40 @@ export function removeRoot(path: string): Promise<string[]> {
  */
 export function listRoots(): Promise<string[]> {
   return invoke<string[]>('list_roots');
+}
+
+/**
+ * Opens one repository in an external tool.
+ *
+ * Rust validates the path against what discovery found — a superset of the rows — so this works for
+ * a repository whose HEAD could not be read, which is exactly the one a user wants to go and look
+ * at. It resolves when the tool has been _started_; nothing waits on what the tool then does.
+ *
+ * @param path - The repository to open.
+ * @param target - Where to open it.
+ */
+export function openIn(path: string, target: OpenTarget): Promise<void> {
+  return invoke<void>('open_in', { path, target });
+}
+
+/**
+ * The persisted view state, or `null` when nothing has been saved.
+ *
+ * Typed as `unknown` deliberately. This is the one value crossing the boundary that `ts-rs` does
+ * not generate — see `settings.ts` — so it arrives unvalidated and `parseUiSettings` is what turns
+ * it into a `UiSettings`. Claiming the type here would move the lie one file earlier.
+ *
+ * @returns Whatever the settings file held.
+ */
+export function uiSettings(): Promise<unknown> {
+  return invoke<unknown>('ui_settings');
+}
+
+/**
+ * Persists the view state.
+ *
+ * @param ui - The settings to save.
+ */
+export function saveUiSettings(ui: UiSettings): Promise<void> {
+  return invoke<void>('save_ui_settings', { ui });
 }

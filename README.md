@@ -42,7 +42,7 @@ flowchart TB
 
     subgraph L3["3 &nbsp;Tauri core &mdash; tauri 2.11.5"]
         L3A["invoke_handler command registry<br/>own commands need no capability declaration; capabilities = core:default"]
-        L3B["canonical state: HashMap&lt;PathBuf, RepoStatus&gt;<br/>tiers merged here, full rows pushed"]
+        L3B["canonical state: HashMap&lt;PathBuf, RepoStatus&gt;<br/>tiers merged here, full rows pushed<br/>plus what discovery found, for the resolved git dir"]
     end
 
     subgraph L4["4 &nbsp;Discovery &mdash; ignore 0.4.33"]
@@ -62,8 +62,9 @@ flowchart TB
 
     subgraph L7["7 &nbsp;Side channels &mdash; subprocess and OS, all driven from Rust"]
         L7A["git CLI subprocess<br/>fetch / pull / push ONLY<br/>real credential helpers, SSH config, proxies<br/>CREATE_NO_WINDOW, GIT_TERMINAL_PROMPT=0, timeout"]
-        L7B["tauri-plugin-opener 2.5.5<br/>editor &middot; terminal &middot; file manager<br/>path must be a known repo"]
-        L7C["tauri-plugin-store 2.4.4<br/>JSON cache of roots and last status"]
+        L7B["tauri-plugin-opener 2.5.5<br/>reveal in the file manager &mdash; the shell's own API<br/>path must be one discovery found"]
+        L7C["configured editor / terminal, spawned<br/>command from settings.json, PATH resolved as a shell would<br/>CREATE_NO_WINDOW for the editor and NOT for the terminal<br/>path must be one discovery found"]
+        L7D["tauri-plugin-store 2.4.4<br/>settings.json &mdash; roots, open-in commands, view state<br/>cache.json &mdash; both row maps, so a launch paints at once"]
     end
 
     OUT["Rows paint progressively, tier by tier, back up through Channel to the repo table.<br/>Tiers not yet computed render as unknown &mdash; never as 0."]
@@ -105,6 +106,10 @@ releases do not ship. See [PLAN.md §10](./PLAN.md) for the full platform matrix
 
 The `git` CLI is needed only for fetch/pull/push. Viewing status works without it; those actions
 disable themselves with an explanation if it is absent.
+
+Opening a repository in an editor or a terminal runs whatever `settings.json` names — VS Code and
+Windows Terminal by default. Neither is required: if the command is missing the button reports why,
+beside the row it belongs to. Revealing a folder in the file manager needs nothing installed.
 
 ### To build it
 
@@ -156,6 +161,50 @@ to `allowBuilds:` in `pnpm-workspace.yaml`.
 
 ---
 
+## Settings
+
+The app keeps three files under its identifier, `net.citsolutions.repoviewer`:
+
+| File                 | What it holds                                                   |
+| -------------------- | --------------------------------------------------------------- |
+| `settings.json`      | the folders being watched, the open-in commands, the view state |
+| `cache.json`         | the last scan's rows, so a launch paints before it rescans      |
+| `.window-state.json` | window position and size, written by the window-state plugin    |
+
+On Windows that directory is `%APPDATA%\net.citsolutions.repoviewer`, and on macOS
+`~/Library/Application Support/net.citsolutions.repoviewer`. On Linux the first two are under
+`~/.local/share/` and the window state is under `~/.config/`: the store plugin resolves Tauri's
+app-**data** directory and the window-state plugin its app-**config** directory, which are the same
+place on Windows and macOS and two places on Linux.
+
+Deleting any of them is safe: the app treats a missing, corrupt, or unrecognised file as no file at
+all, and rebuilds it.
+
+**The editor and terminal commands are edited by hand** — there is no settings screen yet. The
+defaults are written into `settings.json` on a first run so the shape is there to change:
+
+```json
+{
+  "openIn": {
+    "editor": { "program": "code", "args": ["{path}"] },
+    "terminal": { "program": "wt.exe", "args": ["-d", "{path}"] }
+  }
+}
+```
+
+`{path}` is replaced with the repository's folder, and appended as a final argument if it appears
+nowhere — so `{"program": "code"}` on its own works. The program is resolved against `PATH` the way
+a shell does, so `code` finds the `code.cmd` that a VS Code install puts there. Changes take effect
+on the next launch of a tool, with no restart. On macOS and Linux the terminal is left unset, because
+every desktop wants different arguments and a default that silently fails is worse than a message
+saying which file to edit.
+
+A cached row is shown with the age of the read that produced it — that is what makes it honest — and
+the file counts in a row's drawer are deliberately **not** cached, because they are shown with no age
+beside them.
+
+---
+
 ## Layout
 
 The target shape. Entries marked with a phase do not exist yet — see the
@@ -181,11 +230,11 @@ repo-viewer/
 │   ├── pages/                    # file-based routes; index.vue = /
 │   ├── components/               #
 │   │   ├── inputs/               #    App*.vue reka-ui wrappers — always use at call sites
-│   │   ├── repos/                #    RepoTable, RepoRow, RepoDetail, AheadBehind, RootBar …
+│   │   ├── repos/                #    RepoTable, RepoRow, RepoDetail, RepoActions, FilterBar, RootBar …
 │   │   └── feedback/             #    AppUnknown, AppAlert, ScanProgress, ScanErrors
-│   ├── scripts/                  # ipc.ts, router.ts, scan.ts, detail.ts, utils.ts  (+ search.ts — Phase 5)
+│   ├── scripts/                  # ipc.ts, router.ts, scan.ts, detail.ts, view.ts, search.ts, settings.ts, utils.ts
 │   │   └── generated/            # ts-rs output, committed
-│   ├── stores/                   # Pinia: repos  (+ filters, settings — Phase 5)
+│   ├── stores/                   # Pinia: repos (rows, mirrored), view (chips, sort, grouping)
 │   ├── styles/                   # main.css, theme.css (custom palette)
 │   ├── tests/                    # shared harness only — unit tests sit beside their subject
 │   └── types/                    # ambient .d.ts only; route-map.d.ts is generated, committed
@@ -213,8 +262,9 @@ repo-viewer/
         ├── state.rs              # canonical HashMap<PathBuf, RepoStatus>, tier merge
         ├── stream.rs             # batching for tauri::ipc::Channel sends
         ├── pipeline.rs           # the scan driver: discovery → batch → Tier 0 → merge
+        ├── persist.rs            # settings.json + cache.json — the only consumer of the store plugin
         ├── error.rs              # CommandError: anyhow across the IPC boundary
-        └── commands/            # session, scan, roots, repo  (+ fetch, open — Phase 7)
+        └── commands/            # session, scan, roots, repo, open, settings  (+ fetch — Phase 7)
 ```
 
 Coming from .NET: there is no `.sln` and no `.csproj`. The root `Cargo.toml` is the workspace

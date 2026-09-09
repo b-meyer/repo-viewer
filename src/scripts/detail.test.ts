@@ -1,7 +1,7 @@
 import { clearMocks, mockIPC } from '@tauri-apps/api/mocks';
 import { createPinia, setActivePinia } from 'pinia';
 import { afterEach, beforeEach, describe, expect, it } from 'vite-plus/test';
-import { RefreshDetail, ToggleRow } from '@/scripts/detail';
+import { OpenIn, RefreshDetail, ToggleRow } from '@/scripts/detail';
 import { useReposStore } from '@/stores/repos';
 import { MakeCounts, MakeDiscovered, MakeStatus } from '@/tests/fixtures';
 
@@ -209,5 +209,63 @@ describe('row detail', () => {
     await RefreshDetail('C:/work/alpha');
 
     expect(store.detailErrors.has('C:/work/alpha')).toBe(false);
+  });
+});
+
+describe('OpenIn', () => {
+  beforeEach(() => {
+    setActivePinia(createPinia());
+  });
+
+  afterEach(() => {
+    clearMocks();
+  });
+
+  it('asks Rust to open the row, and says which target', async () => {
+    const calls: unknown[] = [];
+    mockIPC((cmd, args) => {
+      calls.push({ cmd, args });
+      return null;
+    });
+
+    await OpenIn('C:/work/alpha', 'terminal');
+
+    expect(calls).toEqual([
+      { cmd: 'open_in', args: { path: 'C:/work/alpha', target: 'terminal' } },
+    ]);
+  });
+
+  /**
+   * A launch failure belongs to the row and the button that produced it. It must not reach the
+   * row's one `error` slot, which the tiers own, and it must not be reported as a failed read.
+   */
+  it('records a launch failure without touching the read state', async () => {
+    const store = useReposStore();
+    store.Upsert(MakeStatus({ path: 'C:/work/alpha' }));
+    mockIPC(() => {
+      throw new Error('could not run `code`');
+    });
+
+    await OpenIn('C:/work/alpha', 'editor');
+
+    expect(store.openErrors.get('C:/work/alpha')).toContain('could not run `code`');
+    expect(store.detailErrors.has('C:/work/alpha')).toBe(false);
+    expect(store.byPath.get('C:/work/alpha')).toMatchObject({ error: null });
+    expect(store.scanError).toBeNull();
+  });
+
+  /**
+   * Cleared by the next attempt, so a stale cause does not sit under a button that has since
+   * worked.
+   */
+  it('clears the previous failure when a launch succeeds', async () => {
+    const store = useReposStore();
+    store.Upsert(MakeStatus({ path: 'C:/work/alpha' }));
+    store.SetOpenError('C:/work/alpha', 'could not run `code`');
+    mockIPC(() => null);
+
+    await OpenIn('C:/work/alpha', 'editor');
+
+    expect(store.openErrors.has('C:/work/alpha')).toBe(false);
   });
 });

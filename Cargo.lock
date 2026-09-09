@@ -4125,6 +4125,7 @@ dependencies = [
  "tauri-plugin-opener",
  "tauri-plugin-store",
  "tauri-plugin-window-state",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",

@@ -25,6 +25,7 @@ import type { ScanId } from '@/scripts/generated/ScanId';
  * id is dropped. The resolved id then cross-checks the latch rather than establishing it.
  */
 import * as ipc from '@/scripts/ipc';
+import { ClearIndex, IndexRows, UnindexPaths } from '@/scripts/search';
 import { useReposStore } from '@/stores/repos';
 
 /// Data
@@ -48,6 +49,11 @@ let pending: Promise<ScanId> | null = null;
  * Whether the session channel has been opened. Guards HMR's repeated mounts.
  */
 let subscribed = false;
+
+/**
+ * Whether the launch reconcile has run. Guards the same repeated mounts.
+ */
+let reconciled = false;
 
 /**
  * Whether a cancel has already gone out for the current scan attempt.
@@ -74,6 +80,7 @@ export async function StartSession(): Promise<void> {
   try {
     const rows = await ipc.subscribe(HandleSessionEvent);
     repos.UpsertMany(rows);
+    IndexRows(rows);
   } catch (error) {
     subscribed = false;
     throw error;
@@ -83,9 +90,19 @@ export async function StartSession(): Promise<void> {
 /**
  * Starts a scan over `roots`, replacing whatever scan was running.
  *
+ * `keepRows` is what separates the two kinds of scan. Pressing Scan starts over: the rows go first,
+ * so nothing from the previous tree can linger. A **reconcile** does not, because the rows on
+ * screen are the ones restored from the cache and dropping them would make the window flash empty
+ * for the length of a scan — the stream overwrites each row as it is re-read, and Rust evicts the
+ * ones the walk does not find.
+ *
  * @param roots - The configured roots to walk.
+ * @param options - `keepRows` to reconcile rather than start over.
  */
-export async function StartScan(roots: string[]): Promise<void> {
+export async function StartScan(
+  roots: string[],
+  options: { keepRows?: boolean } = {},
+): Promise<void> {
   const repos = useReposStore();
 
   generation += 1;
@@ -93,8 +110,13 @@ export async function StartScan(roots: string[]): Promise<void> {
   activeId = null;
   cancelSent = false;
 
-  // Before the invoke, so the old rows are gone before any new row can arrive.
-  repos.Reset();
+  // Before the invoke, so nothing from the last scan can be mistaken for this one's.
+  if (options.keepRows === true) {
+    repos.ResetSummaries();
+  } else {
+    repos.Reset();
+    ClearIndex();
+  }
   repos.SetPhase('discovering');
 
   const request = ipc.scanRoots(roots, {}, (event) => {
@@ -129,6 +151,25 @@ export async function StartScan(roots: string[]): Promise<void> {
     repos.SetScanError(error instanceof Error ? error.message : String(error));
     repos.SetPhase('failed');
   }
+}
+
+/**
+ * Reconciles the cached rows against the disk, once, at launch.
+ *
+ * This is the second half of the cache: Rust restores the rows so the window paints immediately,
+ * and this is what then makes them true. Guarded, because Vite HMR re-runs the mounting component's
+ * `onMounted` and a reconcile per reload would rescan the tree every time a file is saved.
+ *
+ * Not a fetch, and deliberately: §8.2 rules out fetching on launch, so ahead/behind is reconciled
+ * against whatever the last fetch left behind and says so through its age.
+ *
+ * @param roots - The configured roots, as Rust spells them.
+ */
+export async function ReconcileOnLaunch(roots: string[]): Promise<void> {
+  if (reconciled || roots.length === 0) return;
+  reconciled = true;
+
+  await StartScan(roots, { keepRows: true });
 }
 
 /**
@@ -189,6 +230,7 @@ export function ResetScanSession(): void {
   pending = null;
   cancelSent = false;
   subscribed = false;
+  reconciled = false;
 }
 
 /**
@@ -206,10 +248,14 @@ function HandleScanEvent(mine: number, event: ScanEvent): void {
   switch (event.kind) {
     case 'reposFound': {
       repos.UpsertMany(event.repos);
+      // Indexed from the moment they are found, so a search works while the refs are still being
+      // read. A row enters with its name and path and is replaced when Tier 0 gives it a branch.
+      IndexRows(event.repos);
       break;
     }
     case 'reposUpdated': {
       repos.UpsertMany(event.repos);
+      IndexRows(event.repos);
       repos.SetPhase('reading');
       break;
     }
@@ -258,10 +304,14 @@ function HandleSessionEvent(event: RepoEvent): void {
   switch (event.kind) {
     case 'updated': {
       repos.UpsertMany(event.repos);
+      IndexRows(event.repos);
       break;
     }
     case 'removed': {
+      // Either a root the user removed or a repository a reconciling scan found to be gone. Both
+      // have to leave the index, or a search keeps offering a row the table no longer has.
       repos.Remove(event.paths);
+      UnindexPaths(event.paths);
       break;
     }
   }

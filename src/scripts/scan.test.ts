@@ -1,7 +1,14 @@
 import { clearMocks, mockIPC } from '@tauri-apps/api/mocks';
 import { createPinia, setActivePinia } from 'pinia';
 import { afterEach, beforeEach, describe, expect, it } from 'vite-plus/test';
-import { CancelScan, ResetScanSession, StartScan, StartSession } from '@/scripts/scan';
+import {
+  CancelScan,
+  ReconcileOnLaunch,
+  ResetScanSession,
+  StartScan,
+  StartSession,
+} from '@/scripts/scan';
+import { ClearIndex, indexVersion, searchPaths } from '@/scripts/search';
 import { useReposStore } from '@/stores/repos';
 import { MakeChannelDriver, ReadNumber } from '@/tests/channel';
 import { MakeDiscovered, MakeStatus, MakeTotals } from '@/tests/fixtures';
@@ -21,6 +28,7 @@ describe('scan session', () => {
   afterEach(() => {
     clearMocks();
     ResetScanSession();
+    ClearIndex();
   });
 
   /**
@@ -233,6 +241,85 @@ describe('scan session', () => {
     expect(store.count).toBe(1);
   });
 
+  /**
+   * The two kinds of scan, and the difference that matters. Pressing Scan starts over, so the rows
+   * go before the first new one can arrive.
+   */
+  it('drops the existing rows when a scan starts over', async () => {
+    const store = useReposStore();
+    store.Upsert(MakeStatus({ path: 'C:/work/stale' }));
+
+    mockIPC((cmd) => (cmd === 'scan_roots' ? 1 : null));
+    await StartScan(['C:/work']);
+
+    expect(store.count).toBe(0);
+  });
+
+  /**
+   * **A reconcile must not.** The rows on screen at launch are the ones Rust restored from the
+   * cache, and clearing them would make the window flash empty for the length of a scan — worse
+   * than never having cached them. The stream overwrites each row as it is re-read, and Rust evicts
+   * whatever the walk did not find.
+   */
+  it('keeps the cached rows when a launch reconcile starts', async () => {
+    const store = useReposStore();
+    store.Upsert(MakeStatus({ path: 'C:/work/cached' }));
+
+    mockIPC((cmd) => (cmd === 'scan_roots' ? 1 : null));
+    await ReconcileOnLaunch(['C:/work']);
+
+    expect(store.count).toBe(1);
+  });
+
+  /**
+   * Vite HMR re-runs the mounting component's `onMounted`, and a reconcile per reload would rescan
+   * the tree every time a file is saved.
+   */
+  it('reconciles only once, however often it is asked', async () => {
+    let scans = 0;
+    mockIPC((cmd) => {
+      if (cmd !== 'scan_roots') return null;
+      scans += 1;
+      return scans;
+    });
+
+    await ReconcileOnLaunch(['C:/work']);
+    await ReconcileOnLaunch(['C:/work']);
+
+    expect(scans).toBe(1);
+  });
+
+  it('does not reconcile when there are no roots to walk', async () => {
+    let scans = 0;
+    mockIPC((cmd) => {
+      if (cmd !== 'scan_roots') return null;
+      scans += 1;
+      return 1;
+    });
+
+    await ReconcileOnLaunch([]);
+
+    expect(scans).toBe(0);
+  });
+
+  /**
+   * This module is the seam where events become store writes, so it is also where the search index
+   * is kept in step. A row found by the walk is searchable before its refs have been read.
+   */
+  it('indexes rows as they arrive, before any tier has read them', async () => {
+    const drive = MakeChannelDriver();
+    mockIPC((cmd, args) => {
+      if (cmd !== 'scan_roots') return null;
+      const id = drive.Capture(args);
+      drive.Send(id, found(1, 'C:/work/alpha'));
+      return 1;
+    });
+
+    await StartScan(['C:/work']);
+
+    expect(searchPaths('alpha', indexVersion.value)).toEqual(new Set(['C:/work/alpha']));
+  });
+
   describe('session channel', () => {
     it('mirrors the snapshot Rust returns', async () => {
       mockIPC((cmd) => (cmd === 'subscribe' ? [MakeStatus({ path: 'C:/work/a' })] : null));
@@ -257,6 +344,27 @@ describe('scan session', () => {
       drive.Send(channelId, { kind: 'removed', paths: ['C:/work/a'] });
 
       expect([...useReposStore().byPath.keys()]).toEqual(['C:/work/b']);
+    });
+
+    /**
+     * A row Rust evicted — a removed root, or a repository a reconciling scan found to be gone —
+     * has to leave the index too, or a search keeps offering a row the table no longer has.
+     */
+    it('unindexes rows Rust removed', async () => {
+      const drive = MakeChannelDriver();
+      let channelId = 0;
+      mockIPC((cmd, args) => {
+        if (cmd !== 'subscribe') return null;
+        channelId = drive.Capture(args);
+        return [MakeStatus({ path: 'C:/work/alpha', name: 'alpha' })];
+      });
+
+      await StartSession();
+      expect(searchPaths('alpha', indexVersion.value)).toEqual(new Set(['C:/work/alpha']));
+
+      drive.Send(channelId, { kind: 'removed', paths: ['C:/work/alpha'] });
+
+      expect(searchPaths('alpha', indexVersion.value)).toEqual(new Set());
     });
 
     it('subscribes only once, so HMR remounts do not stack channels', async () => {

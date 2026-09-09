@@ -1,5 +1,11 @@
 <template>
-  <button :class="classes" :disabled="disabled || busy" type="button" @click="emit('click')">
+  <button
+    :class="classes"
+    :disabled="disabled || busy"
+    :title="title || undefined"
+    type="button"
+    @click="emit('click')"
+  >
     <i v-if="busy" class="bi bi-arrow-repeat mr-6 animate-spin" />
     <i v-else-if="icon" :class="`bi ${icon} mr-6`" />
     <span v-text="label" />
@@ -29,6 +35,10 @@ const props = withDefaults(
      */
     icon?: string;
     /**
+     * Hover text, for a label that cannot carry the whole explanation.
+     */
+    title?: string;
+    /**
      * Whether the action is unavailable.
      */
     disabled?: boolean;
@@ -37,7 +47,7 @@ const props = withDefaults(
      */
     busy?: boolean;
   }>(),
-  { variant: 'default', size: 'default', icon: '', disabled: false, busy: false },
+  { variant: 'default', size: 'default', icon: '', title: '', disabled: false, busy: false },
 );
 
 const emit = defineEmits<{

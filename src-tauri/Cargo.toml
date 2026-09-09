@@ -36,3 +36,8 @@ tauri-plugin-dialog = { workspace = true }
 tauri-plugin-opener = { workspace = true }
 tauri-plugin-store = { workspace = true }
 tauri-plugin-window-state = { workspace = true }
+
+[dev-dependencies]
+# For the `PATH` walk in `commands/open.rs`: the trap it exists for is a real file with a real
+# extension, so the test needs a real directory to find one in.
+tempfile = { workspace = true }

@@ -17,6 +17,7 @@ function mountRow(
     expanded?: boolean;
     loadingDetail?: boolean;
     detailError?: string | null;
+    openError?: string | null;
   } = {},
 ) {
   return mount(RepoRow, {
@@ -28,10 +29,20 @@ function mountRow(
       expanded: extra.expanded ?? false,
       loadingDetail: extra.loadingDetail ?? false,
       detailError: extra.detailError ?? null,
+      openError: extra.openError ?? null,
       colspan: 7,
     },
     attachTo: document.createElement('tbody'),
   });
+}
+
+/**
+ * The button whose label contains `label`.
+ */
+function button(wrapper: ReturnType<typeof mountRow>, label: string) {
+  const found = wrapper.findAll('button').find((candidate) => candidate.text().includes(label));
+  if (found === undefined) throw new Error(`no button labelled ${label}`);
+  return found;
 }
 
 describe('RepoRow', () => {
@@ -95,5 +106,40 @@ describe('RepoRow', () => {
   it('labels a non-ordinary repository kind', () => {
     expect(mountRow(MakeStatus({ kind: 'submodule' })).text()).toContain('submodule');
     expect(mountRow(MakeStatus({ kind: 'normal' })).text()).not.toContain('normal');
+  });
+  /**
+   * A repository Tier 0 could not read is the one a user most wants to go and look at, so it
+   * expands like any other row — its drawer is where the failure is explained and where the buttons
+   * that open it elsewhere live. Rust validates those against what discovery found rather than
+   * against the rows for exactly this case.
+   */
+  it('expands a row that could not be read, and explains why', () => {
+    const wrapper = mountRow(MakeDiscovered({ path: 'C:/work/broken' }), {
+      expanded: true,
+      tier0Done: true,
+      readError: 'HEAD is corrupt',
+    });
+
+    expect(wrapper.text()).toContain('HEAD is corrupt');
+    expect(wrapper.text()).toContain('Reveal');
+  });
+
+  /**
+   * And it must not claim a read failed while one is still to come: mid-scan, a row nothing has
+   * reached yet is pending, not broken.
+   */
+  it('says a row is still being read rather than broken, mid-scan', () => {
+    const wrapper = mountRow(MakeDiscovered({ path: 'C:/work/pending' }), { expanded: true });
+
+    expect(wrapper.text()).toContain('counting…');
+    expect(wrapper.text()).not.toContain('could not be read');
+  });
+
+  it('forwards which tool a row was asked to open in', async () => {
+    const wrapper = mountRow(MakeStatus({ path: 'C:/work/a' }), { expanded: true });
+
+    await button(wrapper, 'Editor').trigger('click');
+
+    expect(wrapper.emitted('open')).toEqual([['editor']]);
   });
 });
