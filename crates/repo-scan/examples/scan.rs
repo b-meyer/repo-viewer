@@ -21,7 +21,8 @@ use std::{
 };
 
 use repo_scan::{
-    DiscoveredRepo, Head, RepoKind, RepoStatus, ScanOpts, discover_roots, read_tier0_all,
+    DiscoveredRepo, Head, RepoKind, RepoStatus, ScanOpts, Tier1, discover_roots, read_tier0_all,
+    read_tier1_all_with,
 };
 
 fn main() -> ExitCode {
@@ -37,7 +38,11 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    let (repos, summary) = discover_roots(std::slice::from_ref(&root), &ScanOpts::default());
+    let (repos, summary) = discover_roots(
+        std::slice::from_ref(&root),
+        &ScanOpts::default(),
+        &AtomicBool::new(false),
+    );
 
     println!("root:      {}", root.display());
     println!("repos:     {}", summary.repos_found);
@@ -66,6 +71,30 @@ fn main() -> ExitCode {
     );
     print_tier0_stats(&statuses);
     print_errors("tier 0", &tier0.errors);
+
+    println!();
+    let collected = std::sync::Mutex::new(Vec::new());
+    let tier1 = read_tier1_all_with(
+        &repos,
+        &std::sync::Arc::new(AtomicBool::new(false)),
+        |row| {
+            collected.lock().expect("not poisoned").push(row);
+        },
+    );
+    let dirty_rows: Vec<Tier1> = collected.into_inner().expect("not poisoned");
+
+    println!(
+        "tier 1:    {} ms over {} repos ({} bare, skipped)",
+        tier1.elapsed_ms, tier1.repos_read, tier1.bare_skipped
+    );
+    println!(
+        "  dirty:     {} of {} worktrees",
+        dirty_rows.iter().filter(|row| row.dirty).count(),
+        dirty_rows.len()
+    );
+    let conflicted: u32 = dirty_rows.iter().map(|row| row.conflicted).sum();
+    println!("  conflicts: {conflicted} files across the tree");
+    print_errors("tier 1", &tier1.errors);
 
     if rows {
         println!();

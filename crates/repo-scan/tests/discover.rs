@@ -6,7 +6,10 @@
 
 mod support;
 
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    sync::atomic::AtomicBool,
+};
 
 use repo_scan::{DiscoveredRepo, RepoKind, ScanOpts, discover_roots};
 
@@ -25,7 +28,11 @@ fn finds_a_worktree_a_submodule_and_a_bare_repo() {
         ..ScanOpts::default()
     };
 
-    let (repos, summary) = discover_roots(&[fixture.root().to_path_buf()], &opts);
+    let (repos, summary) = discover_roots(
+        &[fixture.root().to_path_buf()],
+        &opts,
+        &AtomicBool::new(false),
+    );
 
     assert_eq!(
         kind_of(&repos, &fixture.path("wt")),
@@ -66,7 +73,11 @@ fn finds_a_worktree_a_submodule_and_a_bare_repo() {
 fn stops_at_the_first_git_by_default() {
     let fixture = fixtures::build();
 
-    let (repos, summary) = discover_roots(&[fixture.root().to_path_buf()], &ScanOpts::default());
+    let (repos, summary) = discover_roots(
+        &[fixture.root().to_path_buf()],
+        &ScanOpts::default(),
+        &AtomicBool::new(false),
+    );
 
     assert_eq!(kind_of(&repos, &fixture.path("plain/nested")), None);
     assert_eq!(kind_of(&repos, &fixture.path("parent/sub")), None);
@@ -88,7 +99,11 @@ fn a_submodule_reached_directly_is_classified_as_one() {
     let fixture = fixtures::build();
     let sub = fixture.path("parent/sub");
 
-    let (repos, _) = discover_roots(std::slice::from_ref(&sub), &ScanOpts::default());
+    let (repos, _) = discover_roots(
+        std::slice::from_ref(&sub),
+        &ScanOpts::default(),
+        &AtomicBool::new(false),
+    );
 
     assert_eq!(kind_of(&repos, &sub), Some(RepoKind::Submodule));
 }
@@ -99,7 +114,11 @@ fn a_submodule_reached_directly_is_classified_as_one() {
 fn prunes_generated_directories_and_reports_the_count() {
     let fixture = fixtures::build();
 
-    let (repos, summary) = discover_roots(&[fixture.root().to_path_buf()], &ScanOpts::default());
+    let (repos, summary) = discover_roots(
+        &[fixture.root().to_path_buf()],
+        &ScanOpts::default(),
+        &AtomicBool::new(false),
+    );
 
     assert_eq!(kind_of(&repos, &fixture.path("node_modules/pkg")), None);
     assert_eq!(summary.dirs_pruned, 1);
@@ -112,7 +131,11 @@ fn prunes_generated_directories_and_reports_the_count() {
 fn resolves_the_git_directory_for_each_kind() {
     let fixture = fixtures::build();
 
-    let (repos, _) = discover_roots(&[fixture.root().to_path_buf()], &ScanOpts::default());
+    let (repos, _) = discover_roots(
+        &[fixture.root().to_path_buf()],
+        &ScanOpts::default(),
+        &AtomicBool::new(false),
+    );
 
     let worktree = row(&repos, &fixture.path("wt"));
     assert_eq!(worktree.name, "wt");
@@ -133,7 +156,7 @@ fn deduplicates_overlapping_roots() {
     let fixture = fixtures::build();
     let roots = vec![fixture.root().to_path_buf(), fixture.path("plain")];
 
-    let (repos, _) = discover_roots(&roots, &ScanOpts::default());
+    let (repos, _) = discover_roots(&roots, &ScanOpts::default(), &AtomicBool::new(false));
 
     let plain = fixture.path("plain");
     assert_eq!(repos.iter().filter(|repo| repo.path == plain).count(), 1);
@@ -145,7 +168,7 @@ fn an_unreadable_root_is_recorded_rather_than_fatal() {
     let fixture = fixtures::build();
     let roots = vec![fixture.path("does-not-exist"), fixture.root().to_path_buf()];
 
-    let (repos, summary) = discover_roots(&roots, &ScanOpts::default());
+    let (repos, summary) = discover_roots(&roots, &ScanOpts::default(), &AtomicBool::new(false));
 
     assert_eq!(summary.errors.len(), 1);
     assert_eq!(summary.repos_found, 4);
@@ -165,7 +188,11 @@ fn max_depth_limits_the_descent() {
         ..ScanOpts::default()
     };
 
-    let (repos, _) = discover_roots(&[fixture.root().to_path_buf()], &opts);
+    let (repos, _) = discover_roots(
+        &[fixture.root().to_path_buf()],
+        &opts,
+        &AtomicBool::new(false),
+    );
 
     assert!(
         repos.is_empty(),
@@ -203,7 +230,7 @@ fn a_case_differing_root_collapses_onto_the_on_disk_form() {
     let shouted = fixture.root().to_string_lossy().to_uppercase();
     let roots = vec![fixture.root().to_path_buf(), PathBuf::from(&shouted)];
 
-    let (repos, summary) = discover_roots(&roots, &ScanOpts::default());
+    let (repos, summary) = discover_roots(&roots, &ScanOpts::default(), &AtomicBool::new(false));
 
     assert!(
         summary.errors.is_empty(),
@@ -214,4 +241,40 @@ fn a_case_differing_root_collapses_onto_the_on_disk_form() {
     // The reported path is the on-disk spelling, not the one that was asked for.
     let plain = row(&repos, &fixture.path("plain"));
     assert!(!plain.path.to_string_lossy().starts_with(&shouted));
+}
+
+/// A pre-set flag stops the walk before it reports anything.
+///
+/// Mirrors `tier0.rs`'s `cancellation_stops_the_pass`. The uncancelled control call is not
+/// decoration: without it this test also passes when the fixture tree is empty or the root is
+/// wrong, which is the failure mode a cancellation test is most likely to have.
+#[test]
+fn cancellation_stops_the_walk() {
+    let fixture = fixtures::build();
+
+    let (found, _) = discover_roots(
+        &[fixture.root().to_path_buf()],
+        &ScanOpts::default(),
+        &AtomicBool::new(false),
+    );
+    assert!(
+        !found.is_empty(),
+        "the fixture tree should hold repositories"
+    );
+
+    // Pre-set so the outcome does not depend on winning a race with the walk.
+    let cancelled = AtomicBool::new(true);
+    let (repos, summary) = discover_roots(
+        &[fixture.root().to_path_buf()],
+        &ScanOpts::default(),
+        &cancelled,
+    );
+
+    assert!(repos.is_empty());
+    assert_eq!(summary.repos_found, 0);
+    assert!(
+        summary.errors.is_empty(),
+        "cancelling is not a failure: {:?}",
+        summary.errors
+    );
 }

@@ -66,6 +66,22 @@ pub enum Error {
         message: String,
     },
 
+    /// A worktree-level read failed on a repository that opened.
+    ///
+    /// Partial rather than total: the row keeps everything Tier 0 gave it, the affected Tier 1
+    /// field stays unknown, and this message reaches
+    /// [`RepoStatus::error`](crate::model::RepoStatus::error). Distinct from [`Error::Refs`]
+    /// because it names a read that touched the worktree, which is the expensive kind.
+    #[error("cannot read {what} of `{path}`: {message}")]
+    Worktree {
+        /// The repository's resolved Git directory.
+        path: PathBuf,
+        /// Which read failed, for the message — `"status"`, `"index"`.
+        what: &'static str,
+        /// Rendered cause.
+        message: String,
+    },
+
     /// A per-repository read panicked and was caught.
     ///
     /// `gix` can panic on a corrupt object or pack. Per-repo work runs under `catch_unwind` so

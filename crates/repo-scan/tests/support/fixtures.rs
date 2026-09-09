@@ -3,7 +3,7 @@
 //! Two of them, deliberately separate. [`build`] is the discovery tree, whose exact `repos_found`
 //! and `dirs_visited` counts `discover.rs` asserts — adding a repository to it would make every
 //! one of those counts a maintenance tax on tests that do not care. [`status_tree`] is the Tier 0
-//! tree: upstream topologies, parked operations, and the head shapes.
+//! tree: upstream topologies, parked operations, the head shapes, and the Tier 1 worktree states.
 //!
 //! A nested `.git` cannot be committed inside the outer repository, and the cases most worth
 //! testing — a linked worktree, a submodule, a bare repository — are exactly the ones that need
@@ -238,6 +238,10 @@ pub fn status_tree() -> &'static Fixture {
 ///   rebasing/       a conflicted rebase parked
 ///   bare.git/       bare, reads Tier 0 with no worktree
 ///   wt/             a linked worktree of behind/, which has a FETCH_HEAD
+///   untracked/      one new file, never added               Tier 1: dirty
+///   stagedonly/     one new file staged, worktree clean     Tier 1: dirty
+///   unstaged/       one tracked file modified, not added    Tier 1: dirty
+///   conflicted/     a parked modify/modify merge, 2 files   Tier 1: 2 conflicted
 /// ```
 ///
 /// Clone order is load-bearing. Every clone starts at the same upstream tip, so each topology is
@@ -326,6 +330,7 @@ fn build_status() -> Fixture {
 
     build_stashed(&root.join("stashed"));
     build_parked_states(&root);
+    build_tier1_states(&root, &origin);
 
     git(&root, &["init", "--bare", "bare.git"]);
 
@@ -479,4 +484,72 @@ fn write_commit(repo: &Path, file: &str, contents: &str, message: &str) {
 /// A path as git wants it in a URL position: forward slashes, even on Windows.
 fn local_url(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
+}
+
+/// Build the four worktree states Tier 1 is read from.
+///
+/// ```text
+/// untracked/    one new file, never added        dirty, 0 conflicted
+/// stagedonly/   one new file added, not committed; worktree matches the index
+/// unstaged/     one tracked file modified, not added
+/// conflicted/   a parked modify/modify merge over two files
+/// ```
+///
+/// Each of the first three is a *separate* fixture because each is caught by a different mistake,
+/// and a single "dirty" repository would let two of those mistakes pass:
+///
+/// - `untracked` fails if the dirty flag comes from `gix::Repository::is_dirty()`, which documents
+///   that untracked files do not affect it.
+/// - `stagedonly` fails if the flag comes from `into_index_worktree_iter()`, which deactivates the
+///   HEAD-tree comparison — the worktree matches the index here, so only tree-against-index sees
+///   the change.
+/// - `unstaged` is the case every implementation gets right, and is here so a flag that is somehow
+///   always `true` does not pass by agreeing with the other two.
+///
+/// `conflicted` is a modify/modify merge on purpose: it leaves stages 1, 2 and 3 for each path, so
+/// six index entries across two files. A count of index entries reports 6 and a count of distinct
+/// paths reports 2, which is what `git status` shows.
+fn build_tier1_states(root: &Path, origin: &str) {
+    for name in ["untracked", "stagedonly", "unstaged", "conflicted"] {
+        git(root, &["clone", origin, name]);
+    }
+
+    // Never added, so only a directory walk can see it.
+    let untracked = root.join("untracked");
+    std::fs::write(untracked.join("new.txt"), "untracked\n").expect("write untracked file");
+
+    // Added but not committed, and the worktree agrees with the index — so the only difference is
+    // between HEAD's tree and the index.
+    let staged = root.join("stagedonly");
+    std::fs::write(staged.join("staged.txt"), "staged\n").expect("write staged file");
+    git(&staged, &["add", "staged.txt"]);
+
+    // A tracked file changed on disk and not staged. `a.txt` comes from the seed commits.
+    let unstaged = root.join("unstaged");
+    std::fs::write(unstaged.join("a.txt"), "modified\n").expect("modify tracked file");
+
+    // Two files changed on both sides of a merge, which parks a conflict over both.
+    let conflicted = root.join("conflicted");
+    for file in ["c1.txt", "c2.txt"] {
+        std::fs::write(conflicted.join(file), "base\n").expect("write conflict base");
+    }
+    git(&conflicted, &["add", "c1.txt", "c2.txt"]);
+    git(&conflicted, &["commit", "-m", "conflict base"]);
+
+    git(&conflicted, &["checkout", "-b", "other"]);
+    for file in ["c1.txt", "c2.txt"] {
+        std::fs::write(conflicted.join(file), "theirs\n").expect("write theirs");
+    }
+    git(&conflicted, &["add", "c1.txt", "c2.txt"]);
+    git(&conflicted, &["commit", "-m", "theirs"]);
+
+    git(&conflicted, &["checkout", "main"]);
+    for file in ["c1.txt", "c2.txt"] {
+        std::fs::write(conflicted.join(file), "ours\n").expect("write ours");
+    }
+    git(&conflicted, &["add", "c1.txt", "c2.txt"]);
+    git(&conflicted, &["commit", "-m", "ours"]);
+
+    // The failure is the point: a clean merge would commit and leave no conflicted entries.
+    git_may_fail(&conflicted, &["merge", "other"]);
 }

@@ -3,12 +3,13 @@
 A cross-platform desktop app: point it at a folder and get a live dashboard of every Git repo
 beneath it — branch, ahead/behind, dirty state, file counts — without opening each one in an IDE.
 
-Status: **Phase 2 complete.** The workspace, the toolchain, and the app shell build and run end to
-end: `vp check`, `vp run typecheck`, `vp test run`, and `vp run rust` are green, `vp run types`
-generates the bindings, and `vp run build` produces both Windows installers. Discovery finds and
-classifies every repository under a root, and Tier 0 turns each one into a row from refs alone —
-branch, upstream, ahead/behind, stash count, in-progress state, tip commit, last-fetched age. None
-of it is wired to the UI yet. Next step is Phase 3, streaming IPC and a minimal table.
+Status: **Phase 3 complete — the app is useful.** Point it at a folder and rows stream into a table
+as the walk finds them, then fill in tier by tier: branch, upstream, ahead/behind, stash count,
+in-progress state, tip commit and last-fetched age from refs alone, then the dirty flag and
+conflicted count from the worktree. Scans are cancellable, roots are managed in-app, and the whole
+gate is green — `vp check`, `vp run typecheck`, `vp test run`, `vp run rust`, `vp run types`, and
+`vp run build`. Tier 1 was pulled forward from Phase 4 into this phase; what remains there is the
+per-file counts and the detail drawer that triggers them.
 
 ---
 
@@ -77,14 +78,16 @@ TypeScript and the other a Rust crate.
 Most of what the dashboard shows costs almost nothing; only file counts are expensive. Three
 tiers stream independently, so a row appears before any worktree is touched.
 
-| Tier                | Cost per repo                                                                                                                                  | Yields                                                                                                                        | When                                                                     |
-| ------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------ |
-| **0 — refs only**   | ~3 ms measured (§11); reads `.git/HEAD`, `packed-refs`, loose refs, `refs/stash` reflog, `FETCH_HEAD` mtime, revwalk with commit-graph         | branch, ahead/behind, upstream, stash count, state flags (rebase/merge/bisect/revert/detached), last commit, last-fetched age | immediately, every scan                                                  |
-| **1 — dirty flag**  | early-exit: first item from the status iterator, **untracked files included**; conflicted count read from index stage entries, no worktree I/O | clean/dirty boolean, conflicted count                                                                                         | streams in right after Tier 0                                            |
-| **2 — full counts** | full index↔worktree diff                                                                                                                       | staged / unstaged / untracked / conflicted                                                                                    | lazily: expanded rows, explicit refresh — never in the default scan path |
+| Tier                | Cost per repo                                                                                                                                                                                                  | Yields                                                                                                                        | When                                                                     |
+| ------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------ |
+| **0 — refs only**   | ~3 ms measured (§11); reads `.git/HEAD`, `packed-refs`, loose refs, `refs/stash` reflog, `FETCH_HEAD` mtime, revwalk with commit-graph                                                                         | branch, ahead/behind, upstream, stash count, state flags (rebase/merge/bisect/revert/detached), last commit, last-fetched age | immediately, every scan                                                  |
+| **1 — dirty flag**  | ~17 ms measured warm, ~146 ms cold (§11) — an early exit on the first status item, **untracked and staged changes both included**; the conflicted count comes from index stage entries and touches no worktree | clean/dirty boolean, conflicted count                                                                                         | streams in right after Tier 0                                            |
+| **2 — full counts** | full index↔worktree diff                                                                                                                                                                                       | staged / unstaged / untracked / conflicted                                                                                    | lazily: expanded rows, explicit refresh — never in the default scan path |
 
 Tier 0 alone answers "which repos have unpushed commits?" with zero worktree I/O. This tiering
-matters more to perceived performance than any library choice.
+matters more to perceived performance than any library choice, and the measured gap is why: Tier 1
+costs about **24x** Tier 0 on a cold cache (§11). Waiting to paint a complete row would mean
+holding an answer that is ready in a third of a second behind one that takes another seven.
 
 ### 2.3 Diagrams
 
@@ -134,9 +137,19 @@ Three `gix` traps and their handling:
 
 - **`Repository::is_dirty()` is not the dirty flag.** Its docs state "untracked files do _not_
   affect this flag" — it sets `dirwalk_options = None`, so a repo with a brand-new file reports
-  clean. Tier 1 uses `repo.status(Discard)?.untracked_files(Collapsed).into_index_worktree_iter(..)`
-  with `should_interrupt`, and takes the first item. Clean repos pay a full ignore-aware worktree
-  walk; Phase 4 records that cost.
+  clean.
+- **`into_index_worktree_iter()` is not the iterator either**, which is the less obvious half. It
+  sets `head_tree = None`, so it compares only the index against the worktree: a repository with
+  staged-but-uncommitted changes and a clean worktree reports clean through it. Tier 1 uses
+  `repo.status(Discard)?.untracked_files(Collapsed).should_interrupt_owned(..).into_iter(..)` and
+  takes the first item. `into_iter` keeps the HEAD-tree comparison `status()` sets up by default
+  and runs all three checks at once — the directory walk for untracked files, index-to-worktree for
+  unstaged changes, tree-to-index for staged ones — so any item at all means dirty. Note the
+  `should_interrupt_owned`: `gix` accepts an owned `Arc` or a `&'static` flag here, not the plain
+  reference Tier 0 takes.
+- **A conflicted path has up to three index entries.** A merge conflict writes stages 1, 2 and 3
+  for one path, so counting entries with a non-zero stage triples the number of conflicted files.
+  The count is of distinct paths, which is what `git status` shows.
 - **`with_boundary` is not `^upstream`.** Its docs say a boundary "is distinctly different from
   exclusive revspecs" — it stops the walk at the given ids but does not hide their ancestors, so
   any merged history overcounts. Ahead/behind is `rev_walk([local]).with_hidden([upstream])`
@@ -210,9 +223,17 @@ Catalogs are a pnpm-workspace feature, so that file exists even though this is a
 Bump with `vp update -L <pkg>`, never by widening a range.
 
 **Virtualization is deferred.** 500 rows of simple DOM does not need it, and it costs real
-complexity in measurement, sticky headers, keyboard nav, and find-in-page. Keep row markup
-fixed-height, measure, and add `@tanstack/vue-virtual` 3.13.36 past a measured threshold
-(~1000 rows, or a p95 frame-budget miss).
+complexity in measurement, sticky headers, keyboard nav, and find-in-page. Measure, and add
+`@tanstack/vue-virtual` 3.13.36 past a measured threshold (~1000 rows, or a p95 frame-budget
+miss).
+
+**Rows are not fixed height, and whoever virtualizes them must use dynamic measurement.** The
+original plan here was to keep the markup fixed-height; the Upstream-and-sync cell makes that
+impossible, and deliberately so. It renders one line for a repository with no upstream and three
+for one that has counts and a fetch age, because the counts are meaningless without that age
+beside them (§8.2) — collapsing it to a uniform height would mean either dropping the age or
+padding every short row with a blank line. `@tanstack/vue-virtual` supports `measureElement` for
+exactly this; budget for it rather than assuming a constant `estimateSize`.
 
 ### 3.3 Version constraints
 
@@ -240,8 +261,9 @@ workspace crates_, so editing `repo-scan` still triggers a rebuild.
 1. **`[profile.release]` must live in the root `Cargo.toml`.** Cargo ignores profile sections in
    member crates with only a warning, so the `lto`/`codegen-units = 1`/`strip` block belongs at
    the root or the binary ships unoptimized and large.
-2. **`target/` is at the workspace root.** The template's `src-tauri/.gitignore` entry for
-   `/target/` stops matching; add `/target/` at the repo root.
+2. **`target/` is at the workspace root**, so `/target/` is ignored from the root `.gitignore` and
+   there is no `src-tauri/.gitignore`. A `/target/` entry scoped to `src-tauri/` matches nothing
+   once the workspace moves the directory, which is how build output ends up staged.
 3. **Keep `[lib] name = "..._lib"`** in `src-tauri/Cargo.toml`. The suffix prevents a lib/bin
    name collision **on Windows specifically**
    ([cargo#8519](https://github.com/rust-lang/cargo/issues/8519)).
@@ -305,11 +327,29 @@ unreliable — while git's answer cannot drift from git's behaviour. The literal
 so an implementation returning `(0, 0)` everywhere cannot pass by agreeing with an oracle that
 also reads zero.
 
-One fixture still to come: a repo whose only change is one untracked file (Phase 4 — Tier 1 must
-say dirty).
+Tier 1's fixtures follow the same principle, and there are four rather than one because a single
+"dirty repository" would let two of three plausible mistakes pass: `untracked/` (one new file, never
+added) catches a flag built on `is_dirty()`, `stagedonly/` (added, worktree clean) catches one built
+on `into_index_worktree_iter()`, `unstaged/` is the case everyone gets right and is there so an
+always-`true` flag cannot pass by agreeing with the other two, and `conflicted/` is a modify/modify
+merge over two files — six index entries — so a count of entries reads 6 where a count of paths
+reads 2. The oracle is `git status --porcelain`, run over every repository in the tree.
 
 Frontend code that reaches `ipc.ts` is tested with `mockIPC` from `@tauri-apps/api/mocks`,
-which intercepts `invoke` and `Channel` traffic without a webview; no hand-rolled mocks.
+which intercepts `invoke` and `Channel` traffic without a webview; no hand-rolled mocks. Under
+`mockIPC` nothing is serialised, so the handler is given the **live** `Channel` instance rather
+than its `"__CHANNEL__:id"` wire form — which is what makes streaming testable at all.
+`src/tests/channel.ts` drives one; its `index` must start at 0 and rise by exactly 1, because
+`Channel` buffers an out-of-order message in a private field and delivers nothing until the gap
+fills, presenting as a hung assertion rather than an error.
+
+**There are no `#[tauri::command]`-level Rust tests, deliberately.** They need
+`tauri = { features = ["test"] }`, which pulls the test harness into the dependency graph of a
+shipped binary. The commands are thin — validate an input, clone an `Arc`, spawn — and everything
+underneath them is covered by the `state`, `stream` and `pipeline` module tests. `pipeline`'s run
+against a **real** `tauri::ipc::Channel`, because `Channel::new` needs no `AppHandle` or `Webview`;
+its handler collects the serialised body, so the assertions run over what actually crosses the wire.
+That is also why there is no `EventSink` trait: the real channel removed the reason for one.
 
 **No `criterion`.** Its repeated-sampling model is the wrong shape for a whole-tree scan — 100
 samples of a multi-second operation is a five-minute run fought with `sample_size`. A tier's timing
@@ -385,7 +425,7 @@ threads on the machine as it has cores.
 Discovery yields `DiscoveredRepo` — path, name, parent, kind, and the resolved Git directory —
 rather than a partial `RepoStatus`. The §8.1 Tier 0 fields are not `Option`, because a row that
 has been read always has them, and discovery has read nothing; a "partial" row would have to lie.
-This is what `RepoFound` carries, and Tier 0 turns it into a `RepoStatus`. `ScanOpts` and
+This is what the `ReposFound` event carries, and Tier 0 turns it into a `RepoStatus`. `ScanOpts` and
 `ScanSummary` cross the same boundary and live in `model.rs` beside it.
 
 The Git directory is resolved once, here: `<path>/.git` for a normal repo, `<path>` itself when
@@ -426,7 +466,9 @@ the private Git directory — more robust than matching `worktrees/` or `modules
 ### 6.1 Commands
 
 ```rust
-subscribe(on_event: Channel<RepoEvent>)           // once at startup; lives for the session
+subscribe(on_event: Channel<RepoEvent>) -> Vec<RepoStatus>  // once at startup; lives for the
+                                                  //   session. Returns the canonical map, so a
+                                                  //   reloaded webview repaints without rescanning
 scan_roots(roots: Vec<PathBuf>, opts: ScanOpts, on_event: Channel<ScanEvent>) -> ScanId
 cancel_scan(id: ScanId)
 refresh_repo(path: PathBuf, tier: Tier) -> RepoStatus
@@ -434,8 +476,13 @@ full_status(path: PathBuf) -> DetailedStatus      // Tier 2, on demand
 fetch_repos(paths: Vec<PathBuf>, on_event: Channel<FetchEvent>)   // git CLI
 open_in(path: PathBuf, target: OpenTarget)        // editor | terminal | file manager
 pick_root() -> Option<PathBuf>                    // native folder dialog, via the plugin's Rust API
-add_root(path) / remove_root(path) / list_roots()
+add_root(path) -> Vec<PathBuf>                    // canonicalises and validates; returns the list
+remove_root(path) -> Vec<PathBuf>                 // evicts its rows, pushed as RepoEvent::Removed
+list_roots() -> Vec<PathBuf>
 ```
+
+The root commands return the new list rather than `()`, so the frontend mirrors it exactly as it
+mirrors the rows and never maintains a second copy.
 
 Commands registered via `invoke_handler` are callable by all windows by default and need no
 capability declaration. Because the plugins are reached only from Rust (§3.1), no plugin
@@ -445,6 +492,12 @@ the Rust side is trusted — which is why all fs access stays in Rust and `tauri
 used. The corollary is that commands validate their own inputs: `open_in`, `refresh_repo` and
 `full_status` accept only a path that is already a key in the canonical repo map (§6.3), never
 an arbitrary string from the webview.
+
+Roots are the other half of that rule, and a different check: they are by definition _not_ map
+keys. `scan_roots` accepts only a path already on the root list, and `add_root` is the single place
+a new path enters the app — it canonicalises through the same helper discovery uses and requires
+the path to be a directory. Canonicalising through that one helper is what makes a root a prefix of
+the row keys beneath it, which is what `remove_root` relies on to evict them.
 
 `refresh_repo` is fallible for the §8.1 total-failure grade: a repository that will not open, or
 whose HEAD is unreadable, has no honest `RepoStatus` to return. It reports that failure rather than
@@ -464,19 +517,37 @@ ordering.
 Batch channel sends — flush every ~50 ms or every 25 repos — rather than one send per repo. The
 per-message JSON serialization cost is what bites.
 
-Every `ScanEvent` carries its `ScanId`. The frontend keeps the id of the scan it asked for and
-drops batches from any other, so a rescan or a root change mid-scan cannot interleave stale rows
-with fresh ones.
+Every `ScanEvent` carries its `ScanId`, so a rescan or a root change mid-scan cannot interleave
+stale rows with fresh ones.
+
+**The id cannot be the primary filter, though, and a design that assumes it is has a hole.** Rust
+starts the pipeline before `scan_roots`'s reply crosses back, so a batch can arrive while the
+frontend still does not know the id to compare it against. The frontend therefore keys acceptance
+on a **generation counter** captured in the event handler's closure _before_ the invoke — which has
+no window at all — and treats the id as the guard on top: `activeId` latches from the first
+accepted event, and once latched, any event bearing a different id is dropped. The resolved id
+cross-checks the latch rather than establishing it.
 
 ### 6.3 Rust owns the canonical state
 
 A tiered stream has a merge problem: a Tier 0 result for a repo arriving after its Tier 1 result
 carries `dirty: None`, and a naive "replace the row" would erase a value the UI already shows.
 The merge therefore happens once, in Rust. `src-tauri/src/state.rs` holds
-`HashMap<PathBuf, RepoStatus>`; each tier result is merged field-wise into the existing row, and
-the **full merged row** is what goes over the channel. The Pinia store is a mirror keyed by path
+`HashMap<PathBuf, RepoStatus>`, and the **full merged row** is what goes over the channel — on the
+scan's `Channel<ScanEvent>` for a scan result, on the session `Channel<RepoEvent>` for a watcher,
+poll, or fetch push (§6.2). The Pinia store is a mirror keyed by path
 — it never merges, never infers, and never holds a value Rust does not. The same map is what the
 JSON cache serialises, so there is exactly one source of truth on each side of the IPC boundary.
+
+**The rule is tier ownership, not field-wise option preference.** Each tier replaces every field
+it owns, `None` included, and leaves fields owned by other tiers untouched. The distinction is
+load-bearing and easy to get backwards: `upstream`, `ahead`, `behind`, `last_commit` and
+`last_fetched_ms` are `Option` because the _answer_ can be none — no upstream configured, never
+fetched — not because the value might be uncomputed. A merge preferring `Some` over `None` on
+every `Option` would report a deleted upstream as live for the rest of the session, which is
+§8.1's dishonesty pointing the other way. Only the genuinely tiered fields — `dirty`,
+`conflicted`, `counts`, `submodules` — mean "not computed yet" when `None`, and only those survive
+a merge from another tier.
 
 ### 6.4 Cancellation
 
@@ -652,7 +723,7 @@ Also carry `boost` for field weighting (repo name over its path), `MIN_QUERY_LEN
 
 **The corpus is live, not static.** qdocs fetches a prebuilt index once; here the corpus _is_ the
 repo set, streaming in tier by tier and mutating on watcher events. So build from the Pinia store
-with no `fetch` and no build-time artifact; `add` on `RepoFound` batches and **`replace(doc)`**
+with no `fetch` and no build-time artifact; `add` on `ReposFound` batches and **`replace(doc)`**
 when a row changes. MiniSearch 7 has the full incremental surface — `add`, `addAll`,
 `addAllAsync`, `remove`, `removeAll`, `replace`, `discard`, `discardAll`, `vacuum`, `has`,
 `getStoredFields`, `search`, `autoSuggest`, plus `toJSON` / static `loadJSON`. Prefer `discard`
@@ -801,7 +872,7 @@ the built bundle's `import.meta.env.PROD` flag (§3.3).
 
 Each phase gets a runbook in `docs/` when it starts, written against the tree as it exists then,
 and is deleted when the phase completes — durable facts move into README.md and AGENTS.md.
-No phase is currently open; Phase 3 gets the next one.
+No phase is currently open; Phase 4 gets the next one.
 
 **Phase 0 — Environment and structure.** The Cargo workspace with its root `[profile.release]`
 (§4.1), `pnpm-workspace.yaml` with the catalog and the `vite`→core override, `vite.config.ts`
@@ -826,13 +897,13 @@ is the entry point Phase 3 wires to the channel. Discovery has no fallible signa
 unreadable root, a permission error, and a broken `.git` are all `ScanSummary.errors` values, so
 one stale drive letter cannot cost the user the roots that did scan.
 
-_Verified:_ nine tests in `crates/repo-scan/tests/discover.rs` against a `git`-built fixture tree
+_Verified:_ ten tests in `crates/repo-scan/tests/discover.rs` against a `git`-built fixture tree
 cover all four repository kinds, stop-at-first-`.git`, the descend flag, pruning with its count,
-overlapping-root and case-differing-root deduplication, a bad root alongside good ones, and
-`max_depth`. A real run over `C:/Working/Source` found 51 repositories across 566 directories in
-58 ms — discovery only, and not the number §2.2 defends, which is Phase 2's. The one §5.2 case with
-no test is a genuine permission failure, which has no portable way to stage; the code path it would
-take is the same one the unreadable-root test exercises.
+overlapping-root and case-differing-root deduplication, a bad root alongside good ones,
+`max_depth`, and cancellation. A real run over `C:/Working/Source` found 51 repositories across 566
+directories in 58 ms — discovery only, and not the number §2.2 defends, which is Phase 2's. The one
+§5.2 case with no test is a genuine permission failure, which has no portable way to stage; the code
+path it would take is the same one the unreadable-root test exercises.
 
 _Settled by those runs:_ `gix::discover::is_git` already implements every §5.2 classification
 case, so none of it is hand-rolled — see [AGENTS.md](./AGENTS.md). `dirs_pruned` was **0** on the
@@ -870,14 +941,67 @@ something this project does, so scale and the with/without pair are measured on 
 instead. `examples/synth.rs` disables git's own auto-maintenance to keep that baseline honest —
 see the trap in [AGENTS.md](./AGENTS.md).
 
-**Phase 3 — Streaming IPC and minimal UI.** Canonical state map and tier merge (§6.3),
+**Phase 3 — Streaming IPC, Tiers 0–1, and a minimal UI.** Canonical state map and tier merge (§6.3),
 `subscribe` session channel, `scan_roots` with `ScanId` and `cancel_scan` (§6.4), `pick_root`
 over the dialog plugin's Rust API, Pinia mirror store, plain non-virtualized table, progress
 indicator. **First point at which the app is useful.**
 
-**Phase 4 — Tiers 1 and 2.** Dirty flag from the status iterator with untracked files included,
-conflicted count from the index; lazy full status on row expand. _Deliverable:_ Tier 1 timing
-over the same tree as Phase 2, and a check that partial-state rendering is honest (§8.1).
+_Verified:_ 65 Rust tests (10 discovery, 20 Tier 0, 11 Tier 1, 24 in `src-tauri`) and 77 frontend
+tests, with `vp check` and `vp run typecheck` clean. The pipeline's smoke test runs against a
+**real** `tauri::ipc::Channel` — `Channel::new` needs no `AppHandle`, so the assertions run over
+what actually crosses the wire rather than over a mock's idea of it, which is why no `EventSink`
+trait exists.
+
+Engine timings over `C:/Working/Source`, 52 repositories across 567 directories, 1 of them carrying
+a commit-graph and 17 of them dirty:
+
+| Stage     | Cold    | Warm   | Per repo, warm |
+| --------- | ------- | ------ | -------------- |
+| Discovery | 54 ms   | 32 ms  | —              |
+| Tier 0    | 322 ms  | 136 ms | ~2.6 ms        |
+| Tier 1    | 7581 ms | 906 ms | ~17 ms         |
+
+All from `cargo run --release --example scan`. A figure from `vp run dev` is a debug build and means
+nothing — it reports ~68 ms per repository for Tier 0 against the ~2.6 ms above.
+
+_Settled by writing it:_ three rules in this document were **wrong as stated** and are now corrected
+above. §6.3's "merged field-wise" would have carried a deleted upstream forever — the rule is tier
+ownership, and only the genuinely tiered fields survive a merge. §6.2's "keep the id and drop the
+others" is not implementable on its own, because Rust starts the pipeline before the invoke's reply
+returns; a generation counter is the primary filter and the id is the guard. §3.1's prescribed
+`into_index_worktree_iter` reports a staged-only change as clean, and a parked merge with it —
+`into_iter` is the one that sees all three kinds of change. Each has a test that fails if the naive
+reading is restored. Also settled: a row that is still a `DiscoveredRepo` once Tier 0 has finished
+**is** §8.1's total-failure grade and must stop rendering as "counting…", and a bare repository's
+worktree fields are `n/a` rather than pending — they can never be computed.
+
+**Tier 1 was pulled forward into this phase.** Leaving the worktree column reading "counting…"
+until Phase 4 was a false claim of work in progress, not merely an absent value — it cost a user an
+overnight wait, which is what made the distinction concrete. The dirty flag and conflicted count
+ship here instead, and the table above is the payoff: the expensive tier is **~24x** the cheap one
+cold, so waiting to paint a complete row would hold an answer that is ready in a third of a second
+behind one that takes another seven. Eleven tests in `crates/repo-scan/tests/tier1.rs` cover it —
+one fixture per trap, plus a `git status --porcelain` oracle over every repository in the tree.
+
+**Phase 4 — Tier 2.** Lazy full status on row expand: staged / unstaged / untracked / conflicted
+counts, and the submodule list, reached through `full_status` and `refresh_repo` — which is where
+`Tier` and `AppState::has_repo` finally get a caller, both deferred out of Phase 3 for want of one.
+Tier 1 was pulled forward into Phase 3 — see its note above — so what remains here is the expensive
+tier and the detail drawer that triggers it. _Deliverable:_ a check that a row expanded and then
+collapsed keeps its counts, and that an unexpanded row still renders them as unknown rather than
+as `0`.
+
+Two known gaps to weigh here, both consequences of Tier 1's cost:
+
+- **The scan summary reports one total, not a per-tier breakdown.** `ScanEvent::Finished` reuses
+  `Tier0Summary`, whose `elapsed_ms` the pipeline fills with whole-scan wall clock, so the UI can
+  only honestly say "scan". Now that Tier 1 is ~24x Tier 0, seeing both numbers in the app would be
+  worth the small wire change.
+- **Tier 0's _total_ failures are only delivered by the terminal event.** That was fine when a scan
+  finished in a few seconds; at Tier 1's ~146 ms/repo cold it is closer to three quarters of a
+  minute on a 300-repository tree, and an unreadable repository would sit there unexplained for all
+  of it. Discovery-side failures are unaffected — `DiscoveryFinished` carries them and fires when
+  the walk ends. A per-batch `RepoErrors` variant is the fix if a tree that size turns up.
 
 **Phase 5 — Filters, sort, grouping, search, persistence.** Filter chips, MiniSearch (§8.3), JSON
 cache and settings via the store plugin from Rust, window state, `open_in` with the repo-map
@@ -918,6 +1042,12 @@ number rather than being removed, because §9 and elsewhere cite these by number
    IT allow indicator — and how colleagues get new versions: a share path with a version check
    in-app, or `tauri-plugin-updater` against an ADO artifact feed. Recommend the certificate plus
    the updater; the allow-indicator route has to be repeated per build hash. _(Blocks Phase 8.)_
+6. ~~**`RepoStatus.error` has one slot and two writers.**~~ **Settled:** Tier 0 owns the slot and
+   replaces it; Tier 1 **appends** to whatever is already there. The two tiers describe different
+   halves of the row and fail independently, so a Tier 1 failure must not erase the reason a Tier 0
+   upstream is missing. Appending cannot accumulate across rescans, because Tier 0 replaces the slot
+   outright and so restarts the chain on every scan. A per-tier field was the alternative and costs
+   a wire change for a case that is rare and only ever displayed. _(Delivered with Tier 1.)_
 
 ---
 

@@ -31,7 +31,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, MutexGuard, PoisonError,
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
     },
     time::Instant,
 };
@@ -45,9 +45,19 @@ use crate::model::{DiscoveredRepo, RepoKind, ScanError, ScanOpts, ScanSummary};
 /// Results are sorted by path. A parallel walk yields in a nondeterministic order, and a caller
 /// that wants a stable list should not have to sort it themselves. Use [`discover_roots_with`]
 /// instead when rows should stream as they are found.
-pub fn discover_roots(roots: &[PathBuf], opts: &ScanOpts) -> (Vec<DiscoveredRepo>, ScanSummary) {
+///
+/// `should_interrupt` is taken here as well as on the streaming variant deliberately: an API where
+/// only one of the two can be cancelled is a trap for the poll refresh that reaches for the
+/// collecting one.
+pub fn discover_roots(
+    roots: &[PathBuf],
+    opts: &ScanOpts,
+    should_interrupt: &AtomicBool,
+) -> (Vec<DiscoveredRepo>, ScanSummary) {
     let found = Mutex::new(Vec::new());
-    let summary = discover_roots_with(roots, opts, |repo| lock(&found).push(repo));
+    let summary = discover_roots_with(roots, opts, should_interrupt, |repo| {
+        lock(&found).push(repo);
+    });
 
     let mut repos = found.into_inner().unwrap_or_else(PoisonError::into_inner);
     repos.sort_by(|left, right| left.path.cmp(&right.path));
@@ -63,7 +73,17 @@ pub fn discover_roots(roots: &[PathBuf], opts: &ScanOpts) -> (Vec<DiscoveredRepo
 /// Each repository is reported exactly once. Deduplication is on the `dunce`-canonicalised path,
 /// which is what collapses overlapping roots, case-differing roots, and — when `follow_links` is
 /// on — two links to one directory into a single row.
-pub fn discover_roots_with<F>(roots: &[PathBuf], opts: &ScanOpts, on_repo: F) -> ScanSummary
+///
+/// `should_interrupt` is checked once per entry. A cancelled walk keeps the repositories it had
+/// already reported and is not an error — the caller flipped the flag and already knows.
+/// `dirs_visited` under-reports on a cancelled walk, which is correct: it counts the directories
+/// actually examined.
+pub fn discover_roots_with<F>(
+    roots: &[PathBuf],
+    opts: &ScanOpts,
+    should_interrupt: &AtomicBool,
+    on_repo: F,
+) -> ScanSummary
 where
     F: Fn(DiscoveredRepo) + Send + Sync,
 {
@@ -105,6 +125,14 @@ where
         let (seen, errors, visited, on_repo) = (&seen, &errors, &visited, &on_repo);
 
         Box::new(move |result| {
+            // First statement in the visitor, deliberately. `WalkState::Quit` is documented as
+            // asynchronous — more entries arrive after it — so checking here drops them instead of
+            // reporting them. A repository delivered after its scan has already emitted `Cancelled`
+            // would have nowhere to go.
+            if should_interrupt.load(Ordering::Relaxed) {
+                return WalkState::Quit;
+            }
+
             let entry = match result {
                 Ok(entry) => entry,
                 Err(err) => {
@@ -200,13 +228,18 @@ fn walker_threads(requested: Option<u32>) -> usize {
     (cores / 2).max(1)
 }
 
-/// Canonicalise through `dunce`, falling back to the path as walked.
+/// Canonicalise through `dunce`, falling back to the path as given.
 ///
 /// `std::fs::canonicalize` *returns* verbatim paths on Windows. They render badly, confuse `git`
 /// CLI arguments, and compare unequal to the same path typed normally — which matters here because
 /// this value is the map key. `dunce` drops the prefix whenever the path is representable without
 /// it.
-fn canonical(path: &Path) -> PathBuf {
+///
+/// Public because a configured root has to be normalised the *same* way a discovered repository
+/// is. They are compared against each other — a root is a path prefix of the rows beneath it — so
+/// two spellings of one folder would silently stop matching. Callers outside the walk get this
+/// function rather than their own `dunce` call for exactly that reason.
+pub fn canonical(path: &Path) -> PathBuf {
     dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 

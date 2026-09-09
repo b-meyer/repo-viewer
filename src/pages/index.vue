@@ -1,57 +1,123 @@
 <template>
-  <div class="flex min-h-0 w-full flex-1 flex-col overflow-auto p-20">
-    <div class="mx-auto flex w-full max-w-800 flex-col gap-20">
-      <h1 class="text-24 mt-10 font-bold" v-text="'Repo Viewer'" />
+  <div class="flex min-h-0 w-full flex-1 flex-col">
+    <root-bar
+      :roots="repos.roots"
+      :scanning="repos.scanning"
+      :disabled="!bridgeReady"
+      @pick="PickAndAdd"
+      @scan="Scan"
+      @cancel="Cancel"
+      @remove="Remove"
+    />
 
-      <div class="card flex flex-col gap-10 p-20">
-        <h2 class="text-14 font-semibold" v-text="'Backend'" />
-
-        <p v-if="state === 'pending'" class="text-14 text-gray-600" v-text="'Checking…'" />
-
-        <!-- A failed ping is the interesting case: it means the IPC bridge is not wired, which
-             would otherwise present as a page that simply renders nothing. -->
-        <p v-else-if="state === 'failed'" class="text-14 text-red-600">
-          IPC unavailable — {{ error }}
-        </p>
-
-        <p v-else class="text-14 text-gray-800">
-          Connected. The backend replied <code class="font-mono" v-text="reply" />.
-        </p>
-      </div>
+    <div v-if="repos.scanError" class="px-20 pt-10">
+      <app-alert tone="error" title="The scan failed">{{ repos.scanError }}</app-alert>
     </div>
+
+    <scan-progress
+      v-if="repos.phase !== 'idle'"
+      :progress="repos.progress"
+      :discovery="repos.discovery"
+      :tier0="repos.tier0"
+    />
+
+    <repo-table
+      :rows="repos.rows"
+      :now="now"
+      :read-errors="repos.readErrors"
+      :empty-message="emptyMessage"
+    />
   </div>
 </template>
 
 <script setup lang="ts">
-import { onMounted, ref } from 'vue';
-import { ping } from '@/scripts/ipc';
+import { useNow } from '@vueuse/core';
+import { computed, inject, onMounted, ref } from 'vue';
+import AppAlert from '@/components/feedback/AppAlert.vue';
+import ScanProgress from '@/components/feedback/ScanProgress.vue';
+import RepoTable from '@/components/repos/RepoTable.vue';
+import RootBar from '@/components/repos/RootBar.vue';
+import * as ipc from '@/scripts/ipc';
+import { CancelScan, StartScan } from '@/scripts/scan';
+import { useReposStore } from '@/stores/repos';
 
-/// Type
+/// Composed
+const repos = useReposStore();
+
 /**
- * Where the backend check has got to. Deliberately three states rather than a boolean: "not
- * answered yet" and "answered badly" are different things to show.
+ * One clock for the whole page, passed down as a prop.
+ *
+ * `useTimeAgo` per value would allocate a timer per cell — at 500 rows across two age columns that
+ * is a thousand of them. A single ticking value plus pure formatters is cheaper and testable with a
+ * frozen clock.
  */
-type PingState = 'pending' | 'connected' | 'failed';
+const clock = useNow({ interval: 30_000 });
 
-/// Data
-const state = ref<PingState>('pending');
-const reply = ref('');
-const error = ref('');
+/**
+ * Whether the IPC bridge came up, provided by the layout.
+ */
+const bridgeReady = inject('bridgeReady', ref(true));
+
+/// Computed
+/**
+ * The clock as epoch milliseconds, which is what every row field is measured in.
+ */
+const now = computed(() => clock.value.getTime());
+
+/**
+ * What the table says when it has no rows, which depends on why it has none.
+ */
+const emptyMessage = computed(() => {
+  if (repos.roots.length === 0) return 'Add a folder to scan.';
+  if (repos.phase === 'idle') return 'Ready. Press Scan.';
+  if (repos.scanning) return 'Searching…';
+  return 'No repositories found under the configured folders.';
+});
 
 /// Methods
 /**
- * Calls the backend and records the outcome.
+ * Opens the folder picker and adds whatever the user chose.
  */
-async function Check(): Promise<void> {
+async function PickAndAdd(): Promise<void> {
   try {
-    reply.value = await ping();
-    state.value = 'connected';
-  } catch (err) {
-    error.value = err instanceof Error ? err.message : String(err);
-    state.value = 'failed';
+    const picked = await ipc.pickRoot();
+    if (picked === null) return;
+    repos.SetRoots(await ipc.addRoot(picked));
+  } catch (error) {
+    repos.SetScanError(error instanceof Error ? error.message : String(error));
   }
 }
 
+/**
+ * Removes one root. Its rows are evicted by Rust and arrive on the session channel.
+ *
+ * @param root - The root to remove.
+ */
+async function Remove(root: string): Promise<void> {
+  try {
+    repos.SetRoots(await ipc.removeRoot(root));
+  } catch (error) {
+    repos.SetScanError(error instanceof Error ? error.message : String(error));
+  }
+}
+
+/**
+ * Scans every configured root.
+ */
+async function Scan(): Promise<void> {
+  await StartScan(repos.roots);
+}
+
+/**
+ * Stops the running scan.
+ */
+async function Cancel(): Promise<void> {
+  await CancelScan();
+}
+
 /// Lifecycle
-onMounted(Check);
+onMounted(async () => {
+  if (!bridgeReady.value) return;
+  repos.SetRoots(await ipc.listRoots());
+});
 </script>

@@ -9,13 +9,15 @@
 //!
 //! - [`tier0`] — refs only. Branch, upstream, ahead/behind, stash, state, tip commit,
 //!   last-fetched age. Runs on every scan and must stay refs-only.
-//! - `tier1` — the dirty flag and conflicted count. Streams right after Tier 0.
+//! - [`tier1`] — the dirty flag and conflicted count. Streams right after Tier 0.
 //! - `tier2` — full file counts. Lazy: expanded rows and explicit refresh only.
 //!
-//! Tiers 1 and 2 are not implemented yet.
+//! Tier 2 is not implemented yet — see PLAN.md §11, Phase 4.
 
 pub mod ahead_behind;
 pub mod tier0;
+pub mod tier1;
 
 pub use ahead_behind::{AHEAD_BEHIND_CAP, ahead_behind};
 pub use tier0::{read_tier0, read_tier0_all, read_tier0_all_with};
+pub use tier1::{Tier1, Tier1Summary, read_tier1, read_tier1_all_with};

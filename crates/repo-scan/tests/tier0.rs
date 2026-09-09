@@ -33,7 +33,8 @@ fn rows() -> HashMap<String, RepoStatus> {
         max_depth: Some(4),
         ..ScanOpts::default()
     };
-    let (found, summary) = discover_roots(&[tree.root().to_path_buf()], &opts);
+    let (found, summary) =
+        discover_roots(&[tree.root().to_path_buf()], &opts, &AtomicBool::new(false));
     assert!(
         summary.errors.is_empty(),
         "discovery of the fixture tree reported errors: {:?}",
@@ -427,7 +428,11 @@ fn a_repository_that_cannot_be_opened_produces_no_row() {
 #[test]
 fn cancellation_stops_the_pass() {
     let tree = fixtures::status_tree();
-    let (found, _) = discover_roots(&[tree.root().to_path_buf()], &ScanOpts::default());
+    let (found, _) = discover_roots(
+        &[tree.root().to_path_buf()],
+        &ScanOpts::default(),
+        &AtomicBool::new(false),
+    );
     assert!(
         !found.is_empty(),
         "the fixture tree should hold repositories"
@@ -449,7 +454,11 @@ fn cancellation_stops_the_pass() {
 #[test]
 fn rows_come_back_sorted_by_path() {
     let tree = fixtures::status_tree();
-    let (found, _) = discover_roots(&[tree.root().to_path_buf()], &ScanOpts::default());
+    let (found, _) = discover_roots(
+        &[tree.root().to_path_buf()],
+        &ScanOpts::default(),
+        &AtomicBool::new(false),
+    );
     let (statuses, _) = read_tier0_all(&found, &AtomicBool::new(false));
 
     let mut sorted = statuses.clone();

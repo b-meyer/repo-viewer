@@ -12,12 +12,13 @@ A Tauri 2 desktop app: Rust backend, Vue 3 frontend, native installer, no server
 - **[PLAN.md](./PLAN.md)** — the specification: design decisions, roadmap, open questions.
 - **[AGENTS.md](./AGENTS.md)** — conventions, hard rules, and the traps. Read before changing code.
 
-Status: the project structure is in place and the shell runs end to end — a window, a page, and a
-`ping` command across the IPC bridge. The engine works without a GUI: the `scan` example walks a
-tree, classifies every repository under it, and reads Tier 0 for each one — branch, upstream,
-ahead/behind, stash count, in-progress state, tip commit, last-fetched age. None of it reaches the
-UI yet; streaming those rows over IPC into a table is Phase 3. Each phase gets its own runbook in
-`docs/` while it is being worked on.
+Status: **the app is useful.** Point it at a folder and it streams every repository beneath it into
+a table — rows appear as the walk finds them, then fill in tier by tier: branch, upstream,
+ahead/behind, stash count, in-progress state, tip commit and last-fetched age from refs alone, then
+the dirty flag and conflicted count from the worktree. Scans are cancellable and roots are managed
+in-app. Full per-file counts and the detail drawer are Phase 4. The engine also still works without
+a GUI, through the `scan` example. Each phase gets its own runbook in `docs/` while it is being
+worked on.
 
 ---
 
@@ -178,11 +179,11 @@ repo-viewer/
 ├── src/                          # ── Vue frontend
 │   ├── layout/                   # App.vue shell, Header.vue
 │   ├── pages/                    # file-based routes; index.vue = /
-│   ├── components/               # ← Phase 3+
+│   ├── components/               #
 │   │   ├── inputs/               #    App*.vue reka-ui wrappers — always use at call sites
-│   │   ├── repos/                #    RepoTable, RepoRow, FilterBar, DetailDrawer …
-│   │   └── feedback/             #    AppToaster, ScanProgress
-│   ├── scripts/                  # ipc.ts, router.ts  (+ scan.ts, search.ts, utils.ts — Phase 3+)
+│   │   ├── repos/                #    RepoTable, RepoRow, AheadBehind, RootBar …
+│   │   └── feedback/             #    AppUnknown, AppAlert, ScanProgress, ScanErrors
+│   ├── scripts/                  # ipc.ts, router.ts, scan.ts, utils.ts  (+ search.ts — Phase 5)
 │   │   └── generated/            # ts-rs output, committed
 │   ├── stores/                   # Pinia: repos  (+ filters, settings — Phase 5)
 │   ├── styles/                   # main.css, theme.css (custom palette)
@@ -196,7 +197,7 @@ repo-viewer/
 │       │   ├── model.rs          # RepoStatus and friends
 │       │   ├── error.rs
 │       │   ├── discover/         # parallel walk, prune, .git → DiscoveredRepo
-│       │   ├── status/           # tier0.rs + ahead_behind.rs  (tier1 / tier2 — Phase 4)
+│       │   ├── status/           # tier0.rs, tier1.rs, ahead_behind.rs  (tier2 — Phase 4)
 │       │   ├── watch/            # ← Phase 6: one debounced watcher
 │       │   └── fetch.rs          # ← Phase 7: git CLI subprocess
 │       └── tests/                # discover.rs, tier0.rs + support/fixtures.rs, built into TempDirs
@@ -209,9 +210,11 @@ repo-viewer/
     └── src/
         ├── main.rs               # calls run(); windows_subsystem = "windows" in release
         ├── lib.rs                # run(): builder, plugins, invoke_handler
-        ├── state.rs              # ← Phase 3: canonical HashMap<PathBuf, RepoStatus>, tier merge
-        ├── stream.rs             # ← Phase 3: domain events → tauri::ipc::Channel
-        └── commands/             # ← Phase 3+: scan, repo, fetch, open, config
+        ├── state.rs              # canonical HashMap<PathBuf, RepoStatus>, tier merge
+        ├── stream.rs             # batching for tauri::ipc::Channel sends
+        ├── pipeline.rs           # the scan driver: discovery → batch → Tier 0 → merge
+        ├── error.rs              # CommandError: anyhow across the IPC boundary
+        └── commands/            # session, scan, roots  (+ fetch, open — Phase 7)
 ```
 
 Coming from .NET: there is no `.sln` and no `.csproj`. The root `Cargo.toml` is the workspace

@@ -6,8 +6,8 @@ import type { RepoKind } from "./RepoKind";
  *
  * Deliberately **not** a partial [`RepoStatus`]: that type's Tier 0 fields (`head`, `state`,
  * `stash_count`) are not `Option`, because a row that has been read always has them. Discovery
- * has read nothing, so it cannot honestly produce one. This is what the `RepoFound` event
- * carries; Tier 0 turns it into a `RepoStatus`.
+ * has read nothing, so it cannot honestly produce one. This is what the [`ScanEvent::ReposFound`]
+ * event carries; Tier 0 turns it into a `RepoStatus`.
  */
 export type DiscoveredRepo = { 
 /**

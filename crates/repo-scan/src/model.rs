@@ -224,8 +224,8 @@ pub struct RepoStatus {
 ///
 /// Deliberately **not** a partial [`RepoStatus`]: that type's Tier 0 fields (`head`, `state`,
 /// `stash_count`) are not `Option`, because a row that has been read always has them. Discovery
-/// has read nothing, so it cannot honestly produce one. This is what the `RepoFound` event
-/// carries; Tier 0 turns it into a `RepoStatus`.
+/// has read nothing, so it cannot honestly produce one. This is what the [`ScanEvent::ReposFound`]
+/// event carries; Tier 0 turns it into a `RepoStatus`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS), ts(export))]
@@ -360,4 +360,147 @@ pub struct ScanSummary {
     pub errors: Vec<ScanError>,
     /// Wall-clock duration of the walk, milliseconds.
     pub elapsed_ms: u64,
+}
+
+// ---------------------------------------------------------------------------------------------
+// IPC events
+//
+// The engine does not use these types. They live here because `vp run types` is scoped to
+// `-p repo-scan` (§4.2), so an event type declared in `src-tauri` would be the one part of the
+// wire the frontend had to mirror by hand. They stay `gix`-free and Tauri-free like everything
+// else in this file: `tauri::ipc::Channel<T>` needs only `T: Serialize`.
+// ---------------------------------------------------------------------------------------------
+
+/// Identifies one scan for the lifetime of the process.
+///
+/// A plain counter rather than a UUID: it never leaves this process, it is only ever compared for
+/// equality, and a `u64` costs no dependency. The counter starts at 1, so `0` is never a live scan
+/// and a frontend default cannot accidentally match one.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, Default,
+)]
+// Redundant for a newtype, which serde already serializes as its inner value — stated so that
+// adding a second field is a compile error here rather than a silent change of the wire from a
+// number to an array. `ts-rs` cannot parse this attribute and says so on every `vp run types`;
+// the note is expected, the generated `export type ScanId = number` is correct, and neither is
+// worth removing the guard for.
+#[serde(transparent)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS), ts(export))]
+pub struct ScanId(pub u64);
+
+impl std::fmt::Display for ScanId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}", self.0)
+    }
+}
+
+/// What a scan reports as it runs. One `Channel<ScanEvent>` per `scan_roots` call.
+///
+/// Every variant carries its [`ScanId`]: a rescan or a root change mid-scan must not be able to
+/// interleave stale rows with fresh ones, and the frontend drops any event whose id is not the one
+/// it asked for. Rows are batched rather than sent one per repository — the per-message JSON
+/// serialization is the cost that bites.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS), ts(export))]
+pub enum ScanEvent {
+    /// Repositories the walk found, before any Git read. Rows paint from these, with every tiered
+    /// field rendering as unknown.
+    #[serde(rename_all = "camelCase")]
+    ReposFound {
+        /// The scan that produced this batch.
+        scan_id: ScanId,
+        /// The batch, at most one flush window's worth.
+        repos: Vec<DiscoveredRepo>,
+    },
+
+    /// Full merged rows, after Tier 0. Merged in Rust, so the frontend replaces wholesale.
+    #[serde(rename_all = "camelCase")]
+    ReposUpdated {
+        /// The scan that produced this batch.
+        scan_id: ScanId,
+        /// The batch of merged rows.
+        repos: Vec<RepoStatus>,
+    },
+
+    /// Running totals, so the frontend renders progress from values Rust holds rather than by
+    /// counting the rows it happens to have received.
+    #[serde(rename_all = "camelCase")]
+    Progress {
+        /// The scan being reported on.
+        scan_id: ScanId,
+        /// Repositories reported by [`ScanEvent::ReposFound`] so far.
+        found: u32,
+        /// Rows merged and reported by [`ScanEvent::ReposUpdated`] so far.
+        read: u32,
+    },
+
+    /// The walk is over. Carries the final repository count, which is the denominator a progress
+    /// bar needs.
+    ///
+    /// Emitted the moment the walk returns, so it arrives early enough to be useful. It therefore
+    /// says nothing about the row events: batches for repositories counted here may still be in
+    /// flight behind it.
+    #[serde(rename_all = "camelCase")]
+    DiscoveryFinished {
+        /// The scan whose walk finished.
+        scan_id: ScanId,
+        /// What the walk did — counts, pruned directories, and non-fatal path failures.
+        summary: ScanSummary,
+    },
+
+    /// The scan ran to completion. Terminal.
+    ///
+    /// `summary.errors` is where the *total* per-repository failures land: a repository that would
+    /// not open has no [`RepoStatus`] and never will, so its row stays whatever
+    /// [`ScanEvent::ReposFound`] delivered and this is the only place the cause appears.
+    #[serde(rename_all = "camelCase")]
+    Finished {
+        /// The scan that finished.
+        scan_id: ScanId,
+        /// The aggregate of every Tier 0 batch in the scan.
+        summary: Tier0Summary,
+    },
+
+    /// The scan stopped before completing. Terminal.
+    ///
+    /// Covers `cancel_scan`, a root change that superseded it, window close, and an internal
+    /// failure that unwound the pipeline. The frontend treats all four alike: stop the spinner,
+    /// keep the rows already delivered, show the counts as final. There is deliberately no
+    /// separate "failed" variant — from the row state's point of view the outcomes are identical,
+    /// and a variant meaning "the same as cancelled, but sadder" earns nothing.
+    #[serde(rename_all = "camelCase")]
+    Cancelled {
+        /// The scan that stopped.
+        scan_id: ScanId,
+        /// Repositories reported found before it stopped.
+        found: u32,
+        /// Rows merged before it stopped.
+        read: u32,
+    },
+}
+
+/// A row change that is not part of a scan.
+///
+/// One `Channel<RepoEvent>` per app session, opened by `subscribe` at startup and held in state for
+/// the process's life. This is the channel the watcher, the poll, and fetch completions push over:
+/// each refreshes in Rust and sends the merged row here. Scan results go on the scan's own channel
+/// instead, so a scan's ordering and a session push can never be confused for one another.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS), ts(export))]
+pub enum RepoEvent {
+    /// Full merged rows, refreshed outside a scan. Batched like scan results, for the same reason.
+    #[serde(rename_all = "camelCase")]
+    Updated {
+        /// The merged rows.
+        repos: Vec<RepoStatus>,
+    },
+
+    /// Rows that are no longer in the canonical map, by path. The mirror must drop them.
+    #[serde(rename_all = "camelCase")]
+    Removed {
+        /// Absolute paths, exactly as Rust spells them.
+        paths: Vec<PathBuf>,
+    },
 }

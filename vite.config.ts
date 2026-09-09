@@ -104,6 +104,10 @@ export default defineConfig({
         },
       ],
       'no-console': ['error', { allow: ['warn', 'error', 'info'] }],
+      // `__TAURI_INTERNALS__` is Tauri's own global. The test harness in `src/tests/channel.ts`
+      // drives a mocked `Channel` through it, and the name is not ours to choose. Named explicitly
+      // rather than disabled inline, so the exemption is one identifier and not one file.
+      'no-underscore-dangle': ['error', { allow: ['__TAURI_INTERNALS__'] }],
       eqeqeq: ['error', 'smart'],
       // Vue SFCs and vite config files export defaults.
       'import/no-default-export': 'off',

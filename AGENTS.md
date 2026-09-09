@@ -53,15 +53,29 @@ Break any of these and the design stops working. They are not style preferences.
 - **The frontend does no Git logic, no path manipulation, and no filesystem access.** Rust owns
   all of it.
 - **Rust owns the canonical row state.** `src-tauri/src/state.rs` holds the one
-  `HashMap<PathBuf, RepoStatus>`, merges each tier into it, and sends the full merged row. The
-  Pinia store is a mirror keyed by path: it never merges tiers and never holds a value Rust does
-  not. Commands that take a path accept only a key of that map.
+  `HashMap<PathBuf, RepoStatus>`, merges each tier into it, and sends the full merged row — on the
+  scan's `Channel<ScanEvent>` for a scan result, on the session `Channel<RepoEvent>` for a watcher,
+  poll, or fetch push. The Pinia store is a mirror keyed by path: it never merges tiers and never
+  holds a value Rust does not. Commands that take a repository path accept only a key of that map;
+  commands that take a _root_ validate against the root list instead, and `add_root` is the single
+  place a new path enters, canonicalised through `repo_scan::canonical` so a root stays a prefix of
+  the row keys beneath it.
+- **The merge is tier ownership, not option preference.** Each tier replaces every field it owns,
+  `None` included, and leaves other tiers' fields alone. `upstream`, `ahead`, `behind`,
+  `last_commit` and `last_fetched_ms` are `Option` because the _answer_ can be none — not because
+  the value is uncomputed — so preferring a stale `Some` over a fresh `None` would report a deleted
+  upstream as live forever. Only `dirty`, `conflicted`, `counts` and `submodules` mean "not yet"
+  when `None`. `state.rs` has a test for each half; they are the only inputs on which a correct
+  merge and a wholesale replace disagree while Tier 0 is the sole writer.
 - **Everything streams over `tauri::ipc::Channel`; `emit()`/`listen()` are not used.** Tauri's
   event system is documented as "not designed for low latency or high throughput" — payloads are
   always JSON strings. One `Channel<ScanEvent>` per scan, one `Channel<RepoEvent>` per session
   opened by `subscribe` at startup for watcher, poll, and fetch pushes. Batch sends (~50 ms, or
   25 repos) rather than one per repo. Every scan event carries its `ScanId`; the frontend drops
-  events from any scan it did not ask for.
+  events from any scan it did not ask for — but the id **cannot** be the primary filter, because
+  Rust starts the pipeline before `scan_roots`'s reply crosses back and a batch can arrive before
+  the id is known. `src/scripts/scan.ts` keys acceptance on a generation counter captured in the
+  handler closure before the invoke, and uses the id as the guard on top.
 - **One `notify` watcher for all repos.** `notify` spawns a thread per `Watcher`, so N watchers
   means N threads. Create one and call `watch()` per repo, non-recursively, on the git dir only —
   which discovery already resolved onto `DiscoveredRepo.git_dir`, including the indirection for a
@@ -73,6 +87,20 @@ Break any of these and the design stops working. They are not style preferences.
   `head`; it stays a `DiscoveredRepo` and the failure is a value on `Tier0Summary.errors`. A
   repository that _was_ read but lost one field keeps its row, with that field `None` and the cause
   on `RepoStatus.error`.
+- **"counting…" is a claim that work is in progress, so it must be transient.** The four kinds of
+  absence are four different facts and `AppUnknown` is the single place they are worded, because
+  collapsing any two of them is how the rule above gets diluted:
+  - `pending` → "counting…" — a tier that has not run **yet**. Never for a tier that will not run:
+    the Worktree column once read this for the life of the session because Tier 1 was a phase away,
+    which is a false claim of activity and cost a user an overnight wait.
+  - `na` → "n/a" — cannot ever apply. A bare repository has no worktree, so its `dirty` is not
+    pending.
+  - `unreadable` → red, with the cause — tried and failed. A row still lacking a status once
+    Tier 0 has finished is this, not `pending`.
+  - `none` → an em dash — there is genuinely no such value, e.g. no tip commit on an unborn HEAD.
+
+  And a computed `false` is not an absence: a clean worktree is `Some(false)` and reads "clean".
+
 - **Ahead/behind lives in exactly one module.** `status/ahead_behind.rs` is the only file that
   names `rev_walk`; if that primitive changes, this file is the blast radius. There is deliberately
   no backend trait. Its `ahead_behind` is the one public function in the engine whose signature
@@ -84,6 +112,10 @@ Break any of these and the design stops working. They are not style preferences.
 ### The tiered scan
 
 The reason the UI feels instant. A row appears before any worktree is touched.
+`src-tauri/src/pipeline.rs` is the whole of it: discovery streams into `stream.rs`'s batcher, each
+batch is emitted, then read by Tier 0, merged, emitted, read by Tier 1, merged and emitted again.
+**Never fold two tiers into one send** — that holds the cheap answer back for the expensive one and
+undoes the point.
 
 ```mermaid
 sequenceDiagram
@@ -99,15 +131,16 @@ sequenceDiagram
     V->>T: invoke scan_roots with Channel
     T->>D: parallel walk, prune heavy dirs
     D-->>T: DiscoveredRepo streamed - path, kind, resolved git dir
-    T-->>V: RepoFound batches
+    T-->>V: ReposFound batches
     Note over V: rows paint immediately<br/>tiered fields render as "unknown", never 0
 
-    T->>G: Tier 0 - refs only
+    T->>G: Tier 0 - refs only, ~2.6 ms per repo warm
     G-->>V: branch, ahead/behind, state, last commit, stash, last-fetched
     Note over V: "what have I not pushed?" answered<br/>with zero worktree I/O
 
-    T->>G: Tier 1 - status iterator, first item, early exit
-    G-->>V: clean / dirty (untracked included), conflicted count from index
+    T->>G: Tier 1 - status into_iter, first item of any kind, early exit
+    G-->>V: clean / dirty (untracked AND staged included), conflicted paths from index
+    Note over G: ~24x Tier 0 cold - the reason the two tiers stream separately
 
     T->>W: register one watcher over N git dirs
 
@@ -276,8 +309,66 @@ pathing bug. Every `git` invocation in `tests/support/fixtures.rs` passes
 templates cannot change the shape of the tree under test.
 
 **`gix::Repository::is_dirty()` ignores untracked files.** Its docs say so, and it disables the
-directory walk internally. A repo whose only change is a new file reports clean. The dirty flag
-comes from the status iterator with `untracked_files(Collapsed)`, first item, `should_interrupt`.
+directory walk internally. A repo whose only change is a new file reports clean.
+
+**And `into_index_worktree_iter()` ignores staged ones**, which is the half that gets missed. It
+sets `head_tree = None`, so it compares the index against the worktree and nothing else — a
+repository with a staged change and a clean worktree reports clean, and so does a parked merge whose
+content is staged. `into_iter()` keeps the HEAD-tree comparison that `status()` sets up by default
+and runs all three checks together: dirwalk for untracked, index-to-worktree for unstaged,
+tree-to-index for staged. Any item means dirty. `crates/repo-scan/tests/tier1.rs` has one fixture
+per trap plus a `git status --porcelain` oracle over the whole tree, because a single "dirty repo"
+fixture lets two of the three mistakes pass. Interrupting takes
+`should_interrupt_owned(Arc<AtomicBool>)` — `gix` wants an owned `Arc` or a `&'static` flag, not the
+plain `&AtomicBool` Tier 0 takes.
+
+**A conflicted path has up to three index entries, not one.** Stages 1, 2 and 3 all describe the
+same path, so counting non-zero-stage entries reports three times the number of conflicted files.
+Count distinct paths — the index is sorted by path, so counting transitions needs no allocation.
+
+**Tier 1 costs ~24x Tier 0 cold and ~6x warm.** Over `C:/Working/Source`, 52 repositories: Tier 0
+322 ms cold / 136 ms warm, Tier 1 **7581 ms cold / 906 ms warm**. That gap is the entire argument
+for streaming the tiers separately rather than waiting to paint a complete row, and it is why
+Tier 2 is lazy. Always name the tree beside a timing — PLAN.md §11 carries figures for two
+different roots, and they are only comparable once you notice which is which.
+
+**`AHEAD_BEHIND_CAP` is duplicated in TypeScript, and both copies assert the literal.** `ts-rs`
+exports types, not constants, so the cap lives in `crates/repo-scan/src/status/ahead_behind.rs` and
+again in `src/scripts/utils.ts`. A count equal to it means "at least this many" and renders as
+`1000+`, so a frontend copy that drifted low would present a capped value as exact.
+`crates/repo-scan/tests/tier0.rs` and `src/scripts/utils.test.ts` each pin the number, which is
+what makes moving one of them fail two tests rather than none. Shipping it on the wire was the
+alternative and puts a build-time constant in a per-scan payload.
+
+**A full row batch crosses Tauri's direct-`eval` threshold, and that is fine.** `BATCH_MAX = 25`
+and `BATCH_WINDOW = 50 ms` live in `src-tauri/src/stream.rs`. Twenty-five rows is ~12–15 KB, past
+the 8192-byte cutoff, so the batch takes the queue-plus-`fetch` path rather than a direct `eval`.
+Do not shrink the batch to duck under it: 8192 is a crossover Tauri measured, not a cliff, and
+going under trades one round trip for twice as many `eval`s queued on the event-loop thread — while
+making the batch size depend on how long the user's paths happen to be. If whole-tree wall time
+regresses, try a **larger** batch first: the pipeline pays `par_iter`'s join overhead once per
+batch rather than once per tree.
+
+**`ScanOpts.threads` sizes the walker only, and rayon takes the global pool.** Peak thread
+population during a scan is therefore ~1.5x cores — the walker's half plus rayon's full — which is
+deliberate: the walk is the short half and rayon has the machine to itself once it ends, so
+oversubscription for the overlap window is much the cheaper error than halving the throughput of
+the tier that dominates. The lever, if a measurement ever asks for one, is
+`rayon::ThreadPoolBuilder::new().num_threads(n).build_global()` in `run()` — one line, no engine
+change, but it must be called before the first `par_iter` and cannot be called twice. Do not
+repurpose `ScanOpts.threads` for it without renaming the field; it is documented and generated as
+the walker's count.
+
+**Never take a timing from `vp run dev`.** That is a debug build, and `gix` in debug is roughly an
+order of magnitude slower than in release: the app reports ~68 ms per repository for Tier 0 where
+`cargo run --release --example scan` measures ~2.6 ms warm. Every number in this file and in
+PLAN.md §11 comes from the release example, which is what `examples/scan.rs` exists for. A
+regression hunt started from a dev-build figure is chasing the profile, not the code.
+
+**The scan's own summary line reports total wall clock, not Tier 0's.** `ScanEvent::Finished`
+reuses `Tier0Summary` as the scan summary, so its `elapsed_ms` covers the walk and every tier.
+Anything rendering it says "scan"; calling it "Tier 0" blames the cheap tier for the expensive
+one's cost. A genuine per-tier breakdown needs a wire change.
 
 **`gix`'s `with_boundary` is not `^rev`.** It stops the walk at the given commits but does not
 hide their ancestors, so ahead/behind over any merged history overcounts. Use `with_hidden`,
@@ -358,6 +449,26 @@ for long paths, so the walk does not fail on deep `node_modules`. `canonicalize(
 `\\?\C:\...` paths, which render badly, confuse `git` CLI arguments, and compare unequal to the
 typed form. Canonicalize through `dunce`. Junctions and reparse points are reported as symlinks
 by `std`, so `follow_links(false)` covers them.
+
+**`Couldn't find callback id N` in the dev log is a stale channel, not a bug.** A `Channel` taken as
+a command argument installs an `on_drop` hook that evals `{ end: true }` at its callback id. When
+the webview has been replaced since — every `tauri dev` rebuild restarts the binary, and the page
+goes with it — that eval lands in a page with no such callback and `console.warn`s. Verified
+harmless: with the app left alone, `subscribe` is called exactly once and no warnings appear.
+`src-tauri/src/commands/session.rs` logs each `subscribe` at debug precisely so that a _repeated_
+one, which would mean the webview really is reloading, can be told apart from this.
+
+**Only `console.warn` and `console.error` reach the terminal from the webview.** Vite's client
+reports a lost HMR socket and its subsequent reload over `console.log`, so a page that reloads
+itself under `tauri dev` leaves no trace in the dev log — while its side effects, like the stale
+channel above, do. Do not read an absence of reload lines as an absence of reloads.
+
+**Nothing installs a `tracing` subscriber unless `run()` does.** `tracing-subscriber` being a
+dependency is not enough: without `init_tracing()` every `tracing::warn!` in the app is discarded,
+which is worse than having no logging because the code reads as though it reports. The one that
+matters most is the panicking discovery walk — nothing awaits the `spawn_blocking` handle that would
+otherwise carry that panic, so it would be completely silent. Filtering is by level, not by target,
+to keep the `env-filter` feature and its regex engine out of the tree.
 
 **A spawned `git` flashes a console window on Windows.** Every `Command` for `git fetch` sets
 `creation_flags(CREATE_NO_WINDOW)` and `GIT_TERMINAL_PROMPT=0`, and has a timeout — a credential
