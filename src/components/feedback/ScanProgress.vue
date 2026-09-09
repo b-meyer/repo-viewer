@@ -9,7 +9,9 @@
     <div class="text-12 text-gray-600" v-text="line" />
 
     <scan-errors v-if="discovery" :errors="discovery.errors" title="could not be walked" />
-    <scan-errors v-if="tier0" :errors="tier0.errors" title="could not be read" />
+    <!-- Built from the accumulated map rather than from `totals.errors`, so a repository that
+         failed shows up while the scan is still running instead of at the end of it. -->
+    <scan-errors v-if="readErrors.length > 0" :errors="readErrors" title="could not be read" />
   </div>
 </template>
 
@@ -17,8 +19,9 @@
 import { computed } from 'vue';
 import ScanErrors from '@/components/feedback/ScanErrors.vue';
 import AppProgress from '@/components/inputs/AppProgress.vue';
+import type { ScanError } from '@/scripts/generated/ScanError';
 import type { ScanSummary } from '@/scripts/generated/ScanSummary';
-import type { Tier0Summary } from '@/scripts/generated/Tier0Summary';
+import type { ScanTotals } from '@/scripts/generated/ScanTotals';
 import type { ScanProgress } from '@/stores/repos';
 
 /// Setup
@@ -32,9 +35,13 @@ const props = defineProps<{
    */
   discovery: ScanSummary | null;
   /**
-   * What Tier 0 did, once the scan has finished.
+   * What the whole scan did, tier by tier, once it has finished.
    */
-  tier0: Tier0Summary | null;
+  totals: ScanTotals | null;
+  /**
+   * Why each repository produced no row, by path, accumulated as the scan runs.
+   */
+  repoErrors: Map<string, string>;
 }>();
 
 /// Computed
@@ -57,14 +64,28 @@ const line = computed(() => {
   if (phase === 'cancelled') return `Cancelled after ${String(read)} of ${String(found)}`;
   if (phase === 'failed') return 'The scan failed.';
 
-  const walk = props.discovery;
-  const reads = props.tier0;
+  const totals = props.totals;
   const parts = [`${String(read)} ${read === 1 ? 'repository' : 'repositories'}`];
-  if (walk)
-    parts.push(`discovery ${String(walk.elapsedMs)} ms`, `${String(walk.dirsPruned)} pruned`);
-  // `scan`, not `Tier 0`: the pipeline puts its whole wall-clock time in this field, walk and
-  // Tier 1 included. Labelling it Tier 0 blamed the cheap tier for the expensive one's cost.
-  if (reads) parts.push(`scan ${String(reads.elapsedMs)} ms`);
+  if (props.discovery) parts.push(`${String(props.discovery.dirsPruned)} pruned`);
+  if (totals) {
+    // Four numbers, and the first is not the sum of the other three: most of a scan is spent
+    // waiting for the walk to hand over the next batch, which belongs to no tier. Tier 1 is
+    // typically an order of magnitude above Tier 0, which is the whole reason they stream apart —
+    // so showing them separately is what makes that visible instead of merely documented.
+    parts.push(
+      `scan ${String(totals.elapsedMs)} ms`,
+      `discovery ${String(totals.discoveryMs)} ms`,
+      `tier 0 ${String(totals.tier0Ms)} ms`,
+      `tier 1 ${String(totals.tier1Ms)} ms`,
+    );
+  }
   return parts.join(' · ');
 });
+
+/**
+ * The read failures as a list, for the errors panel.
+ */
+const readErrors = computed<ScanError[]>(() =>
+  [...props.repoErrors].map(([path, message]) => ({ path, message })),
+);
 </script>

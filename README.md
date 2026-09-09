@@ -15,10 +15,10 @@ A Tauri 2 desktop app: Rust backend, Vue 3 frontend, native installer, no server
 Status: **the app is useful.** Point it at a folder and it streams every repository beneath it into
 a table — rows appear as the walk finds them, then fill in tier by tier: branch, upstream,
 ahead/behind, stash count, in-progress state, tip commit and last-fetched age from refs alone, then
-the dirty flag and conflicted count from the worktree. Scans are cancellable and roots are managed
-in-app. Full per-file counts and the detail drawer are Phase 4. The engine also still works without
-a GUI, through the `scan` example. Each phase gets its own runbook in `docs/` while it is being
-worked on.
+the dirty flag and conflicted count from the worktree. Expanding a row reads its full per-file
+counts and submodule list on demand, and keeps them when it is collapsed again. Scans are
+cancellable and roots are managed in-app. The engine also still works without a GUI, through the
+`scan` example. Each phase gets its own runbook in `docs/` while it is being worked on.
 
 ---
 
@@ -53,7 +53,7 @@ flowchart TB
     subgraph L5["5 &nbsp;Git reads &mdash; gix 0.87.1, fanned out by rayon 1.12.0, zero C dependencies"]
         L5A["Tier 0 &mdash; refs only, ~3 ms per repo<br/>head.try_peel_to_id &middot; rev_walk.with_hidden, capped &middot; commit-graph is worth 10x"]
         L5B["Tier 1 &mdash; dirty flag incl. untracked, conflicted from index<br/>status iterator, first item, early exit"]
-        L5C["Tier 2 &mdash; full counts, lazy<br/>status, index-to-worktree diff"]
+        L5C["Tier 2 &mdash; full counts + submodules, lazy, ~35 ms per expand<br/>status drained, per-column totals &middot; no fan-out, by design"]
     end
 
     subgraph L6["6 &nbsp;Watching &mdash; notify 8.2.0"]
@@ -140,19 +140,19 @@ runner. Never call `pnpm` / `npm` / `yarn` scripts directly; see [AGENTS.md](./A
 The first `vp install` may report dependency build scripts that pnpm has blocked. Add what it names
 to `allowBuilds:` in `pnpm-workspace.yaml`.
 
-| Task                                  | Command                                                   |
-| ------------------------------------- | --------------------------------------------------------- |
-| Dev (Vite + Tauri window, hot reload) | `vp run dev`                                              |
-| Frontend only, in a browser           | `vp dev`                                                  |
-| Format, lint, `.ts` types             | `vp check`                                                |
-| Fix what is auto-fixable              | `vp check --fix`                                          |
-| Vue SFC + config type-check           | `vp run typecheck`                                        |
-| Unit tests                            | `vp test run`                                             |
-| Production build + installer          | `vp run build`, then `vp run verify`                      |
-| Regenerate the TypeScript types       | `vp run types`                                            |
-| Rust checks                           | `vp run rust`                                             |
-| Scan a tree without the GUI           | `cargo run --release --example scan -- C:/Working --rows` |
-| Generate a tree to time against       | `cargo run --release --example synth -- <dir> 120 200`    |
+| Task                                  | Command                                                           |
+| ------------------------------------- | ----------------------------------------------------------------- |
+| Dev (Vite + Tauri window, hot reload) | `vp run dev`                                                      |
+| Frontend only, in a browser           | `vp dev`                                                          |
+| Format, lint, `.ts` types             | `vp check`                                                        |
+| Fix what is auto-fixable              | `vp check --fix`                                                  |
+| Vue SFC + config type-check           | `vp run typecheck`                                                |
+| Unit tests                            | `vp test run`                                                     |
+| Production build + installer          | `vp run build`, then `vp run verify`                              |
+| Regenerate the TypeScript types       | `vp run types`                                                    |
+| Rust checks                           | `vp run rust`                                                     |
+| Scan a tree without the GUI           | `cargo run --release --example scan -- C:/Working --rows --tier2` |
+| Generate a tree to time against       | `cargo run --release --example synth -- <dir> 120 200`            |
 
 ---
 
@@ -181,9 +181,9 @@ repo-viewer/
 │   ├── pages/                    # file-based routes; index.vue = /
 │   ├── components/               #
 │   │   ├── inputs/               #    App*.vue reka-ui wrappers — always use at call sites
-│   │   ├── repos/                #    RepoTable, RepoRow, AheadBehind, RootBar …
+│   │   ├── repos/                #    RepoTable, RepoRow, RepoDetail, AheadBehind, RootBar …
 │   │   └── feedback/             #    AppUnknown, AppAlert, ScanProgress, ScanErrors
-│   ├── scripts/                  # ipc.ts, router.ts, scan.ts, utils.ts  (+ search.ts — Phase 5)
+│   ├── scripts/                  # ipc.ts, router.ts, scan.ts, detail.ts, utils.ts  (+ search.ts — Phase 5)
 │   │   └── generated/            # ts-rs output, committed
 │   ├── stores/                   # Pinia: repos  (+ filters, settings — Phase 5)
 │   ├── styles/                   # main.css, theme.css (custom palette)
@@ -197,7 +197,7 @@ repo-viewer/
 │       │   ├── model.rs          # RepoStatus and friends
 │       │   ├── error.rs
 │       │   ├── discover/         # parallel walk, prune, .git → DiscoveredRepo
-│       │   ├── status/           # tier0.rs, tier1.rs, ahead_behind.rs  (tier2 — Phase 4)
+│       │   ├── status/           # tier0.rs, tier1.rs, tier2.rs, ahead_behind.rs
 │       │   ├── watch/            # ← Phase 6: one debounced watcher
 │       │   └── fetch.rs          # ← Phase 7: git CLI subprocess
 │       └── tests/                # discover.rs, tier0.rs + support/fixtures.rs, built into TempDirs
@@ -214,7 +214,7 @@ repo-viewer/
         ├── stream.rs             # batching for tauri::ipc::Channel sends
         ├── pipeline.rs           # the scan driver: discovery → batch → Tier 0 → merge
         ├── error.rs              # CommandError: anyhow across the IPC boundary
-        └── commands/            # session, scan, roots  (+ fetch, open — Phase 7)
+        └── commands/            # session, scan, roots, repo  (+ fetch, open — Phase 7)
 ```
 
 Coming from .NET: there is no `.sln` and no `.csproj`. The root `Cargo.toml` is the workspace

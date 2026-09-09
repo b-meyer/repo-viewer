@@ -185,7 +185,10 @@ fn is_dirty(repo: &gix::Repository, should_interrupt: &Arc<AtomicBool>) -> Resul
         .status(gix::progress::Discard)
         .map_err(|err| worktree_error(repo, "status", &err))?
         .untracked_files(gix::status::UntrackedFiles::Collapsed)
-        .should_interrupt_owned(Arc::clone(should_interrupt))
+        // A private flag, never the shared one — see `private_interrupt`. This iterator is dropped
+        // after its first item, and that drop sets the flag it was given, so sharing it across the
+        // fan-out made one repository's early exit interrupt its neighbours.
+        .should_interrupt_owned(crate::status::private_interrupt(should_interrupt))
         .into_iter(Vec::<BString>::new())
         .map_err(|err| worktree_error(repo, "status iterator", &err))?;
 

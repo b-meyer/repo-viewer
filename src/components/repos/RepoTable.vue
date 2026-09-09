@@ -19,8 +19,14 @@
           :key="row.path"
           :row="row"
           :now="now"
-          :read-error="readErrors?.get(row.path) ?? null"
-          :tier0-done="readErrors !== null"
+          :read-error="repoErrors.get(row.path) ?? null"
+          :tier0-done="tier0Done"
+          :expanded="expanded.has(row.path)"
+          :loading-detail="loadingDetail.has(row.path)"
+          :detail-error="detailErrors.get(row.path) ?? null"
+          :colspan="COLUMNS.length"
+          @toggle="emit('toggle', row.path)"
+          @refresh="emit('refresh', row.path)"
         />
       </tbody>
     </table>
@@ -42,16 +48,44 @@ defineProps<{
    */
   now: number;
   /**
-   * Tier 0's failures by path, or `null` while it is still running.
+   * Why each repository produced no row, by path.
    *
-   * `null` is also what tells a row it is still waiting rather than unreadable, so an empty map and
-   * a missing one mean genuinely different things here.
+   * Always a map. These arrive per batch during the scan rather than only at the end, so an entry
+   * here is enough on its own to say a row is unreadable — `tier0Done` is the _separate_ question
+   * of whether a row with no entry and no status is still waiting.
    */
-  readErrors: Map<string, string> | null;
+  repoErrors: Map<string, string>;
+  /**
+   * Whether Tier 0 has finished, which is what turns "not yet" into "never".
+   */
+  tier0Done: boolean;
+  /**
+   * Which rows have their detail drawer open, by path.
+   */
+  expanded: Set<string>;
+  /**
+   * Which rows have a Tier 2 read in flight, by path.
+   */
+  loadingDetail: Set<string>;
+  /**
+   * Why each row's last Tier 2 read failed, by path.
+   */
+  detailErrors: Map<string, string>;
   /**
    * What to say when there is nothing to show.
    */
   emptyMessage: string;
+}>();
+
+const emit = defineEmits<{
+  /**
+   * A row's expander was clicked.
+   */
+  toggle: [path: string];
+  /**
+   * A row's drawer asked for a fresh read.
+   */
+  refresh: [path: string];
 }>();
 
 /// Data

@@ -1,6 +1,7 @@
 import { mount } from '@vue/test-utils';
 import { describe, expect, it } from 'vite-plus/test';
 import type { ScanProgress as Progress } from '@/stores/repos';
+import { MakeTotals } from '@/tests/fixtures';
 import ScanProgress from './ScanProgress.vue';
 
 function mountProgress(progress: Partial<Progress> = {}, summaries = {}) {
@@ -8,7 +9,8 @@ function mountProgress(progress: Partial<Progress> = {}, summaries = {}) {
     props: {
       progress: { phase: 'discovering', found: 0, read: 0, total: null, ...progress },
       discovery: null,
-      tier0: null,
+      totals: null,
+      repoErrors: new Map<string, string>(),
       ...summaries,
     },
   });
@@ -39,33 +41,43 @@ describe('ScanProgress', () => {
     expect(wrapper.text()).toContain('Cancelled after 40 of 128');
   });
 
-  it('summarises timings when the scan is done', () => {
+  /**
+   * The scan total and the per-tier figures are different measurements and all four are shown.
+   * `scan` is wall clock and is deliberately **not** the sum of the rest: most of a scan is spent
+   * waiting for the walk to hand over the next batch, which belongs to no tier.
+   */
+  it('reports the scan total and each tier separately', () => {
     const wrapper = mountProgress(
       { phase: 'done', found: 3, read: 3, total: 3 },
       {
         discovery: { reposFound: 3, dirsVisited: 90, dirsPruned: 2, errors: [], elapsedMs: 58 },
-        tier0: { reposRead: 3, errors: [], elapsedMs: 146 },
+        totals: MakeTotals({
+          reposRead: 3,
+          elapsedMs: 8000,
+          discoveryMs: 58,
+          tier0Ms: 322,
+          tier1Ms: 7581,
+        }),
       },
     );
 
     expect(wrapper.text()).toContain('3 repositories');
+    expect(wrapper.text()).toContain('scan 8000 ms');
     expect(wrapper.text()).toContain('discovery 58 ms');
-    // `scan`, not `Tier 0`. The pipeline puts its whole wall-clock time in this field — walk and
-    // Tier 1 included — so naming the cheap tier there blames it for the expensive one's cost.
-    expect(wrapper.text()).toContain('scan 146 ms');
-    expect(wrapper.text()).not.toContain('Tier 0');
+    // The gap between these two is the entire argument for streaming the tiers apart, so the UI
+    // says both rather than one number standing for the pair.
+    expect(wrapper.text()).toContain('tier 0 322 ms');
+    expect(wrapper.text()).toContain('tier 1 7581 ms');
   });
 
-  it('lists the paths a scan could not read', () => {
+  /**
+   * Built from the accumulating map, not from the terminal summary, so a failure shows up while the
+   * scan is still running.
+   */
+  it('lists the paths a scan could not read, before it finishes', () => {
     const wrapper = mountProgress(
-      { phase: 'done', read: 1, total: 2 },
-      {
-        tier0: {
-          reposRead: 1,
-          errors: [{ path: 'C:/bad', message: 'HEAD unreadable' }],
-          elapsedMs: 5,
-        },
-      },
+      { phase: 'reading', read: 1, total: 2 },
+      { repoErrors: new Map([['C:/bad', 'HEAD unreadable']]) },
     );
 
     expect(wrapper.text()).toContain('1 path could not be read');

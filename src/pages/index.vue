@@ -18,14 +18,21 @@
       v-if="repos.phase !== 'idle'"
       :progress="repos.progress"
       :discovery="repos.discovery"
-      :tier0="repos.tier0"
+      :totals="repos.totals"
+      :repo-errors="repos.repoErrors"
     />
 
     <repo-table
       :rows="repos.rows"
       :now="now"
-      :read-errors="repos.readErrors"
+      :repo-errors="repos.repoErrors"
+      :tier0-done="repos.tier0Done"
+      :expanded="repos.expanded"
+      :loading-detail="repos.loadingDetail"
+      :detail-errors="repos.detailErrors"
       :empty-message="emptyMessage"
+      @toggle="ToggleRow"
+      @refresh="RefreshDetail"
     />
   </div>
 </template>
@@ -37,6 +44,7 @@ import AppAlert from '@/components/feedback/AppAlert.vue';
 import ScanProgress from '@/components/feedback/ScanProgress.vue';
 import RepoTable from '@/components/repos/RepoTable.vue';
 import RootBar from '@/components/repos/RootBar.vue';
+import { RefreshDetail, ToggleRow } from '@/scripts/detail';
 import * as ipc from '@/scripts/ipc';
 import { CancelScan, StartScan } from '@/scripts/scan';
 import { useReposStore } from '@/stores/repos';

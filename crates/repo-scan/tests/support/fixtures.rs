@@ -183,6 +183,17 @@ fn git_may_fail(cwd: &Path, args: &[&str]) {
 /// against `git rev-list --left-right --count` is the point of those tests, so the comparison
 /// belongs where it can be read beside the expectation.
 pub fn git_out(cwd: &Path, args: &[&str]) -> String {
+    git_out_raw(cwd, args).trim().to_string()
+}
+
+/// Run `git` in `cwd` and return its stdout **untrimmed**, panicking if it fails.
+///
+/// Exists because `git status --porcelain` puts the index status in column 1 and the worktree
+/// status in column 2, so a leading space is data: ` M a.txt` is an unstaged modification and
+/// `M  a.txt` is a staged one. [`git_out`]'s trim strips that space off the first line, silently
+/// promoting it to the other column — which reads as a counting bug in the code under test rather
+/// than as a bug in the oracle.
+pub fn git_out_raw(cwd: &Path, args: &[&str]) -> String {
     let output = run(cwd, args);
     assert!(
         output.status.success(),
@@ -191,7 +202,7 @@ pub fn git_out(cwd: &Path, args: &[&str]) -> String {
         output.status,
         String::from_utf8_lossy(&output.stderr),
     );
-    String::from_utf8_lossy(&output.stdout).trim().to_string()
+    String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
 // -------------------------------------------------------------------------------------------
@@ -242,6 +253,13 @@ pub fn status_tree() -> &'static Fixture {
 ///   stagedonly/     one new file staged, worktree clean     Tier 1: dirty
 ///   unstaged/       one tracked file modified, not added    Tier 1: dirty
 ///   conflicted/     a parked modify/modify merge, 2 files   Tier 1: 2 conflicted
+///   counts/         one staged, one unstaged, one untracked Tier 2: 1/1/1/0
+///   intentadd/      one `git add -N` path                   Tier 2: 1 unstaged, 0 staged
+///   stagedthenmodified/ one path staged and changed again   Tier 2: 1 staged AND 1 unstaged
+///   renamed/        one staged rename                       Tier 2: 1 staged
+///   untrackeddir/   three files in one new directory        Tier 2: 1 untracked, collapsed
+///   submodnone/     no submodule configuration              Tier 2: Some([])
+///   submodparent/   one recorded submodule                  Tier 2: Some([one])
 /// ```
 ///
 /// Clone order is load-bearing. Every clone starts at the same upstream tip, so each topology is
@@ -331,6 +349,7 @@ fn build_status() -> Fixture {
     build_stashed(&root.join("stashed"));
     build_parked_states(&root);
     build_tier1_states(&root, &origin);
+    build_tier2_states(&root, &origin);
 
     git(&root, &["init", "--bare", "bare.git"]);
 
@@ -552,4 +571,82 @@ fn build_tier1_states(root: &Path, origin: &str) {
 
     // The failure is the point: a clean merge would commit and leave no conflicted entries.
     git_may_fail(&conflicted, &["merge", "other"]);
+}
+
+/// Build the repositories Tier 2's four column counts are read from.
+///
+/// Tier 1 only ever asks "is there anything?", so one dirty repository was enough for it. Tier 2
+/// reports four numbers, and each of these fixtures exists because a different plausible way of
+/// producing them is wrong:
+///
+/// - `counts` has one change of each kind, so no two columns can be swapped without a test
+///   noticing. A single-change fixture cannot catch that.
+/// - `intentadd` is `git add -N`: an index entry promising content the object database does not
+///   have. It reaches the status iterator as `IntentToAdd` rather than as an ordinary change, and
+///   git counts it as **unstaged only** — `git status --porcelain` prints ` A`, with the index
+///   column empty. Reading the `A` as a staged addition is the mistake, and it is an easy one:
+///   the entry really is in the index.
+/// - `stagedthenmodified` is the per-column proof. One file is staged and then modified again, so
+///   HEAD-against-index and index-against-worktree both see it — `MM` to `git status`, and one
+///   staged plus one unstaged here. It is the fixture that fails if the four counts are ever
+///   implemented as a partition of paths.
+/// - `renamed` stages a rename. Tree-index rename tracking is on by default, so this arrives as one
+///   `Rewrite` change spanning two paths; counting the paths reports 2 where `git status` prints a
+///   single `R old -> new` line.
+/// - `untrackeddir` holds three untracked files in one new directory. `UntrackedFiles::Collapsed`
+///   reports the directory as **one** entry, which is what `git status` does too; a fixture with a
+///   single loose untracked file cannot tell the two modes apart.
+/// - `submodparent` records a submodule and `submodnone` records none, which is the difference
+///   between `Some([..])` and `Some([])`. Neither is `None`: that is reserved for a read that
+///   failed.
+fn build_tier2_states(root: &Path, origin: &str) {
+    for name in [
+        "counts",
+        "intentadd",
+        "stagedthenmodified",
+        "renamed",
+        "untrackeddir",
+        "submodnone",
+        "submodparent",
+    ] {
+        git(root, &["clone", origin, name]);
+    }
+
+    // One of each kind at once: `a.txt` is tracked by the seed commits, so modifying it is the
+    // unstaged change; a new added file is the staged one; a new unadded file is the untracked one.
+    let counts = root.join("counts");
+    std::fs::write(counts.join("a.txt"), "modified\n").expect("modify tracked file");
+    std::fs::write(counts.join("added.txt"), "added\n").expect("write staged file");
+    git(&counts, &["add", "added.txt"]);
+    std::fs::write(counts.join("loose.txt"), "untracked\n").expect("write untracked file");
+
+    // `add -N` records the promise without the content.
+    let intent = root.join("intentadd");
+    std::fs::write(intent.join("promised.txt"), "promised\n").expect("write intent-to-add file");
+    git(&intent, &["add", "-N", "promised.txt"]);
+
+    // Staged, then changed again on disk, so both comparisons see the same path.
+    let twice = root.join("stagedthenmodified");
+    std::fs::write(twice.join("a.txt"), "staged\n").expect("write staged content");
+    git(&twice, &["add", "a.txt"]);
+    std::fs::write(twice.join("a.txt"), "and then modified\n").expect("write worktree content");
+
+    // A staged rename of a file the seed committed, so HEAD has the source and the index has the
+    // destination.
+    let renamed = root.join("renamed");
+    git(&renamed, &["mv", "a.txt", "renamed.txt"]);
+
+    // Three files in one directory git has never seen. Collapsed reports the directory, not them.
+    let untracked_dir = root.join("untrackeddir");
+    let nested = untracked_dir.join("fresh");
+    std::fs::create_dir_all(&nested).expect("create untracked directory");
+    for file in ["one.txt", "two.txt", "three.txt"] {
+        std::fs::write(nested.join(file), "untracked\n").expect("write file in untracked dir");
+    }
+
+    // A submodule of the shared upstream. `BASE_ARGS` carries `protocol.file.allow=always`, without
+    // which this is refused outright — see the module docs.
+    let parent = root.join("submodparent");
+    git(&parent, &["submodule", "add", origin, "sub"]);
+    git(&parent, &["commit", "-m", "add submodule"]);
 }

@@ -7,6 +7,21 @@
     <!-- Repository -->
     <td class="px-10">
       <div class="flex items-center gap-8">
+        <!-- Only a row with a status has anything to expand: Tier 2 fills fields on a `RepoStatus`,
+             and Rust refuses the command without one. A failed row keeps its place in the layout
+             rather than shifting its name left. -->
+        <button
+          v-if="status"
+          class="text-11 flex h-16 w-16 items-center justify-center rounded text-gray-500 hover:bg-gray-100 hover:text-gray-700"
+          type="button"
+          :aria-expanded="expanded"
+          :title="expanded ? 'Hide details' : 'Show file counts and submodules'"
+          @click="emit('toggle')"
+        >
+          <i :class="['bi', expanded ? 'bi-chevron-down' : 'bi-chevron-right']" />
+        </button>
+        <span v-else class="h-16 w-16" />
+
         <i
           v-if="failed"
           class="bi bi-x-octagon-fill text-red-600"
@@ -101,12 +116,29 @@
       <app-unknown v-else :reason="absent" :hint="readError" />
     </td>
   </tr>
+
+  <!-- The drawer, as a second row rather than inside the first: a `<td>` cannot contain a block
+       that spans the table, and `colspan` is how a table says "full width". A plain `v-if` and not
+       a `reka-ui` Collapsible — that primitive wraps its content in elements of its own, which are
+       not valid between a `<tr>` and its cells. -->
+  <tr v-if="status && expanded" :class="rowTone">
+    <td :colspan="colspan" class="p-0">
+      <repo-detail
+        :row="status"
+        :loading="loadingDetail"
+        :detail-error="detailError"
+        :now="now"
+        @refresh="emit('refresh')"
+      />
+    </td>
+  </tr>
 </template>
 
 <script setup lang="ts">
 import { computed } from 'vue';
 import AppUnknown from '@/components/feedback/AppUnknown.vue';
 import AheadBehind from '@/components/repos/AheadBehind.vue';
+import RepoDetail from '@/components/repos/RepoDetail.vue';
 import RepoHead from '@/components/repos/RepoHead.vue';
 import RepoStateBadge from '@/components/repos/RepoStateBadge.vue';
 import type { RepoKind } from '@/scripts/generated/RepoKind';
@@ -131,6 +163,37 @@ const props = defineProps<{
    * Whether Tier 0 has finished, which is what turns "not yet" into "never".
    */
   tier0Done: boolean;
+  /**
+   * Whether this row's detail drawer is open.
+   */
+  expanded: boolean;
+  /**
+   * Whether a Tier 2 read is in flight for this row.
+   */
+  loadingDetail: boolean;
+  /**
+   * Why this row's last Tier 2 read failed, if it did.
+   */
+  detailError: string | null;
+  /**
+   * How many columns the table has, for the drawer's `colspan`.
+   *
+   * Passed rather than restated here: `RepoTable` owns the column list, and a second copy of its
+   * length would be a literal that drifts the moment a column is added — with a drawer that stops
+   * spanning the table as the only symptom.
+   */
+  colspan: number;
+}>();
+
+const emit = defineEmits<{
+  /**
+   * The user clicked the expander.
+   */
+  toggle: [];
+  /**
+   * The user asked the drawer for a fresh read.
+   */
+  refresh: [];
 }>();
 
 /// Computed
@@ -145,12 +208,19 @@ const status = computed(() => (isRead(props.row) ? props.row : null));
 /**
  * Whether this repository will never produce a row.
  *
- * Once Tier 0 has finished, a row that is still only a `DiscoveredRepo` is not waiting for anything
- * — it is the total-failure grade, and it has no honest status because its HEAD could not be read.
- * Saying `counting…` for the rest of the session would be exactly the dishonesty the
- * unknown-is-not-zero rule exists to prevent, pointed at time instead of at counts.
+ * Two ways to know, and either is enough. Rust reports a total failure **as the batch that failed
+ * is read**, so a row can be known-unreadable while the scan is still running — that is the first
+ * clause, and it is what stops a broken repository claiming to be "counting…" for the minute or
+ * more a large tree takes. The second clause catches the rest: once Tier 0 has finished, a row that
+ * is still only a `DiscoveredRepo` is not waiting for anything either, whether or not its cause
+ * arrived.
+ *
+ * Saying `counting…` in either case would be exactly the dishonesty the unknown-is-not-zero rule
+ * exists to prevent, pointed at time instead of at counts.
  */
-const failed = computed(() => status.value === null && props.tier0Done);
+const failed = computed(
+  () => status.value === null && (props.readError !== null || props.tier0Done),
+);
 
 /**
  * Which absence the tiered cells show, before Tier 0 finishes and after.

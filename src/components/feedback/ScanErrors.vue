@@ -20,9 +20,9 @@ defineProps<{
   /**
    * The failures to list.
    *
-   * `ScanSummary.errors` and `Tier0Summary.errors` are the same type shown the same way, and Tier
-   * 0's are the repositories that produced no row at all — the most important thing on the screen
-   * when the list is not empty.
+   * The walk's failures and Tier 0's are the same type shown the same way. Tier 0's are the
+   * repositories that produced no row at all — the most important thing on the screen when the list
+   * is not empty, and the reason they are delivered per batch rather than only at the end.
    */
   errors: ScanError[];
   /**

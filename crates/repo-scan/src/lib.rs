@@ -17,8 +17,8 @@
 //!   Answers "what have I not pushed?" with zero worktree I/O. This must stay refs-only.
 //! - **Tier 1** — the dirty flag, from the status iterator's first item with untracked files
 //!   included, plus the conflicted count from index stage entries.
-//! - **Tier 2** — full index-to-worktree counts. Lazy: expanded rows and explicit refresh only,
-//!   never in the default scan path.
+//! - **Tier 2** — full index-to-worktree counts and the submodule list. Lazy: expanded rows and
+//!   explicit refresh only, never in the default scan path, and the one tier with no fan-out.
 
 pub mod discover;
 pub mod error;
@@ -29,10 +29,10 @@ pub use discover::{canonical, discover_roots, discover_roots_with};
 pub use error::{Error, Result};
 pub use model::{
     CommitSummary, DEFAULT_PRUNE_NAMES, DiscoveredRepo, FileCounts, Head, RepoEvent, RepoKind,
-    RepoState, RepoStatus, ScanError, ScanEvent, ScanId, ScanOpts, ScanSummary, SubmoduleStatus,
-    Tier0Summary,
+    RepoState, RepoStatus, ScanError, ScanEvent, ScanId, ScanOpts, ScanSummary, ScanTotals,
+    SubmoduleStatus, Tier, Tier0Summary,
 };
 pub use status::{
-    AHEAD_BEHIND_CAP, Tier1, Tier1Summary, ahead_behind, read_tier0, read_tier0_all,
-    read_tier0_all_with, read_tier1, read_tier1_all_with,
+    AHEAD_BEHIND_CAP, Tier1, Tier1Summary, Tier2, ahead_behind, read_tier0, read_tier0_all,
+    read_tier0_all_with, read_tier1, read_tier1_all_with, read_tier2,
 };

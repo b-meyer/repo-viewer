@@ -57,6 +57,8 @@ pub fn run() {
             commands::subscribe,
             commands::scan_roots,
             commands::cancel_scan,
+            commands::full_status,
+            commands::refresh_repo,
             commands::pick_root,
             commands::add_root,
             commands::remove_root,

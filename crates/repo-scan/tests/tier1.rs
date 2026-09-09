@@ -209,6 +209,35 @@ fn cancellation_stops_the_pass() {
     );
 }
 
+/// **A dirty repository's early exit must not interrupt the repositories beside it.**
+///
+/// `gix` treats the flag handed to `should_interrupt_owned` as one it may write: dropping a status
+/// iterator sets it to stop the worker threads, restoring it only afterwards. Sharing one flag
+/// across the rayon fan-out therefore let a dirty repository — which exits after the first item —
+/// abort whichever neighbours were mid-walk, and they came back as `Interrupted` errors with
+/// nothing having asked them to stop.
+///
+/// The pass is run repeatedly because the window is small and the failure is a race. It reproduced
+/// within a handful of iterations on a tree of this shape, where dirty and clean repositories are
+/// read concurrently; the fix makes it impossible rather than unlikely.
+#[test]
+fn one_repositorys_early_exit_does_not_interrupt_the_others() {
+    for attempt in 0..8 {
+        let (rows, summary, found) = read_tree();
+
+        assert!(
+            summary.errors.is_empty(),
+            "attempt {attempt}: nothing cancelled this pass, so nothing may report a failure: {:?}",
+            summary.errors
+        );
+        assert_eq!(
+            rows.len() + summary.bare_skipped as usize,
+            found.len(),
+            "attempt {attempt}: every repository produced a result or was skipped as bare"
+        );
+    }
+}
+
 /// The dirty flag agrees with `git status --porcelain` on every fixture repository.
 ///
 /// The oracle matters here for the same reason it does for ahead/behind: a literal encodes what the

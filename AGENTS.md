@@ -31,7 +31,7 @@ because `vp` is not global on an ADO agent — a pipeline detail, not a pattern 
 | Add a dependency                          | `vp add <pkg>` then pin it exact in the catalog                                                 |
 | Bump a dependency                         | `vp update -L <pkg>`                                                                            |
 | Rust checks                               | `vp run rust` — `cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test`  |
-| Engine without the GUI                    | `cargo run --release --example scan -- <path>` (add `--rows` for one line per repo)             |
+| Engine without the GUI                    | `cargo run --release --example scan -- <path>` (`--rows` per repo, `--tier2` to time expands)   |
 | A tree to time against                    | `cargo run --release --example synth -- <dir> [count] [depth]` — generated, so safe to write to |
 
 Imports: configs from `vite-plus`, tests from `vite-plus/test`. **Never `vite` / `vitest`
@@ -56,10 +56,19 @@ Break any of these and the design stops working. They are not style preferences.
   `HashMap<PathBuf, RepoStatus>`, merges each tier into it, and sends the full merged row — on the
   scan's `Channel<ScanEvent>` for a scan result, on the session `Channel<RepoEvent>` for a watcher,
   poll, or fetch push. The Pinia store is a mirror keyed by path: it never merges tiers and never
-  holds a value Rust does not. Commands that take a repository path accept only a key of that map;
-  commands that take a _root_ validate against the root list instead, and `add_root` is the single
-  place a new path enters, canonicalised through `repo_scan::canonical` so a root stays a prefix of
-  the row keys beneath it.
+  holds a value Rust does not. A command that takes a repository path accepts only a key of one of
+  the two maps below — never an arbitrary string from the webview; a command that takes a _root_
+  validates against the root list instead, and `add_root` is the single place a new path enters,
+  canonicalised through `repo_scan::canonical` so a root stays a prefix of the row keys beneath it.
+
+  A **second** map beside the rows holds what discovery found, keyed identically. `RepoStatus`
+  carries no `git_dir` and every engine entry point needs the resolved one, which discovery already
+  produced and must not be re-derived. It is a **superset** of the rows — a repository whose HEAD
+  was unreadable has an entry here and no row — and which map a command checks follows from what it
+  needs: `full_status` requires a row to merge Tier 2 into, so it checks the rows; `refresh_repo`
+  checks this one, which is what lets the §8.1 total-failure grade be retried without rescanning the
+  tree. `remove_root` evicts from both.
+
 - **The merge is tier ownership, not option preference.** Each tier replaces every field it owns,
   `None` included, and leaves other tiers' fields alone. `upstream`, `ahead`, `behind`,
   `last_commit` and `last_fetched_ms` are `Option` because the _answer_ can be none — not because
@@ -84,9 +93,9 @@ Break any of these and the design stops working. They are not style preferences.
   must say "counting…" rather than showing a number it does not have. This is the most common bug
   in this class of app. The corollary for a repository that cannot be read at all: it produces
   **no** `RepoStatus`. Tier 0's fields are not `Option`, so a row for it would have to invent a
-  `head`; it stays a `DiscoveredRepo` and the failure is a value on `Tier0Summary.errors`. A
-  repository that _was_ read but lost one field keeps its row, with that field `None` and the cause
-  on `RepoStatus.error`.
+  `head`; it stays a `DiscoveredRepo` and the failure is a value — on `ScanEvent::RepoErrors` as its
+  batch is read, and again in `ScanTotals.errors` at the end. A repository that _was_ read but lost
+  one field keeps its row, with that field `None` and the cause on `RepoStatus.error`.
 - **"counting…" is a claim that work is in progress, so it must be transient.** The four kinds of
   absence are four different facts and `AppUnknown` is the single place they are worded, because
   collapsing any two of them is how the rule above gets diluted:
@@ -95,8 +104,12 @@ Break any of these and the design stops working. They are not style preferences.
     which is a false claim of activity and cost a user an overnight wait.
   - `na` → "n/a" — cannot ever apply. A bare repository has no worktree, so its `dirty` is not
     pending.
-  - `unreadable` → red, with the cause — tried and failed. A row still lacking a status once
-    Tier 0 has finished is this, not `pending`.
+  - `unreadable` → red, with the cause — tried and failed. Two independent ways to know, and either
+    is enough: `ScanEvent::RepoErrors` reports a repository as the batch that failed is read, so a
+    row can be known-unreadable **mid-scan**; and a row still lacking a status once Tier 0 has
+    finished is this too, whether or not its cause arrived. Do not infer the second from the absence
+    of the first — "an error arrived for this path" and "Tier 0 is done" are separate facts, and the
+    frontend keeps them as separate state for that reason.
   - `none` → an em dash — there is genuinely no such value, e.g. no tip commit on an unborn HEAD.
 
   And a computed `false` is not an absence: a clean worktree is `Some(false)` and reads "clean".
@@ -142,12 +155,16 @@ sequenceDiagram
     G-->>V: clean / dirty (untracked AND staged included), conflicted paths from index
     Note over G: ~24x Tier 0 cold - the reason the two tiers stream separately
 
+    T-->>V: RepoErrors - repos that produced no row, per batch
+    Note over V: so a broken row reads "unreadable" now,<br/>not "counting…" until the scan ends
+
     T->>W: register one watcher over N git dirs
 
     U->>V: expand a row
     V->>T: invoke full_status
-    T->>G: Tier 2 - full index-to-worktree diff
-    G-->>V: staged / unstaged / untracked / conflicted, submodule list
+    T->>G: Tier 2 - HEAD-tree vs index AND index vs worktree, drained
+    G-->>V: four per-column counts + submodule list, merged onto the row
+    Note over G: ~35 ms per expand warm - sequential, no fan-out
 
     W-->>T: debounced change on a git dir
     T->>G: Tier 0 + 1 for that repo
@@ -157,6 +174,12 @@ sequenceDiagram
 
 Never move Tier 2 work into the default scan path. Tier 0 is refs-only and must stay that way.
 A change notice never crosses IPC on its own: Rust refreshes and pushes the row.
+
+Tier 2 is the one tier with **no rayon fan-out**, and that is deliberate rather than missing: it
+runs for one expanded row at a time, so a `read_tier2_all_with` would exist only to be called from
+the pipeline — which is the thing this section forbids. `full_status` merges it and returns the
+whole row; `refresh_repo(path, tier)` re-reads tiers `0..=tier` and both returns the row and pushes
+it on the session channel, so the watcher can reuse that one path rather than duplicating it.
 
 ## Hard rules
 
@@ -320,7 +343,9 @@ tree-to-index for staged. Any item means dirty. `crates/repo-scan/tests/tier1.rs
 per trap plus a `git status --porcelain` oracle over the whole tree, because a single "dirty repo"
 fixture lets two of the three mistakes pass. Interrupting takes
 `should_interrupt_owned(Arc<AtomicBool>)` — `gix` wants an owned `Arc` or a `&'static` flag, not the
-plain `&AtomicBool` Tier 0 takes.
+plain `&AtomicBool` Tier 0 takes — and the `Arc` handed over must be a **private** one, never the
+shared cancellation flag. See the `should_interrupt_owned` trap below for why that distinction is
+load-bearing rather than tidiness.
 
 **A conflicted path has up to three index entries, not one.** Stages 1, 2 and 3 all describe the
 same path, so counting non-zero-stage entries reports three times the number of conflicted files.
@@ -331,6 +356,14 @@ Count distinct paths — the index is sorted by path, so counting transitions ne
 for streaming the tiers separately rather than waiting to paint a complete row, and it is why
 Tier 2 is lazy. Always name the tree beside a timing — PLAN.md §11 carries figures for two
 different roots, and they are only comparable once you notice which is which.
+
+**Tier 2 is measured per repository, because that is the only way it runs.** ~35 ms warm for one
+expand over the same tree, against Tier 0's ~2.6 ms per repo — so one expand costs roughly 13x a
+whole row's refs. `cargo run --release --example scan -- <path> --tier2` walks the tree one
+repository at a time purely to collect the spread, and its figure is always **warm**, because
+Tier 1 has just touched the same worktrees in the same run. Do not compare that per-repo number
+against Tier 0's or Tier 1's pass totals without noticing that both of those are rayon fan-outs and
+this is sequential.
 
 **`AHEAD_BEHIND_CAP` is duplicated in TypeScript, and both copies assert the literal.** `ts-rs`
 exports types, not constants, so the cap lives in `crates/repo-scan/src/status/ahead_behind.rs` and
@@ -365,10 +398,27 @@ order of magnitude slower than in release: the app reports ~68 ms per repository
 PLAN.md §11 comes from the release example, which is what `examples/scan.rs` exists for. A
 regression hunt started from a dev-build figure is chasing the profile, not the code.
 
-**The scan's own summary line reports total wall clock, not Tier 0's.** `ScanEvent::Finished`
-reuses `Tier0Summary` as the scan summary, so its `elapsed_ms` covers the walk and every tier.
-Anything rendering it says "scan"; calling it "Tier 0" blames the cheap tier for the expensive
-one's cost. A genuine per-tier breakdown needs a wire change.
+**`ScanTotals.elapsed_ms` is not the sum of its three per-stage fields, and must not be presented
+as one.** `ScanEvent::Finished` carries `ScanTotals`, whose `elapsed_ms` is wall clock across the
+whole pipeline while `discovery_ms`, `tier0_ms` and `tier1_ms` are sums of the per-batch passes.
+The difference is the time spent waiting for the walk to hand over the next batch, which belongs to
+no tier and is most of what a user experiences — so the four numbers are shown side by side and
+never reconciled. `Tier0Summary` means only what Tier 0 did and is not the scan summary: reusing it
+there leaves one `elapsed_ms` standing for the whole pipeline, which reads as Tier 0's cost and
+blames the cheap tier for the expensive one's.
+
+**Never hand a shared `Arc<AtomicBool>` to `gix`'s `should_interrupt_owned`.** It records the flag
+as `private: false`, meaning `gix` may write to it: `parallel_iter_drop` does
+`should_interrupt.swap(true, ..)` to stop its worker threads when a status iterator is dropped, and
+only then tries to restore the previous value. Every other walk holding that same flag reads `true`
+inside the window. Sharing the scan's cancellation flag across Tier 1's rayon fan-out therefore let
+one dirty repository's early exit abort whichever neighbours were mid-walk, which came back as
+`Interrupted` on a repository nothing had asked to stop — and because the fan-out and
+`src-tauri`'s pipeline both poll that flag, a transient `true` could end the whole scan and report
+it as cancelled. `status::private_interrupt` makes a per-walk flag seeded from the shared one, which
+keeps "a walk that starts after the user cancels stops immediately" and gives up only interrupting
+a walk already in flight. `crates/repo-scan/tests/tier1.rs` reproduces it by running the pass
+repeatedly over a tree of mixed dirty and clean repositories.
 
 **`gix`'s `with_boundary` is not `^rev`.** It stops the walk at the given commits but does not
 hide their ancestors, so ahead/behind over any merged history overcounts. Use `with_hidden`,
@@ -424,7 +474,31 @@ snapshot, and it is the residual per-repo cost in the §11 numbers.
 the **worktree**, and when that file is absent it falls back to parsing the whole `.git/index` and
 then the HEAD tree. `Submodule::index_id()` parses the index; `head_id()` opens the submodule's own
 repository. So the submodule list is Tier 2 in full — not even names and paths belong in Tier 0.
-`Submodule` also holds an `Rc`, so it is `!Send` and cannot cross a rayon boundary.
+`Submodule` also holds an `Rc`, so it is `!Send` and cannot cross a rayon boundary. And its
+`Ok(None)` means **no submodule configuration at all**, which is an answered question: it maps to
+`Some(vec![])` on the row, where `None` would claim a read is still outstanding for the
+overwhelmingly common case.
+
+**Tier 2's four counts are per-column, not a partition of paths.** `status().into_iter()` runs
+HEAD-tree-against-index and index-against-worktree at once, and **both emit for the same path** when
+a file was staged and then modified again — which is exactly what `git status` prints as `MM`. So
+`staged + unstaged + untracked + conflicted` is not a number of changed files, and nothing may sum
+them or label them a total. Two classification traps sit underneath:
+`EntryStatus::NeedsUpdate` — "unchanged, but checking was expensive" — never reaches a consumer,
+because `gix/src/status/iter/mod.rs` diverts it into the iterator's own index-writeback list, which
+is also what makes Tier 1's early exit safe. `EntryStatus::IntentToAdd` **is** emitted and is the
+trap in its place: `git add -N` records an index entry, but git counts it as **unstaged only** —
+porcelain prints ` A`, index column empty — and `gix` emits no tree-index change for it. Reading
+that `A` as a staged addition is the mistake, and an easy one, because the entry really is in the
+index. Tree-index rename tracking also defaults to **on**, so a staged rename is one `Rewrite`
+change spanning two paths and stays one, matching porcelain's single `R old -> new` line.
+
+**`git status --porcelain`'s leading space is data, so an oracle must not trim.** Column 1 is the
+index status and column 2 the worktree's: ` M` is an unstaged modification and `M ` a staged one.
+Trimming the whole output — which the fixtures' `git_out` does — strips that space off the **first
+line only**, silently promoting one change to the other column. It reads as a counting bug in the
+code under test rather than a bug in the oracle. `fixtures::git_out_raw` is the untrimmed variant
+Tier 2's oracle uses.
 
 **`catch_unwind` around an already-open `Repository` needs `AssertUnwindSafe`,** because the
 repository holds interior mutability for its object caches. A caught panic still runs the process

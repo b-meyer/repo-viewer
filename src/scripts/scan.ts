@@ -223,8 +223,18 @@ function HandleScanEvent(mine: number, event: ScanEvent): void {
       repos.SetPhase('reading');
       break;
     }
+    case 'repoErrors': {
+      // Repositories that will never produce a row, reported as the batch that failed is read
+      // rather than at the end. Recording them now is what lets a row stop saying `counting…`
+      // while the rest of the scan runs.
+      repos.AddRepoErrors(event.errors);
+      break;
+    }
     case 'finished': {
-      repos.SetTier0Summary(event.summary);
+      // `summary.errors` repeats every failure already delivered per batch, which is deliberate:
+      // a webview that reloaded mid-scan missed those events and this is where it catches up.
+      repos.AddRepoErrors(event.summary.errors);
+      repos.SetTotals(event.summary);
       repos.SetPhase('done');
       break;
     }

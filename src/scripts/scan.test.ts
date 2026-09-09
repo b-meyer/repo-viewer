@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vite-plus/test';
 import { CancelScan, ResetScanSession, StartScan, StartSession } from '@/scripts/scan';
 import { useReposStore } from '@/stores/repos';
 import { MakeChannelDriver, ReadNumber } from '@/tests/channel';
-import { MakeDiscovered, MakeStatus } from '@/tests/fixtures';
+import { MakeDiscovered, MakeStatus, MakeTotals } from '@/tests/fixtures';
 
 /**
  * A `reposFound` batch for one path.
@@ -107,7 +107,7 @@ describe('scan session', () => {
       drive.Send(id, {
         kind: 'finished',
         scanId: 1,
-        summary: { reposRead: 3, errors: [], elapsedMs: 146 },
+        summary: MakeTotals({ reposRead: 3 }),
       });
       return 1;
     });
@@ -117,7 +117,58 @@ describe('scan session', () => {
     const store = useReposStore();
     expect(store.phase).toBe('done');
     expect(store.progress.total).toBe(3);
-    expect(store.readErrors).not.toBeNull();
+    expect(store.tier0Done).toBe(true);
+    expect(store.totals?.tier1Ms).toBe(700);
+  });
+
+  /**
+   * A repository that will never produce a row is reported as its batch is read, so the row can
+   * stop claiming to be "counting…" without waiting for the scan to end.
+   */
+  it('records a read failure from a mid-scan event', async () => {
+    const drive = MakeChannelDriver();
+    mockIPC((cmd, args) => {
+      if (cmd !== 'scan_roots') return null;
+      const id = drive.Capture(args);
+      drive.Send(id, {
+        kind: 'repoErrors',
+        scanId: 1,
+        errors: [{ path: 'C:/work/broken', message: 'HEAD is corrupt' }],
+      });
+      return 1;
+    });
+
+    await StartScan(['C:/work']);
+
+    const store = useReposStore();
+    expect(store.repoErrors.get('C:/work/broken')).toBe('HEAD is corrupt');
+    // Still running: the failure arriving does not mean Tier 0 has finished, and conflating those
+    // is what the old single-field contract got wrong.
+    expect(store.tier0Done).toBe(false);
+  });
+
+  /**
+   * The terminal event repeats every failure, so a webview that reloaded mid-scan catches up.
+   */
+  it('records the failures the terminal event repeats', async () => {
+    const drive = MakeChannelDriver();
+    mockIPC((cmd, args) => {
+      if (cmd !== 'scan_roots') return null;
+      const id = drive.Capture(args);
+      drive.Send(id, {
+        kind: 'finished',
+        scanId: 1,
+        summary: MakeTotals({
+          reposRead: 0,
+          errors: [{ path: 'C:/work/broken', message: 'HEAD is corrupt' }],
+        }),
+      });
+      return 1;
+    });
+
+    await StartScan(['C:/work']);
+
+    expect(useReposStore().repoErrors.get('C:/work/broken')).toBe('HEAD is corrupt');
   });
 
   it('surfaces a failed scan command rather than leaving the spinner running', async () => {

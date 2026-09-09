@@ -23,6 +23,7 @@ import type { RepoStatus } from '@/scripts/generated/RepoStatus';
 import type { ScanEvent } from '@/scripts/generated/ScanEvent';
 import type { ScanId } from '@/scripts/generated/ScanId';
 import type { ScanOpts } from '@/scripts/generated/ScanOpts';
+import type { Tier } from '@/scripts/generated/Tier';
 
 /**
  * Round-trips a call to the Rust backend.
@@ -81,6 +82,40 @@ export function scanRoots(
  */
 export function cancelScan(id: ScanId): Promise<void> {
   return invoke<void>('cancel_scan', { id });
+}
+
+/**
+ * Reads Tier 2 for one repository — the full file counts and the submodule list.
+ *
+ * Resolves with the **whole merged row**, not a Tier 2 payload of its own: Rust owns the canonical
+ * copy of `counts` and `submodules`, so what comes back is mirrored exactly like a scan batch. That
+ * is what makes an expanded-then-collapsed row keep its counts without this side caching anything.
+ *
+ * Rejects when the read failed, which is where a Tier 2 failure is reported: the row's one `error`
+ * slot already has two writers, and this call can be repeated once per expand.
+ *
+ * @param path - The repository to read. Rust accepts only a key of its canonical map.
+ * @returns The merged row.
+ */
+export function fullStatus(path: string): Promise<RepoStatus> {
+  return invoke<RepoStatus>('full_status', { path });
+}
+
+/**
+ * Re-reads one repository up to and including `tier`.
+ *
+ * `tier` is cumulative — `'two'` reads all three — because the tiers are not independent: a fresh
+ * dirty flag beside a stale branch would describe two different moments.
+ *
+ * The merged row also arrives on the session channel, so a caller that only wants the store updated
+ * can ignore what this resolves with.
+ *
+ * @param path - The repository to re-read.
+ * @param tier - How much of it to read.
+ * @returns The merged row.
+ */
+export function refreshRepo(path: string, tier: Tier): Promise<RepoStatus> {
+  return invoke<RepoStatus>('refresh_repo', { path, tier });
 }
 
 /**

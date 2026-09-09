@@ -2,6 +2,7 @@
 //!
 //!     cargo run --release --example scan -- C:/Working
 //!     cargo run --release --example scan -- C:/Working --rows
+//!     cargo run --release --example scan -- C:/Working --tier2
 //!
 //! This exists to produce the timing number the whole design defends, to debug one repository
 //! without a webview in the way, and to check behaviour in a CI container. Cargo compiles
@@ -22,16 +23,21 @@ use std::{
 
 use repo_scan::{
     DiscoveredRepo, Head, RepoKind, RepoStatus, ScanOpts, Tier1, discover_roots, read_tier0_all,
-    read_tier1_all_with,
+    read_tier1_all_with, read_tier2,
 };
 
 fn main() -> ExitCode {
     let mut args = env::args_os().skip(1);
     let Some(root) = args.next().map(PathBuf::from) else {
-        eprintln!("usage: scan <path> [--rows]");
+        eprintln!("usage: scan <path> [--rows] [--tier2]");
         return ExitCode::FAILURE;
     };
-    let rows = args.any(|arg| arg == *"--rows");
+    let flags: Vec<_> = args.collect();
+    let rows = flags.iter().any(|arg| arg == "--rows");
+    // Off by default, and one repository at a time even when asked for: Tier 2 is the tier the
+    // whole design keeps off the scan path, so an example that ran it over a tree by default would
+    // be measuring something the app never does.
+    let tier2 = flags.iter().any(|arg| arg == "--tier2");
 
     if !root.is_dir() {
         eprintln!("not a directory: {}", root.display());
@@ -96,12 +102,73 @@ fn main() -> ExitCode {
     println!("  conflicts: {conflicted} files across the tree");
     print_errors("tier 1", &tier1.errors);
 
+    if tier2 {
+        println!();
+        print_tier2(&repos);
+    }
+
     if rows {
         println!();
         print_rows(&statuses);
     }
 
     ExitCode::SUCCESS
+}
+
+/// Time Tier 2 one repository at a time, and report the spread.
+///
+/// **Per repository, never as a pass.** Tier 2 has no fan-out for exactly this reason: it runs when
+/// a user expands one row, so the number that matters is what that one expand costs — a whole-tree
+/// total would describe an operation the app never performs and invite someone to put it in the
+/// pipeline.
+///
+/// The slowest repository is called out because it is the one a user would notice, and a mean over
+/// a tree of mostly-clean checkouts hides it completely.
+fn print_tier2(repos: &[DiscoveredRepo]) {
+    let flag = std::sync::Arc::new(AtomicBool::new(false));
+    let mut timings: Vec<(std::time::Duration, &DiscoveredRepo)> = Vec::new();
+    let mut skipped = 0_usize;
+    let mut failed = 0_usize;
+    let mut submodules = 0_usize;
+
+    for repo in repos {
+        let started = std::time::Instant::now();
+        match read_tier2(repo, &flag) {
+            Ok(Some(read)) => {
+                timings.push((started.elapsed(), repo));
+                submodules += read.submodules.map(|list| list.len()).unwrap_or(0);
+                if read.error.is_some() {
+                    failed += 1;
+                }
+            }
+            // Bare: no worktree, so the question does not apply.
+            Ok(None) => skipped += 1,
+            Err(err) => {
+                failed += 1;
+                println!("  {}: {err}", repo.path.display());
+            }
+        }
+    }
+
+    let total: std::time::Duration = timings.iter().map(|(elapsed, _)| *elapsed).sum();
+    println!(
+        "tier 2:    {} ms over {} repos ({skipped} bare, skipped) — per repo, not a pass",
+        total.as_millis(),
+        timings.len()
+    );
+    if !timings.is_empty() {
+        println!(
+            "  mean:      {:.1} ms per expand",
+            total.as_secs_f64() * 1000.0 / timings.len() as f64
+        );
+    }
+    if let Some((slowest, repo)) = timings.iter().max_by_key(|(elapsed, _)| *elapsed) {
+        println!("  slowest:   {} ms — {}", slowest.as_millis(), repo.name);
+    }
+    println!("  submodules: {submodules} recorded across the tree");
+    if failed > 0 {
+        println!("  degraded:  {failed} repositories lost at least one half");
+    }
 }
 
 /// Print the discovered repositories by kind.

@@ -331,9 +331,13 @@ pub struct ScanError {
 /// errors here are repositories that could not be read *at all* — one that was read but whose
 /// ahead/behind or stash count failed carries its own message on [`RepoStatus::error`] instead and
 /// is counted in `repos_read`.
+///
+/// **Not `ts(export)`ed, unlike its siblings**, because it does not cross IPC: one Tier 0 pass is a
+/// per-batch detail of the pipeline, and the scan reports [`ScanTotals`] instead. Exporting it
+/// anyway would put a file in `src/scripts/generated/` that nothing imports, in a directory whose
+/// whole claim is that it mirrors the wire.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS), ts(export))]
 pub struct Tier0Summary {
     /// Repositories that produced a row.
     pub repos_read: u32,
@@ -341,6 +345,64 @@ pub struct Tier0Summary {
     pub errors: Vec<ScanError>,
     /// Wall-clock duration of the pass, milliseconds.
     pub elapsed_ms: u64,
+}
+
+/// How much of a row to read.
+///
+/// Cumulative: a tier names itself **and every cheaper tier below it**, because the tiers are not
+/// independent. Tier 1 without Tier 0 would produce a `dirty` flag for a row with no `head` to
+/// attach it to, and Tier 2 alone could not tell a repository that moved from one that did not.
+/// So `Two` means "read all three", which is what a refresh of a single row wants.
+///
+/// Variants are named for the numbers rather than as `Tier0`/`Tier1`/`Tier2`: repeating the type's
+/// own name in every variant trips `clippy::enum_variant_names`, which `-D warnings` makes fatal.
+/// `Ord` so the gate reads `tier >= Tier::One` rather than as a match with three arms.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default,
+)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS), ts(export))]
+pub enum Tier {
+    /// Refs only: branch, upstream, ahead/behind, stash, state, tip commit, last-fetched age.
+    #[default]
+    Zero,
+    /// Tier 0, plus the dirty flag and the conflicted count.
+    One,
+    /// Tier 0 and 1, plus the full file counts and the submodule list.
+    Two,
+}
+
+/// What a whole scan did, tier by tier.
+///
+/// [`ScanEvent::Finished`]'s payload, and deliberately **not** [`Tier0Summary`]: reusing that type
+/// meant one `elapsed_ms` field standing for the whole pipeline, so anything rendering it could
+/// only honestly say "scan" — which blamed the cheap tier for the expensive one's cost, given
+/// Tier 1 runs about 24x Tier 0 cold.
+///
+/// `elapsed_ms` is wall clock across the walk and every tier. The three per-stage fields are sums
+/// of the per-batch passes, which is a different measurement and the right one for attribution:
+/// summing them would *understate* a total, because it omits the time spent waiting for the walk
+/// to produce the next batch, and that wait is most of what a user experiences. The batches run
+/// sequentially, so the spans do not overlap and the sums do not double-count.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS), ts(export))]
+pub struct ScanTotals {
+    /// Repositories that produced a row.
+    pub repos_read: u32,
+    /// Repositories that could not be opened or whose HEAD could not be read. Never fatal.
+    ///
+    /// Also delivered per batch as [`ScanEvent::RepoErrors`] while the scan runs; this is the
+    /// complete list for a frontend that missed one, or reloaded mid-scan.
+    pub errors: Vec<ScanError>,
+    /// Wall-clock duration of the whole scan, milliseconds: the walk and every tier.
+    pub elapsed_ms: u64,
+    /// How long the walk took, milliseconds.
+    pub discovery_ms: u64,
+    /// Time in Tier 0, summed over every batch, milliseconds.
+    pub tier0_ms: u64,
+    /// Time in Tier 1, summed over every batch, milliseconds.
+    pub tier1_ms: u64,
 }
 
 /// What a completed walk did, as opposed to what it found.
@@ -449,17 +511,34 @@ pub enum ScanEvent {
         summary: ScanSummary,
     },
 
+    /// Repositories in the batch just read that produced **no row at all**, with the cause.
+    ///
+    /// The *total* failure grade, delivered as it happens. It arrives per batch rather than only in
+    /// the terminal event because a scan is not quick: at Tier 1's cold cost a three-hundred
+    /// repository tree runs for the better part of a minute, and a row whose HEAD could not be read
+    /// would otherwise render as "counting…" — a claim that work is in progress — for all of it.
+    ///
+    /// A repository that *was* read but lost one field is not here: it has a row, and its cause
+    /// rides on [`RepoStatus::error`].
+    #[serde(rename_all = "camelCase")]
+    RepoErrors {
+        /// The scan that produced these failures.
+        scan_id: ScanId,
+        /// The failures, by path.
+        errors: Vec<ScanError>,
+    },
+
     /// The scan ran to completion. Terminal.
     ///
-    /// `summary.errors` is where the *total* per-repository failures land: a repository that would
-    /// not open has no [`RepoStatus`] and never will, so its row stays whatever
-    /// [`ScanEvent::ReposFound`] delivered and this is the only place the cause appears.
+    /// `summary.errors` is the complete list of *total* per-repository failures — the same ones
+    /// [`ScanEvent::RepoErrors`] already delivered per batch, repeated here so a frontend that
+    /// reloaded mid-scan is not left without them.
     #[serde(rename_all = "camelCase")]
     Finished {
         /// The scan that finished.
         scan_id: ScanId,
-        /// The aggregate of every Tier 0 batch in the scan.
-        summary: Tier0Summary,
+        /// What the whole scan did, tier by tier.
+        summary: ScanTotals,
     },
 
     /// The scan stopped before completing. Terminal.

@@ -9,13 +9,26 @@ const NOW = 1_700_000_000_000;
 /**
  * Mounts a row inside a table, so the `<tr>` is valid markup.
  */
-function mountRow(row: Row, extra: { readError?: string | null; tier0Done?: boolean } = {}) {
+function mountRow(
+  row: Row,
+  extra: {
+    readError?: string | null;
+    tier0Done?: boolean;
+    expanded?: boolean;
+    loadingDetail?: boolean;
+    detailError?: string | null;
+  } = {},
+) {
   return mount(RepoRow, {
     props: {
       row,
       now: NOW,
       readError: extra.readError ?? null,
       tier0Done: extra.tier0Done ?? false,
+      expanded: extra.expanded ?? false,
+      loadingDetail: extra.loadingDetail ?? false,
+      detailError: extra.detailError ?? null,
+      colspan: 7,
     },
     attachTo: document.createElement('tbody'),
   });

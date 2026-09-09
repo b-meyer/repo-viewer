@@ -7,7 +7,9 @@
  * that reason — a test that wants a computed value says so.
  */
 import type { DiscoveredRepo } from '@/scripts/generated/DiscoveredRepo';
+import type { FileCounts } from '@/scripts/generated/FileCounts';
 import type { RepoStatus } from '@/scripts/generated/RepoStatus';
+import type { ScanTotals } from '@/scripts/generated/ScanTotals';
 
 /**
  * A repository the walk found but nothing has read.
@@ -54,4 +56,35 @@ export function MakeStatus(overrides: Partial<RepoStatus> = {}): RepoStatus {
     error: null,
     ...overrides,
   };
+}
+
+/**
+ * What a finished scan reported, tier by tier.
+ *
+ * @param overrides - Fields to replace.
+ * @returns A `ScanTotals`.
+ */
+export function MakeTotals(overrides: Partial<ScanTotals> = {}): ScanTotals {
+  return {
+    reposRead: 1,
+    errors: [],
+    elapsedMs: 900,
+    discoveryMs: 40,
+    tier0Ms: 130,
+    tier1Ms: 700,
+    ...overrides,
+  };
+}
+
+/**
+ * A Tier 2 read: four column totals.
+ *
+ * Not a partition of paths — a staged-then-modified file counts in two columns — so these are
+ * deliberately not chosen to look like they add up to anything.
+ *
+ * @param overrides - Fields to replace.
+ * @returns A `FileCounts`.
+ */
+export function MakeCounts(overrides: Partial<FileCounts> = {}): FileCounts {
+  return { staged: 1, unstaged: 2, untracked: 3, conflicted: 0, ...overrides };
 }

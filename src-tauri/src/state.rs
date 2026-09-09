@@ -15,7 +15,7 @@ use std::{
     },
 };
 
-use repo_scan::{RepoEvent, RepoStatus, ScanError, ScanId, Tier1};
+use repo_scan::{DiscoveredRepo, RepoEvent, RepoStatus, ScanError, ScanId, Tier1, Tier2};
 use tauri::ipc::Channel;
 
 /// Everything the app owns between commands.
@@ -33,6 +33,18 @@ pub struct AppState {
     /// per-key sharding buys nothing here — and a sharded map cannot cheaply produce the coherent
     /// snapshot the cache needs.
     repos: RwLock<HashMap<PathBuf, RepoStatus>>,
+
+    /// What discovery found, keyed the same way as [`AppState::repos`].
+    ///
+    /// A second map rather than a field on the row, because the row does not have one to spare:
+    /// `RepoStatus` carries no `git_dir`, and every engine entry point needs the *resolved* one —
+    /// `<path>/.git` for a normal repository, the path itself when bare, and the private directory
+    /// a `.git` file names for a worktree or submodule. Discovery resolved it once and re-resolving
+    /// it per command is explicitly not done, so it is kept here instead.
+    ///
+    /// This is also a **superset** of `repos`: a repository whose HEAD could not be read has an
+    /// entry here and no row, which is what gives `refresh_repo` something to retry.
+    found: RwLock<HashMap<PathBuf, DiscoveredRepo>>,
 
     /// The configured roots, canonicalised. In memory only; persistence is Phase 5.
     roots: RwLock<Vec<PathBuf>>,
@@ -59,6 +71,7 @@ impl std::fmt::Debug for AppState {
         formatter
             .debug_struct("AppState")
             .field("repos", &self.read_repos().len())
+            .field("found", &self.read_found().len())
             .field("roots", &self.read_roots().len())
             .field("scans", &self.lock_scans().len())
             .field("session", &self.lock_session().is_some())
@@ -98,6 +111,52 @@ impl AppState {
                 Some(merged)
             })
             .collect()
+    }
+
+    /// Merge one Tier 2 read into the canonical map and return the full merged row.
+    ///
+    /// Single rather than batched, unlike the other two: Tier 2 runs for one expanded row at a
+    /// time, so there is no batch to take the lock once for.
+    ///
+    /// `None` for a path the map does not hold, for the same reason [`AppState::merge_tier1_batch`]
+    /// drops one: Tier 2 has no `head` and so cannot produce a row on its own.
+    pub fn merge_tier2(&self, row: Tier2) -> Option<RepoStatus> {
+        let mut repos = self.write_repos();
+        let existing = repos.get(&row.path)?;
+        let merged = merge_tier2(existing, row);
+        repos.insert(merged.path.clone(), merged.clone());
+        Some(merged)
+    }
+
+    /// Record what discovery found, so a later per-row read can reach its resolved Git directory.
+    pub fn record_found(&self, repos: &[DiscoveredRepo]) {
+        let mut found = self.write_found();
+        for repo in repos {
+            found.insert(repo.path.clone(), repo.clone());
+        }
+    }
+
+    /// What discovery found for `path`, if anything.
+    ///
+    /// The validator for `refresh_repo`, and the only source of a `git_dir` outside a scan.
+    pub fn discovered(&self, path: &Path) -> Option<DiscoveredRepo> {
+        self.read_found().get(path).cloned()
+    }
+
+    /// Whether `path` is a key of the canonical map.
+    ///
+    /// The validator for commands that need an existing row to work on. A repository discovery
+    /// found but Tier 0 could not read is **not** here — see [`AppState::discovered`].
+    pub fn has_repo(&self, path: &Path) -> bool {
+        self.read_repos().contains_key(path)
+    }
+
+    /// The canonical row for `path`, if there is one.
+    ///
+    /// For a command that has to answer with a row it did not change — a Tier 2 read of a bare
+    /// repository, where there is nothing to compute and nothing to merge.
+    pub fn row(&self, path: &Path) -> Option<RepoStatus> {
+        self.read_repos().get(path).cloned()
     }
 
     /// Record a per-repository failure against rows that already exist, and return them merged.
@@ -154,6 +213,9 @@ impl AppState {
             roots.clone()
         };
 
+        // Both maps are keyed the same way and a root is a prefix of every key beneath it, which is
+        // what `add_root`'s canonicalisation buys. `found` is evicted too, or a removed root would
+        // leave behind exactly the entries that let a command reach into it.
         let mut repos = self.write_repos();
         let evicted: Vec<PathBuf> = repos
             .keys()
@@ -163,6 +225,9 @@ impl AppState {
         for key in &evicted {
             repos.remove(key);
         }
+
+        self.write_found().retain(|key, _| !key.starts_with(path));
+
         (roots, evicted)
     }
 
@@ -240,6 +305,16 @@ impl AppState {
         self.repos.write().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// Read the discovered repositories, recovering from a poisoned lock.
+    fn read_found(&self) -> RwLockReadGuard<'_, HashMap<PathBuf, DiscoveredRepo>> {
+        self.found.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Write the discovered repositories, recovering from a poisoned lock.
+    fn write_found(&self) -> RwLockWriteGuard<'_, HashMap<PathBuf, DiscoveredRepo>> {
+        self.found.write().unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// Read the roots, recovering from a poisoned lock.
     fn read_roots(&self) -> RwLockReadGuard<'_, Vec<PathBuf>> {
         self.roots.read().unwrap_or_else(PoisonError::into_inner)
@@ -311,9 +386,9 @@ pub fn merge_tier0(existing: Option<&RepoStatus>, incoming: RepoStatus) -> RepoS
         // result that lost a race with a later tier must not make the row look older than it is.
         scanned_at_ms: incoming.scanned_at_ms.max(existing.scanned_at_ms),
 
-        // Owned by the read that produced it. Unambiguous while Tier 0 is the only writer; when
-        // Phase 4 adds a second one, how two tiers' causes combine is an open question — see
-        // PLAN.md §12.
+        // Tier 0 owns the slot outright and replaces it, which is what stops Tier 1's appending
+        // from accumulating across rescans: every scan restarts the chain here. Tier 2 does not
+        // write it at all (PLAN.md §12, items 6 and 7).
         error: incoming.error,
     }
 }
@@ -336,6 +411,32 @@ pub fn merge_tier1(existing: &RepoStatus, incoming: Tier1) -> RepoStatus {
         conflicted: Some(incoming.conflicted),
         scanned_at_ms: now_ms().max(existing.scanned_at_ms),
         error: join_errors(existing.error.as_deref(), incoming.error.as_deref()),
+        ..existing.clone()
+    }
+}
+
+/// Merge one Tier 2 read into the row the earlier tiers produced.
+///
+/// Tier 2 owns `counts` and `submodules` and nothing else. In particular it does **not** write
+/// `conflicted`, even though it counted one: Tier 1 owns that field, reaching the same number
+/// through index stage entries, and two writers for one field is how the two answers get to
+/// disagree. `FileCounts::conflicted` stays as the cross-check the engine's tests assert on.
+///
+/// **`error` is left alone**, which is the one place this differs from [`merge_tier1`]. Tier 2 runs
+/// on demand and repeatedly — once per expand — so appending would stack a message per expand with
+/// nothing but a rescan to clear it, and replacing would erase the reason an earlier tier's field
+/// is missing. A Tier 2 failure has a caller waiting on a return value, so it is reported there
+/// instead and never lands on the row (PLAN.md §12, item 7).
+///
+/// `..existing.clone()` rather than [`merge_tier0`]'s exhaustive field list, and the asymmetry is
+/// deliberate: the fall-through here means "not Tier 2's", so a field added to `RepoStatus` is kept
+/// from the row by default — which is the safe answer for the narrowest tier. Tier 0 lists every
+/// field precisely because its fall-through would be the *unsafe* one.
+pub fn merge_tier2(existing: &RepoStatus, incoming: Tier2) -> RepoStatus {
+    RepoStatus {
+        counts: incoming.counts,
+        submodules: incoming.submodules,
+        scanned_at_ms: now_ms().max(existing.scanned_at_ms),
         ..existing.clone()
     }
 }
@@ -638,5 +739,179 @@ mod tier1_tests {
         for row in &merged {
             assert!(held.contains(row), "returned row is not what the map holds");
         }
+    }
+}
+
+#[cfg(test)]
+mod tier2_tests {
+    use repo_scan::{FileCounts, SubmoduleStatus, Tier2};
+
+    use super::{tests::row, *};
+
+    fn counts() -> FileCounts {
+        FileCounts {
+            staged: 1,
+            unstaged: 2,
+            untracked: 3,
+            conflicted: 4,
+        }
+    }
+
+    fn tier2(path: &str) -> Tier2 {
+        Tier2 {
+            path: PathBuf::from(path),
+            counts: Some(counts()),
+            submodules: Some(Vec::new()),
+            error: None,
+        }
+    }
+
+    /// Tier 2 owns two fields and must leave every earlier tier's alone.
+    #[test]
+    fn tier2_merge_leaves_the_earlier_tiers_alone() {
+        let mut existing = row("C:/work/a");
+        existing.upstream = Some("origin/main".into());
+        existing.ahead = Some(2);
+        existing.dirty = Some(true);
+        existing.conflicted = Some(9);
+
+        let merged = merge_tier2(&existing, tier2("C:/work/a"));
+
+        assert_eq!(merged.upstream, Some("origin/main".into()));
+        assert_eq!(merged.ahead, Some(2));
+        assert_eq!(merged.dirty, Some(true));
+        assert_eq!(merged.counts, Some(counts()));
+        assert_eq!(merged.submodules, Some(Vec::new()));
+    }
+
+    /// **Tier 1 owns `conflicted`, and Tier 2 counted one too.** Writing it here would give one
+    /// field two writers reaching it by different routes, which is how the two answers get to
+    /// disagree on screen. `counts.conflicted` carries Tier 2's number instead.
+    #[test]
+    fn tier2_merge_does_not_write_the_tier1_conflicted_field() {
+        let mut existing = row("C:/work/a");
+        existing.conflicted = Some(9);
+
+        let merged = merge_tier2(&existing, tier2("C:/work/a"));
+
+        assert_eq!(merged.conflicted, Some(9), "still Tier 1's value");
+        assert_eq!(merged.counts.expect("counts were merged").conflicted, 4);
+    }
+
+    /// A Tier 2 failure is reported to its caller, never onto the row: it runs once per expand, so
+    /// appending would stack a message per expand and replacing would erase an earlier tier's
+    /// cause.
+    #[test]
+    fn tier2_merge_never_touches_the_error_slot() {
+        let mut existing = row("C:/work/a");
+        existing.error = Some("stash count failed".into());
+        let mut incoming = tier2("C:/work/a");
+        incoming.error = Some("status iterator failed".into());
+
+        let merged = merge_tier2(&existing, incoming);
+
+        assert_eq!(merged.error, Some("stash count failed".into()));
+    }
+
+    /// A read that failed leaves the fields unknown rather than zero — a `FileCounts::default()`
+    /// here would be four zeros presented as a measurement.
+    #[test]
+    fn a_failed_tier2_read_merges_as_unknown_not_as_zero() {
+        let existing = row("C:/work/a");
+        let incoming = Tier2 {
+            path: PathBuf::from("C:/work/a"),
+            counts: None,
+            submodules: None,
+            error: Some("index unreadable".into()),
+        };
+
+        let merged = merge_tier2(&existing, incoming);
+
+        assert_eq!(merged.counts, None);
+        assert_eq!(merged.submodules, None);
+    }
+
+    /// An empty submodule list is an answered question; `None` would claim a read is outstanding.
+    #[test]
+    fn an_empty_submodule_list_is_distinct_from_an_unread_one() {
+        let existing = row("C:/work/a");
+        let mut incoming = tier2("C:/work/a");
+        incoming.submodules = Some(vec![SubmoduleStatus {
+            name: "sub".into(),
+            path: PathBuf::from("sub"),
+            recorded_id: None,
+            head_id: None,
+        }]);
+
+        let listed = merge_tier2(&existing, incoming)
+            .submodules
+            .expect("the list was read");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(
+            merge_tier2(&existing, tier2("C:/work/a")).submodules,
+            Some(Vec::new())
+        );
+    }
+
+    /// Tier 2 cannot insert a row of its own — it has no `head` to give one.
+    #[test]
+    fn merge_tier2_drops_a_result_for_a_path_with_no_row() {
+        let state = AppState::default();
+
+        assert!(state.merge_tier2(tier2("C:/work/ghost")).is_none());
+        assert!(state.snapshot().is_empty());
+    }
+
+    /// `has_repo` gates the commands that need a row; `discovered` gates the one that can create
+    /// one. The second is a superset, which is what gives a total Tier 0 failure a retry path.
+    #[test]
+    fn discovered_is_a_superset_of_the_rows() {
+        let state = AppState::default();
+        let unreadable = repo_scan::DiscoveredRepo {
+            path: PathBuf::from("C:/work/broken"),
+            name: "broken".into(),
+            parent: PathBuf::from("C:/work"),
+            kind: repo_scan::RepoKind::Normal,
+            git_dir: PathBuf::from("C:/work/broken/.git"),
+        };
+        state.record_found(&[unreadable]);
+
+        assert!(
+            !state.has_repo(Path::new("C:/work/broken")),
+            "no row exists"
+        );
+        assert!(
+            state.discovered(Path::new("C:/work/broken")).is_some(),
+            "but the walk found it, so a refresh can retry it"
+        );
+        assert_eq!(
+            state
+                .discovered(Path::new("C:/work/broken"))
+                .expect("found")
+                .git_dir,
+            PathBuf::from("C:/work/broken/.git"),
+            "and the resolved git dir is what a per-row read needs"
+        );
+    }
+
+    /// A removed root must not leave `found` entries behind: they are what lets a command reach
+    /// into a tree the user has taken away.
+    #[test]
+    fn remove_root_evicts_the_discovered_map_too() {
+        let state = AppState::default();
+        state.add_root(PathBuf::from("C:/work"));
+        state.record_found(&[repo_scan::DiscoveredRepo {
+            path: PathBuf::from("C:/work/a"),
+            name: "a".into(),
+            parent: PathBuf::from("C:/work"),
+            kind: repo_scan::RepoKind::Normal,
+            git_dir: PathBuf::from("C:/work/a/.git"),
+        }]);
+        state.merge_tier0_batch(vec![row("C:/work/a")]);
+
+        state.remove_root(Path::new("C:/work"));
+
+        assert!(state.discovered(Path::new("C:/work/a")).is_none());
+        assert!(!state.has_repo(Path::new("C:/work/a")));
     }
 }

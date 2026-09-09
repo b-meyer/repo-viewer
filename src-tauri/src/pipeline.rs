@@ -21,7 +21,7 @@ use std::{
 };
 
 use repo_scan::{
-    DiscoveredRepo, ScanError, ScanEvent, ScanId, ScanOpts, Tier0Summary, discover_roots_with,
+    DiscoveredRepo, ScanError, ScanEvent, ScanId, ScanOpts, ScanTotals, discover_roots_with,
     read_tier0_all_with, read_tier1_all_with,
 };
 use tauri::ipc::Channel;
@@ -52,12 +52,19 @@ pub fn run_scan(
     // The walk runs on its own thread so this one can drain and read at the same time. `found_tx`
     // is moved into the closure, which `discover_roots_with` drops on return — that disconnect is
     // what ends the drain loop below, so there is no separate "walk is done" signal to get wrong.
+    //
+    // The walk's own duration comes back through this cell rather than being timed out here: the
+    // thread is joined after the drain loop, so measuring around the join would include every
+    // tier's time as well.
+    let discovery_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let walker = std::thread::spawn({
         let (cancel, events, opts) = (Arc::clone(&cancel), events.clone(), opts.clone());
+        let discovery_ms = Arc::clone(&discovery_ms);
         move || {
             let summary = discover_roots_with(&roots, &opts, &cancel, move |repo| {
                 let _ = found_tx.send(repo);
             });
+            discovery_ms.store(summary.elapsed_ms, Ordering::Relaxed);
             emit(
                 &events,
                 ScanEvent::DiscoveryFinished {
@@ -69,6 +76,8 @@ pub fn run_scan(
     });
 
     let mut errors: Vec<ScanError> = Vec::new();
+    let mut tier0_ms = 0_u64;
+    let mut tier1_ms = 0_u64;
 
     while let Some(batch) = next_batch(&found_rx, BATCH_MAX, BATCH_WINDOW) {
         if cancel.load(Ordering::Relaxed) {
@@ -76,6 +85,9 @@ pub fn run_scan(
         }
 
         guard.found += batch.len() as u32;
+        // Recorded before the batch is emitted, so a `full_status` or `refresh_repo` arriving the
+        // instant a row paints can already resolve its Git directory.
+        state.record_found(&batch);
         // Cloned rather than borrowed: `Channel::send` takes ownership to serialize, and Tier 0
         // needs the batch afterwards. Five `PathBuf`s times 25 is nothing beside 25 x ~3 ms of
         // refs I/O — and the alternative, reading first and emitting once, is precisely the
@@ -92,6 +104,21 @@ pub fn run_scan(
         let summary = read_tier0_all_with(&batch, &cancel, |status| {
             lock(&rows).push(status);
         });
+        tier0_ms = tier0_ms.saturating_add(summary.elapsed_ms);
+
+        // The total-failure grade, delivered now rather than only at the end. These repositories
+        // will never produce a row, so without this their rows would read "counting…" — a claim
+        // that work is in progress — for the rest of the scan, which on a large tree is most of a
+        // minute.
+        if !summary.errors.is_empty() {
+            emit(
+                &events,
+                ScanEvent::RepoErrors {
+                    scan_id: id,
+                    errors: summary.errors.clone(),
+                },
+            );
+        }
         errors.extend(summary.errors);
 
         let read = lock_into(rows);
@@ -128,6 +155,7 @@ pub fn run_scan(
         let tier1 = read_tier1_all_with(&batch, &cancel, |status| {
             lock(&dirty).push(status);
         });
+        tier1_ms = tier1_ms.saturating_add(tier1.elapsed_ms);
         let merged = state.merge_tier1_batch(lock_into(dirty));
         if !merged.is_empty() {
             emit(
@@ -163,18 +191,19 @@ pub fn run_scan(
         return; // The guard emits `Cancelled` with the counts it holds.
     }
 
-    guard.finish(Tier0Summary {
+    guard.finish(ScanTotals {
         repos_read: guard.read,
         errors,
-        // Wall clock across the whole pipeline — the walk and Tier 1 included, not Tier 0 alone.
-        // The per-batch `elapsed_ms` values are discarded on purpose: summing them would exclude
-        // the time spent waiting for the walk to produce the next batch, which is most of a scan's
-        // duration and all of what a user experiences.
-        //
-        // The field belongs to `Tier0Summary` only because `Finished` reuses that type as the
-        // scan's summary, so anything rendering it must say "scan" rather than "Tier 0". A real
-        // per-tier breakdown means a wire change; until then this is the total.
+        // Wall clock across the whole pipeline: the walk and every tier. This is the number a user
+        // experiences, and it is **not** the sum of the three fields below — most of a scan is
+        // spent waiting for the walk to hand over the next batch, which belongs to none of them.
         elapsed_ms: elapsed_ms(started),
+        discovery_ms: discovery_ms.load(Ordering::Relaxed),
+        // Sums of the per-batch passes. Attribution rather than duration: the batches run one
+        // after another, so the spans do not overlap, and this is what says which tier the work
+        // went into. Tier 1 is where roughly 24x of it goes cold.
+        tier0_ms,
+        tier1_ms,
     });
 }
 
@@ -230,7 +259,7 @@ impl ScanGuard {
     }
 
     /// Emit [`ScanEvent::Finished`]. The scan completed.
-    fn finish(&mut self, summary: Tier0Summary) {
+    fn finish(&mut self, summary: ScanTotals) {
         self.finished = true;
         emit(
             &self.events,
@@ -407,6 +436,7 @@ mod tests {
             | ScanEvent::ReposUpdated { scan_id, .. }
             | ScanEvent::Progress { scan_id, .. }
             | ScanEvent::DiscoveryFinished { scan_id, .. }
+            | ScanEvent::RepoErrors { scan_id, .. }
             | ScanEvent::Finished { scan_id, .. }
             | ScanEvent::Cancelled { scan_id, .. } => *scan_id,
         }

@@ -4,7 +4,7 @@ import type { DiscoveredRepo } from '@/scripts/generated/DiscoveredRepo';
 import type { RepoStatus } from '@/scripts/generated/RepoStatus';
 import type { ScanError } from '@/scripts/generated/ScanError';
 import type { ScanSummary } from '@/scripts/generated/ScanSummary';
-import type { Tier0Summary } from '@/scripts/generated/Tier0Summary';
+import type { ScanTotals } from '@/scripts/generated/ScanTotals';
 
 /**
  * One row of the table: either a repository Rust has read, or one it has only found.
@@ -75,7 +75,8 @@ export function isRead(row: RepoRow): row is RepoStatus {
  *
  * The scan-session fields — `phase`, the summaries, `scanError` — are not row values and are not
  * covered by that rule. They are this side's bookkeeping over events Rust sent, which is the
- * frontend's own business.
+ * frontend's own business. So is which rows are expanded: that is a fact about this window, not
+ * about a repository, and Rust neither knows nor needs to.
  *
  * Uncomputed fields stay `null` and must render as unknown — never as `0`.
  */
@@ -98,9 +99,51 @@ export const useReposStore = defineStore('repos', () => {
   const discovery = ref<ScanSummary | null>(null);
 
   /**
-   * What Tier 0 did, once the scan has finished. `null` until then.
+   * What the whole scan did, tier by tier, once it has finished. `null` until then.
+   *
+   * Doubles as the "Tier 0 has finished" signal — see {@link tier0Done}.
    */
-  const tier0 = ref<Tier0Summary | null>(null);
+  const totals = ref<ScanTotals | null>(null);
+
+  /**
+   * Repositories that produced no row at all, by path, with the cause.
+   *
+   * Accumulated from `RepoErrors` events as they arrive rather than derived from the terminal one,
+   * because a scan is not quick: at Tier 1's cold cost a large tree runs for the better part of a
+   * minute, and a row whose HEAD could not be read must stop claiming to be "counting…" as soon as
+   * Rust knows it never will be.
+   *
+   * Always a map, never `null`. "Has Tier 0 finished?" is a separate question and {@link tier0Done}
+   * answers it: an absent entry here means nothing has failed for that path _yet_, which is not the
+   * same as the scan being over. Conflating the two makes a mid-scan failure impossible to
+   * express.
+   */
+  const repoErrors = ref(new Map<string, string>());
+
+  /**
+   * Which rows are expanded, by path.
+   *
+   * Window state, not row state: it is not mirrored from Rust and Rust is not told about it. A
+   * `Set` because the only questions asked of it are membership and toggling.
+   */
+  const expanded = ref(new Set<string>());
+
+  /**
+   * Which rows have a Tier 2 read in flight, by path.
+   *
+   * What makes the drawer say `counting…` honestly — the claim is true exactly while a path is in
+   * here, which is the transience the four-absences rule demands of that word.
+   */
+  const loadingDetail = ref(new Set<string>());
+
+  /**
+   * Why a row's Tier 2 read failed, by path.
+   *
+   * Tier 2 failures live here rather than on `RepoStatus.error`: the row's one error slot is owned
+   * by the tiers that run during a scan, and this read can be repeated once per expand, so writing
+   * there would either stack messages or erase an earlier tier's cause.
+   */
+  const detailErrors = ref(new Map<string, string>());
 
   /**
    * A failed command — not a per-repository failure, which rides on the row itself.
@@ -152,16 +195,14 @@ export const useReposStore = defineStore('repos', () => {
   }));
 
   /**
-   * Tier 0 failures by path, or `null` until Tier 0 has finished.
+   * Whether Tier 0 has finished, which is what turns a row's "not yet" into "never".
    *
-   * `null` rather than an empty map, for the same reason `total` is `null` rather than `0`: "Tier 0
-   * has not finished" and "Tier 0 finished and found nothing wrong" are different facts, and a row
-   * with no status yet means something different in each.
+   * Kept separate from {@link repoErrors} rather than inferred from it, because `RepoErrors` arrives
+   * per batch: a row can be known-unreadable while the scan is still running, so "an error arrived
+   * for this path" and "Tier 0 is done" are different questions. A row still lacking a status once
+   * this is `true` will never get one.
    */
-  const readErrors = computed<Map<string, string> | null>(() => {
-    if (tier0.value === null) return null;
-    return new Map(tier0.value.errors.map((error: ScanError) => [error.path, error.message]));
-  });
+  const tier0Done = computed(() => totals.value !== null);
 
   /// Methods
   /**
@@ -204,12 +245,19 @@ export const useReposStore = defineStore('repos', () => {
 
   /**
    * Drops every row and every summary, for a fresh scan.
+   *
+   * `expanded` survives on purpose: it describes what the user has open, and a rescan of the same
+   * tree should not collapse their drawers. Everything derived from the _previous_ scan's reads
+   * goes, including the Tier 2 failures — a fresh scan is a fresh chance for that read to work.
    */
   function Reset(): void {
     byPath.value.clear();
     discovery.value = null;
-    tier0.value = null;
+    totals.value = null;
     scanError.value = null;
+    repoErrors.value.clear();
+    loadingDetail.value.clear();
+    detailErrors.value.clear();
   }
 
   /**
@@ -231,12 +279,59 @@ export const useReposStore = defineStore('repos', () => {
   }
 
   /**
-   * Records what Tier 0 did.
+   * Records what the whole scan did, tier by tier.
    *
-   * @param summary - Tier 0's summary, or `null` to clear it.
+   * @param summary - The scan's totals, or `null` to clear them.
    */
-  function SetTier0Summary(summary: Tier0Summary | null): void {
-    tier0.value = summary;
+  function SetTotals(summary: ScanTotals | null): void {
+    totals.value = summary;
+  }
+
+  /**
+   * Records repositories that produced no row, as Rust reports them.
+   *
+   * Additive: these arrive per batch, and the terminal event repeats the complete list so a webview
+   * that reloaded mid-scan is not left without them. Re-recording the same path is therefore normal
+   * and overwrites rather than duplicating.
+   *
+   * @param errors - The failures Rust sent.
+   */
+  function AddRepoErrors(errors: ScanError[]): void {
+    for (const error of errors) repoErrors.value.set(error.path, error.message);
+  }
+
+  /**
+   * Toggles a row's drawer.
+   *
+   * @param path - The row to toggle.
+   * @returns Whether it is now expanded.
+   */
+  function ToggleExpanded(path: string): boolean {
+    if (expanded.value.delete(path)) return false;
+    expanded.value.add(path);
+    return true;
+  }
+
+  /**
+   * Records whether a Tier 2 read is in flight for a row.
+   *
+   * @param path - The row being read.
+   * @param loading - Whether the read is running.
+   */
+  function SetLoadingDetail(path: string, loading: boolean): void {
+    if (loading) loadingDetail.value.add(path);
+    else loadingDetail.value.delete(path);
+  }
+
+  /**
+   * Records why a row's Tier 2 read failed, or clears it.
+   *
+   * @param path - The row that was read.
+   * @param message - The failure, or `null` on success.
+   */
+  function SetDetailError(path: string, message: string | null): void {
+    if (message === null) detailErrors.value.delete(path);
+    else detailErrors.value.set(path, message);
   }
 
   /**
@@ -261,7 +356,11 @@ export const useReposStore = defineStore('repos', () => {
     byPath,
     phase,
     discovery,
-    tier0,
+    totals,
+    repoErrors,
+    expanded,
+    loadingDetail,
+    detailErrors,
     scanError,
     roots,
     rows,
@@ -269,7 +368,7 @@ export const useReposStore = defineStore('repos', () => {
     readCount,
     scanning,
     progress,
-    readErrors,
+    tier0Done,
     Upsert,
     UpsertMany,
     Remove,
@@ -277,7 +376,11 @@ export const useReposStore = defineStore('repos', () => {
     Reset,
     SetPhase,
     SetDiscoverySummary,
-    SetTier0Summary,
+    SetTotals,
+    AddRepoErrors,
+    ToggleExpanded,
+    SetLoadingDetail,
+    SetDetailError,
     SetScanError,
     SetRoots,
   };
