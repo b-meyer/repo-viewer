@@ -59,12 +59,15 @@ const KEY_OPEN_IN: &str = "openIn";
 /// The view state, opaque to Rust — see [`ui`].
 const KEY_UI: &str = "ui";
 
+/// How live updates behave — see [`watch`].
+const KEY_WATCH: &str = "watch";
+
 /// The one key in the cache file, holding a whole [`CacheFile`].
 const KEY_CACHE: &str = "cache";
 
 /// The cache shape this build understands. A file carrying anything else is ignored rather than
 /// migrated: one scan rebuilds it, so the cheap answer is the right one.
-const CACHE_VERSION: u32 = 1;
+const CACHE_VERSION: u32 = 2;
 
 /// How to launch one external tool.
 ///
@@ -133,6 +136,56 @@ impl Default for OpenInSettings {
     }
 }
 
+/// How live updates behave.
+///
+/// Read **once, at startup**, unlike [`OpenInSettings`] — the watcher and the poll thread are built
+/// once and hold these values, so a hand-edit takes effect on the next launch rather than
+/// immediately. README.md says so, because a setting that silently needs a restart is worse than
+/// one that says it does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct WatchSettings {
+    /// Whether to watch at all.
+    ///
+    /// Off leaves the poll running, which is the point of it being a separate switch: a network
+    /// mount or a container where the backend misbehaves can drop to polling without dropping to
+    /// nothing.
+    pub enabled: bool,
+
+    /// The debounce window in milliseconds.
+    ///
+    /// §7.3's range is ~300–500 ms. Git writes `.git/index` three times per operation, so this is
+    /// what turns one `git add` into one refresh instead of three.
+    pub debounce_ms: u64,
+
+    /// How often the poll runs, in seconds.
+    pub poll_seconds: u64,
+}
+
+impl Default for WatchSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            debounce_ms: 400,
+            poll_seconds: 60,
+        }
+    }
+}
+
+impl WatchSettings {
+    /// The debounce window, floored so a hand-edited `0` cannot turn debouncing off — which would
+    /// reintroduce the refresh storm the debouncer exists to prevent.
+    pub fn debounce(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.debounce_ms.max(100))
+    }
+
+    /// The poll interval, floored for the same reason: a `0` here would be a busy loop running a
+    /// Tier 0 pass over the whole tree.
+    pub fn poll_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.poll_seconds.max(5))
+    }
+}
+
 /// The persisted row cache.
 ///
 /// Both maps, not just the rows. `RepoStatus` carries no `git_dir` and every engine entry point
@@ -172,6 +225,9 @@ pub fn load<R: Runtime>(app: &AppHandle<R>, state: &AppState) {
     // so an empty file would leave a user with nothing to edit and no hint of what to write.
     if let Err(error) = seed_open_in(app) {
         tracing::warn!(%error, "could not write the default open-in commands");
+    }
+    if let Err(error) = seed_watch(app) {
+        tracing::warn!(%error, "could not write the default watch settings");
     }
 
     match cache(app) {
@@ -227,6 +283,34 @@ fn seed_open_in<R: Runtime>(app: &AppHandle<R>) -> Result<()> {
         return Ok(());
     }
     write(app, KEY_OPEN_IN, &OpenInSettings::default())
+}
+
+/// How live updates behave, defaulted when the key is absent or unreadable.
+///
+/// Read once, from `setup`. A malformed object falls back to the defaults whole rather than
+/// field-by-field: unlike the view state, there is no long tail of optional keys here, and three
+/// values are cheap enough to retype that guessing at which one the user meant buys nothing.
+pub fn watch<R: Runtime>(app: &AppHandle<R>) -> WatchSettings {
+    let stored = settings(app).ok().and_then(|store| store.get(KEY_WATCH));
+
+    let Some(stored) = stored else {
+        return WatchSettings::default();
+    };
+    match serde_json::from_value(stored) {
+        Ok(settings) => settings,
+        Err(error) => {
+            tracing::warn!(%error, "the watch settings could not be read; using the defaults");
+            WatchSettings::default()
+        }
+    }
+}
+
+/// Write the default watch settings if the key is absent, so the file shows what can be set.
+fn seed_watch<R: Runtime>(app: &AppHandle<R>) -> Result<()> {
+    if settings(app)?.has(KEY_WATCH) {
+        return Ok(());
+    }
+    write(app, KEY_WATCH, &WatchSettings::default())
 }
 
 /// The view state, verbatim, or `null` when nothing has been saved.

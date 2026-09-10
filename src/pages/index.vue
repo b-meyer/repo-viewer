@@ -27,6 +27,17 @@
       <app-alert tone="error" title="The scan failed">{{ repos.scanError }}</app-alert>
     </div>
 
+    <!--
+      A warning and not an error: watching is an optimisation, and the 60-second poll and the
+      refresh-on-focus underneath it are still running. So the title says what a user now gets
+      rather than that something broke.
+    -->
+    <div v-if="repos.watchError" class="px-20 pt-10">
+      <app-alert tone="warning" title="Rows update on a timer, not instantly">
+        {{ repos.watchError }}
+      </app-alert>
+    </div>
+
     <scan-progress
       v-if="repos.phase !== 'idle'"
       :progress="repos.progress"

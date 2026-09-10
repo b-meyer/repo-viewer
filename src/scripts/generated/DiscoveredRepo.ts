@@ -36,4 +36,16 @@ kind: RepoKind,
  * Resolved here so later phases never re-resolve it — Tier 0 opens it, and the watcher
  * (§7.2) registers its watch set against it.
  */
-gitDir: string, };
+gitDir: string, 
+/**
+ * The common directory: where `refs/`, `logs/` and `FETCH_HEAD` actually live.
+ *
+ * Equal to [`DiscoveredRepo::git_dir`] for every kind but a linked worktree, whose `git_dir`
+ * is the private `worktrees/<name>/` directory holding only its own `HEAD` and `index`. The
+ * refs it reads — and every remote-tracking update, which is the ahead/behind signal — belong
+ * to the repository it was linked from.
+ *
+ * Resolved here for the same reason `git_dir` is: the watcher's set spans both, and
+ * re-deriving it per repository at registration time would repeat work the walk already did.
+ */
+commonDir: string, };

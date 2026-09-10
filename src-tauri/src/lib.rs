@@ -19,6 +19,7 @@
 
 mod commands;
 mod error;
+mod live;
 mod persist;
 mod pipeline;
 mod state;
@@ -55,16 +56,33 @@ pub fn run() {
 
             let state = app.state::<Arc<AppState>>();
             persist::load(app.handle(), state.inner());
+            // After the cache is loaded, so the poll has the restored `found` map to work from if it
+            // fires before the launch scan finishes. Nothing is watched yet: the watch set follows
+            // from what discovery finds, and the first `sync_watches` is the launch scan's.
+            live::start(state.inner(), &persist::watch(app.handle()));
             Ok(())
         })
-        // Closing the window flips every live scan's flag, so the blocking threads unwind while
-        // the runtime is still up. `CloseRequested` and not `Destroyed` for that reason. This is
-        // about not burning cores on results nobody will see: a send into a dead webview returns
-        // `Ok(())` either way, so it is not an error path.
+        // Closing the window flips every live scan's flag and stops the watcher and the poll, so
+        // the blocking threads unwind while the runtime is still up. `CloseRequested` and not
+        // `Destroyed` for that reason. This is about not burning cores on results nobody will see:
+        // a send into a dead webview returns `Ok(())` either way, so it is not an error path.
+        //
+        // Focus is the other half of §7.4's safety net. It shares the poll's thread rather than
+        // having one of its own — the tick wakes it early — which is what makes "the poll and the
+        // focus handler take the same path" true of the code and not just of the design.
         .on_window_event(|window, event| {
-            if matches!(event, tauri::WindowEvent::CloseRequested { .. }) {
-                use tauri::Manager as _;
-                window.state::<Arc<AppState>>().cancel_all();
+            use tauri::Manager as _;
+
+            match event {
+                tauri::WindowEvent::CloseRequested { .. } => {
+                    let state = window.state::<Arc<AppState>>();
+                    state.cancel_all();
+                    state.stop_live();
+                }
+                tauri::WindowEvent::Focused(true) => {
+                    window.state::<Arc<AppState>>().tick(live::Tick::Refresh);
+                }
+                _ => {}
             }
         })
         .invoke_handler(tauri::generate_handler![

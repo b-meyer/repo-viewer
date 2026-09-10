@@ -247,6 +247,16 @@ pub struct DiscoveredRepo {
     /// Resolved here so later phases never re-resolve it — Tier 0 opens it, and the watcher
     /// (§7.2) registers its watch set against it.
     pub git_dir: PathBuf,
+    /// The common directory: where `refs/`, `logs/` and `FETCH_HEAD` actually live.
+    ///
+    /// Equal to [`DiscoveredRepo::git_dir`] for every kind but a linked worktree, whose `git_dir`
+    /// is the private `worktrees/<name>/` directory holding only its own `HEAD` and `index`. The
+    /// refs it reads — and every remote-tracking update, which is the ahead/behind signal — belong
+    /// to the repository it was linked from.
+    ///
+    /// Resolved here for the same reason `git_dir` is: the watcher's set spans both, and
+    /// re-deriving it per repository at registration time would repeat work the walk already did.
+    pub common_dir: PathBuf,
 }
 
 /// Directory names pruned by default: only names that are near-certainly generated.
@@ -581,5 +591,20 @@ pub enum RepoEvent {
     Removed {
         /// Absolute paths, exactly as Rust spells them.
         paths: Vec<PathBuf>,
+    },
+
+    /// Watching failed or degraded, and rows are now only as fresh as the poll makes them.
+    ///
+    /// Not an error state: the ~60 s poll and the refresh-on-focus are the documented fallback and
+    /// both still run, so this is the difference between "updates in a second" and "updates within
+    /// a minute". A consumer should say which, rather than presenting it as updates having stopped.
+    ///
+    /// The most likely cause on Linux is inotify's per-user watch limit, and the message carries
+    /// the `sysctl` command that raises it — which is the whole reason this crosses the boundary as
+    /// a value a user can read rather than as a log line only a developer will see.
+    #[serde(rename_all = "camelCase")]
+    WatchFailed {
+        /// Rendered cause, with the platform's fix appended where there is one.
+        message: String,
     },
 }

@@ -24,6 +24,7 @@ pub mod discover;
 pub mod error;
 pub mod model;
 pub mod status;
+pub mod watch;
 
 pub use discover::{canonical, discover_roots, discover_roots_with};
 pub use error::{Error, Result};
@@ -36,3 +37,4 @@ pub use status::{
     AHEAD_BEHIND_CAP, Tier1, Tier1Summary, Tier2, ahead_behind, read_tier0, read_tier0_all,
     read_tier0_all_with, read_tier1, read_tier1_all_with, read_tier2,
 };
+pub use watch::{RepoWatcher, WatchEvent, watch_set};

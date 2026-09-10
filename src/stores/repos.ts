@@ -161,6 +161,16 @@ export const useReposStore = defineStore('repos', () => {
   const scanError = ref<string | null>(null);
 
   /**
+   * Why live updates are degraded, or `null` when they are not.
+   *
+   * Separate from {@link scanError} because it is not a failed command and not fatal: the poll and
+   * the refresh-on-focus still run, so this is the difference between rows updating in a second and
+   * updating within a minute. Presenting it as an error would overstate it, and hiding it would
+   * leave a user wondering why the table went quiet.
+   */
+  const watchError = ref<string | null>(null);
+
+  /**
    * The configured roots, mirrored from Rust exactly as the rows are.
    */
   const roots = ref<string[]>([]);
@@ -270,6 +280,11 @@ export const useReposStore = defineStore('repos', () => {
     discovery.value = null;
     totals.value = null;
     scanError.value = null;
+    // A completed scan re-syncs the watch set and pushes a fresh failure if there still is one, so
+    // the message describes the last sync rather than accumulating across them. Left standing it
+    // would outlive the condition — a repository on a share that has since reconnected would keep
+    // reporting as unwatched for the life of the session.
+    watchError.value = null;
     repoErrors.value.clear();
     loadingDetail.value.clear();
     detailErrors.value.clear();
@@ -379,6 +394,15 @@ export const useReposStore = defineStore('repos', () => {
   }
 
   /**
+   * Records why live updates are degraded, or clears it.
+   *
+   * @param message - The cause, or `null` to clear it.
+   */
+  function SetWatchError(message: string | null): void {
+    watchError.value = message;
+  }
+
+  /**
    * Mirrors the root list Rust returned.
    *
    * @param list - The roots, as Rust spells them.
@@ -398,6 +422,7 @@ export const useReposStore = defineStore('repos', () => {
     detailErrors,
     openErrors,
     scanError,
+    watchError,
     roots,
     rows,
     count,
@@ -420,6 +445,7 @@ export const useReposStore = defineStore('repos', () => {
     SetDetailError,
     SetOpenError,
     SetScanError,
+    SetWatchError,
     SetRoots,
   };
 });

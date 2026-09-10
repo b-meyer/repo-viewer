@@ -92,6 +92,52 @@ fn stops_at_the_first_git_by_default() {
     assert_eq!(summary.repos_found, 4);
 }
 
+/// `common_dir` differs from `git_dir` for exactly one kind, and the difference is the whole reason
+/// the field exists: a linked worktree's `refs/` and `FETCH_HEAD` belong to the repository it was
+/// linked from, so a watch set built from `git_dir` alone would never see a remote-tracking update
+/// for it.
+///
+/// The submodule is the case worth pinning beside it. Its `.git` is a file too, and it has no
+/// `commondir` — that absence is precisely what told `is_git` it was a submodule rather than a
+/// worktree — so it must fall through to `git_dir` and not be treated as sharing anything.
+#[test]
+fn only_a_linked_worktree_has_a_common_dir_of_its_own() {
+    let fixture = fixtures::build();
+    let opts = ScanOpts {
+        descend_into_repos: true,
+        ..ScanOpts::default()
+    };
+
+    let (repos, _) = discover_roots(
+        &[fixture.root().to_path_buf()],
+        &opts,
+        &AtomicBool::new(false),
+    );
+
+    let worktree = row(&repos, &fixture.path("wt"));
+    assert_ne!(
+        worktree.common_dir, worktree.git_dir,
+        "a linked worktree's private git dir is not where its refs live"
+    );
+    assert_eq!(
+        worktree.common_dir,
+        fixture.path("plain/.git"),
+        "and they live in the repository it was linked from"
+    );
+
+    for (label, path) in [
+        ("a normal repository", fixture.path("plain")),
+        ("a submodule", fixture.path("parent/sub")),
+        ("a bare repository", fixture.path("mirror.git")),
+    ] {
+        let repo = row(&repos, &path);
+        assert_eq!(
+            repo.common_dir, repo.git_dir,
+            "{label} shares nothing, so its common dir is its git dir"
+        );
+    }
+}
+
 /// A submodule is still classified as one when the walk reaches it — here by making it the root.
 /// Filling `RepoStatus.submodules` from the parent's config is a Tier 0 concern, not this one.
 #[test]

@@ -16,9 +16,11 @@ Status: **the app is useful.** Point it at a folder and it streams every reposit
 a table — rows appear as the walk finds them, then fill in tier by tier: branch, upstream,
 ahead/behind, stash count, in-progress state, tip commit and last-fetched age from refs alone, then
 the dirty flag and conflicted count from the worktree. Expanding a row reads its full per-file
-counts and submodule list on demand, and keeps them when it is collapsed again. Scans are
-cancellable and roots are managed in-app. The engine also still works without a GUI, through the
-`scan` example. Each phase gets its own runbook in `docs/` while it is being worked on.
+counts and submodule list on demand, and keeps them when it is collapsed again. Rows then keep
+themselves current: a commit or a fetch in another window updates its row without a rescan, with a
+one-minute poll and a refresh-on-focus underneath in case the filesystem watcher misses something.
+Scans are cancellable and roots are managed in-app. The engine also still works without a GUI,
+through the `scan` example. Each phase gets its own runbook in `docs/` while it is being worked on.
 
 ---
 
@@ -37,12 +39,12 @@ flowchart TB
     subgraph L2["2 &nbsp;IPC bridge &mdash; @tauri-apps/api 2.11.1"]
         L2A["invoke &mdash; commands down"]
         L2B["Channel&lt;ScanEvent&gt; &mdash; one per scan, ordered and batched, tagged with ScanId"]
-        L2C["Channel&lt;RepoEvent&gt; &mdash; one per session: watcher, poll, fetch pushes<br/>no emit / listen"]
+        L2C["Channel&lt;RepoEvent&gt; &mdash; one per session: watcher, poll, fetch pushes, watch failures<br/>no emit / listen"]
     end
 
     subgraph L3["3 &nbsp;Tauri core &mdash; tauri 2.11.5"]
         L3A["invoke_handler command registry<br/>own commands need no capability declaration; capabilities = core:default"]
-        L3B["canonical state: HashMap&lt;PathBuf, RepoStatus&gt;<br/>tiers merged here, full rows pushed<br/>plus what discovery found, for the resolved git dir"]
+        L3B["canonical state: HashMap&lt;PathBuf, RepoStatus&gt;<br/>tiers merged here, full rows pushed<br/>plus what discovery found, for the resolved git and common dirs"]
     end
 
     subgraph L4["4 &nbsp;Discovery &mdash; ignore 0.4.33"]
@@ -57,14 +59,14 @@ flowchart TB
     end
 
     subgraph L6["6 &nbsp;Watching &mdash; notify 8.2.0"]
-        L6A["ONE watcher over N git dirs<br/>git-dir root non-recursive &middot; refs/ recursive &middot; logs/HEAD<br/>notify-debouncer-full 0.7.0, 300-500 ms<br/>refresh runs in Rust; 60 s poll and focus-refresh as the safety net"]
+        L6A["ONE watcher over N git dirs &mdash; 3 paths per repo, never the working tree<br/>git-dir root non-recursive &middot; refs/ recursive &middot; logs/HEAD &middot; the common dir too, for a worktree<br/>notify-debouncer-full 0.7.0, 300-500 ms, plus a per-repo cooldown<br/>refresh runs in Rust at Tier 0+1; 60 s poll and focus-refresh are Tier 0 only"]
     end
 
     subgraph L7["7 &nbsp;Side channels &mdash; subprocess and OS, all driven from Rust"]
         L7A["git CLI subprocess<br/>fetch / pull / push ONLY<br/>real credential helpers, SSH config, proxies<br/>CREATE_NO_WINDOW, GIT_TERMINAL_PROMPT=0, timeout"]
         L7B["tauri-plugin-opener 2.5.5<br/>reveal in the file manager &mdash; the shell's own API<br/>path must be one discovery found"]
         L7C["configured editor / terminal, spawned<br/>command from settings.json, PATH resolved as a shell would<br/>CREATE_NO_WINDOW for the editor and NOT for the terminal<br/>path must be one discovery found"]
-        L7D["tauri-plugin-store 2.4.4<br/>settings.json &mdash; roots, open-in commands, view state<br/>cache.json &mdash; both row maps, so a launch paints at once"]
+        L7D["tauri-plugin-store 2.4.4<br/>settings.json &mdash; roots, open-in commands, live-update settings, view state<br/>cache.json &mdash; both row maps, so a launch paints at once"]
     end
 
     OUT["Rows paint progressively, tier by tier, back up through Channel to the repo table.<br/>Tiers not yet computed render as unknown &mdash; never as 0."]
@@ -76,7 +78,7 @@ flowchart TB
     L3 --> L7
     L4A --> L4B
     L4 -->|"repo paths"| L5
-    L4 -->|"register git dirs"| L6
+    L4 -->|"the watch set, synced after a completed scan"| L6
     L5A --> L5B
     L5B --> L5C
     L5 -.-> OUT
@@ -145,19 +147,19 @@ runner. Never call `pnpm` / `npm` / `yarn` scripts directly; see [AGENTS.md](./A
 The first `vp install` may report dependency build scripts that pnpm has blocked. Add what it names
 to `allowBuilds:` in `pnpm-workspace.yaml`.
 
-| Task                                  | Command                                                           |
-| ------------------------------------- | ----------------------------------------------------------------- |
-| Dev (Vite + Tauri window, hot reload) | `vp run dev`                                                      |
-| Frontend only, in a browser           | `vp dev`                                                          |
-| Format, lint, `.ts` types             | `vp check`                                                        |
-| Fix what is auto-fixable              | `vp check --fix`                                                  |
-| Vue SFC + config type-check           | `vp run typecheck`                                                |
-| Unit tests                            | `vp test run`                                                     |
-| Production build + installer          | `vp run build`, then `vp run verify`                              |
-| Regenerate the TypeScript types       | `vp run types`                                                    |
-| Rust checks                           | `vp run rust`                                                     |
-| Scan a tree without the GUI           | `cargo run --release --example scan -- C:/Working --rows --tier2` |
-| Generate a tree to time against       | `cargo run --release --example synth -- <dir> 120 200`            |
+| Task                                  | Command                                                                   |
+| ------------------------------------- | ------------------------------------------------------------------------- |
+| Dev (Vite + Tauri window, hot reload) | `vp run dev`                                                              |
+| Frontend only, in a browser           | `vp dev`                                                                  |
+| Format, lint, `.ts` types             | `vp check`                                                                |
+| Fix what is auto-fixable              | `vp check --fix`                                                          |
+| Vue SFC + config type-check           | `vp run typecheck`                                                        |
+| Unit tests                            | `vp test run`                                                             |
+| Production build + installer          | `vp run build`, then `vp run verify`                                      |
+| Regenerate the TypeScript types       | `vp run types`                                                            |
+| Rust checks                           | `vp run rust`                                                             |
+| Scan a tree without the GUI           | `cargo run --release --example scan -- C:/Working --rows --tier2 --watch` |
+| Generate a tree to time against       | `cargo run --release --example synth -- <dir> 120 200`                    |
 
 ---
 
@@ -165,11 +167,11 @@ to `allowBuilds:` in `pnpm-workspace.yaml`.
 
 The app keeps three files under its identifier, `net.citsolutions.repoviewer`:
 
-| File                 | What it holds                                                   |
-| -------------------- | --------------------------------------------------------------- |
-| `settings.json`      | the folders being watched, the open-in commands, the view state |
-| `cache.json`         | the last scan's rows, so a launch paints before it rescans      |
-| `.window-state.json` | window position and size, written by the window-state plugin    |
+| File                 | What it holds                                                                        |
+| -------------------- | ------------------------------------------------------------------------------------ |
+| `settings.json`      | the folders it scans, the open-in commands, the live-update settings, the view state |
+| `cache.json`         | the last scan's rows, so a launch paints before it rescans                           |
+| `.window-state.json` | window position and size, written by the window-state plugin                         |
 
 On Windows that directory is `%APPDATA%\net.citsolutions.repoviewer`, and on macOS
 `~/Library/Application Support/net.citsolutions.repoviewer`. On Linux the first two are under
@@ -202,6 +204,30 @@ saying which file to edit.
 A cached row is shown with the age of the read that produced it — that is what makes it honest — and
 the file counts in a row's drawer are deliberately **not** cached, because they are shown with no age
 beside them.
+
+**Live updates are edited by hand too**, and their defaults are written on a first run the same way:
+
+```json
+{
+  "watch": { "enabled": true, "debounceMs": 400, "pollSeconds": 60 }
+}
+```
+
+A row refreshes itself when its repository changes, so a commit made in another window shows up
+without a rescan. `debounceMs` is how long a burst of filesystem writes is collapsed for — git writes
+`.git/index` three times per operation, so this is what turns one `git add` into one refresh.
+`pollSeconds` is the safety net underneath it: filesystem watching is documented by its own authors
+as not completely reliable, so a refs-only pass runs on that interval regardless, and again whenever
+the window regains focus.
+
+Turning `enabled` off leaves the poll running — the right setting for a network share or a container
+where watching misbehaves, since it drops to slower updates rather than to none. Unlike the open-in
+commands, **these three take effect on the next launch**: the watcher and the poll are started once.
+
+Only the repository's Git directory is watched, never the working tree — watching working trees means
+watching `node_modules`. So an edit shows up when you stage it, and until then the poll is what
+notices. If watching cannot start at all, the window says so and says that rows now update on the
+timer instead.
 
 ---
 
@@ -247,9 +273,9 @@ repo-viewer/
 │       │   ├── error.rs
 │       │   ├── discover/         # parallel walk, prune, .git → DiscoveredRepo
 │       │   ├── status/           # tier0.rs, tier1.rs, tier2.rs, ahead_behind.rs
-│       │   ├── watch/            # ← Phase 6: one debounced watcher
+│       │   ├── watch/            # one debounced watcher: the watch set, the reverse index
 │       │   └── fetch.rs          # ← Phase 7: git CLI subprocess
-│       └── tests/                # discover.rs, tier0.rs + support/fixtures.rs, built into TempDirs
+│       └── tests/                # discover.rs, tier0.rs, watch.rs + support/fixtures.rs, built into TempDirs
 │
 └── src-tauri/                    # ── THIN shell. Tauri glue only.
     ├── build.rs
@@ -262,6 +288,7 @@ repo-viewer/
         ├── state.rs              # canonical HashMap<PathBuf, RepoStatus>, tier merge
         ├── stream.rs             # batching for tauri::ipc::Channel sends
         ├── pipeline.rs           # the scan driver: discovery → batch → Tier 0 → merge
+        ├── live.rs               # the watcher drain, the poll, the focus refresh
         ├── persist.rs            # settings.json + cache.json — the only consumer of the store plugin
         ├── error.rs              # CommandError: anyhow across the IPC boundary
         └── commands/            # session, scan, roots, repo, open, settings  (+ fetch — Phase 7)

@@ -243,6 +243,25 @@ pub fn run_scan(
         tier1_ms,
     });
 
+    // **After the terminal event**, for the same reason the cache write is: registration costs
+    // ~6.5 ms per repository, which is two seconds on a tree of three hundred, and a user waiting
+    // for "done" must not be waiting for bookkeeping. It is after eviction too, so a repository
+    // that is gone has already left the map this reads — and the cancelled path above returns
+    // before reaching here, because a walk that has not seen the whole tree cannot say what the
+    // watch set should be, which is the argument eviction itself rests on.
+    let unwatched = state.sync_watches();
+    if !unwatched.is_empty() {
+        let message = format!(
+            "{} of {} repositories could not be watched, so their rows update on the poll rather \
+             than immediately. {}",
+            unwatched.len(),
+            seen.len(),
+            unwatched[0].message,
+        );
+        tracing::warn!(count = unwatched.len(), "some repositories are not watched");
+        state.push(RepoEvent::WatchFailed { message });
+    }
+
     on_done(&state);
 }
 

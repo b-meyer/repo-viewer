@@ -24,6 +24,10 @@ export function MakeDiscovered(overrides: Partial<DiscoveredRepo> = {}): Discove
     parent: 'C:/work',
     kind: 'normal',
     gitDir: 'C:/work/alpha/.git',
+    // Equal to `gitDir` for everything but a linked worktree. The frontend reads neither — Rust
+    // owns every path decision — so this is here to satisfy the generated type, which is exactly
+    // the reminder that the field belongs to the watcher and not to the table.
+    commonDir: 'C:/work/alpha/.git',
     ...overrides,
   };
 }

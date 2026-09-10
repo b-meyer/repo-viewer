@@ -409,6 +409,7 @@ fn a_repository_that_cannot_be_opened_produces_no_row() {
         parent: tree.root().to_path_buf(),
         kind: RepoKind::Normal,
         git_dir: tree.path("notrepo/.git"),
+        common_dir: tree.path("notrepo/.git"),
     };
 
     let failure = read_tier0(&bogus).expect_err("a non-repository cannot produce a row");

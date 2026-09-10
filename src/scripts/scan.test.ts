@@ -11,13 +11,25 @@ import {
 import { ClearIndex, indexVersion, searchPaths } from '@/scripts/search';
 import { useReposStore } from '@/stores/repos';
 import { MakeChannelDriver, ReadNumber } from '@/tests/channel';
-import { MakeDiscovered, MakeStatus, MakeTotals } from '@/tests/fixtures';
+import { MakeCounts, MakeDiscovered, MakeStatus, MakeTotals } from '@/tests/fixtures';
 
 /**
  * A `reposFound` batch for one path.
  */
 function found(scanId: number, path: string) {
   return { kind: 'reposFound', scanId, repos: [MakeDiscovered({ path, name: path })] };
+}
+
+/**
+ * Lets the microtask queue drain.
+ *
+ * The session handler is synchronous but the Tier 2 re-read it triggers is not — it is started and
+ * deliberately not awaited, because a channel callback must not block on a command. So a test
+ * asserting the read happened has to give the promise a turn.
+ */
+async function Settle(): Promise<void> {
+  await Promise.resolve();
+  await Promise.resolve();
 }
 
 describe('scan session', () => {
@@ -365,6 +377,95 @@ describe('scan session', () => {
       drive.Send(channelId, { kind: 'removed', paths: ['C:/work/alpha'] });
 
       expect(searchPaths('alpha', indexVersion.value)).toEqual(new Set());
+    });
+
+    /**
+     * Watching is an optimisation, so its failure is a message and not a broken app: the poll and
+     * the refresh-on-focus still run behind it.
+     */
+    it('records why live updates are degraded', async () => {
+      const drive = MakeChannelDriver();
+      let channelId = 0;
+      mockIPC((cmd, args) => {
+        if (cmd !== 'subscribe') return null;
+        channelId = drive.Capture(args);
+        return [];
+      });
+
+      await StartSession();
+      drive.Send(channelId, {
+        kind: 'watchFailed',
+        message: 'OS file watch limit reached.',
+      });
+
+      const repos = useReposStore();
+      expect(repos.watchError).toBe('OS file watch limit reached.');
+      expect(repos.scanError).toBeNull();
+      expect(repos.phase).toBe('idle');
+    });
+
+    /**
+     * The transience obligation, at the seam where it is actually owed. A watcher refresh drops
+     * Tier 2 for a repository that changed, so a row arrives with `counts` back to `null` — and if
+     * nothing re-read it, the open drawer would say `counting…` for the rest of the session.
+     */
+    it('re-reads Tier 2 for an expanded row whose counts were invalidated', async () => {
+      const drive = MakeChannelDriver();
+      let channelId = 0;
+      let fullStatusCalls = 0;
+      mockIPC((cmd, args) => {
+        if (cmd === 'subscribe') {
+          channelId = drive.Capture(args);
+          return [MakeStatus({ path: 'C:/work/a', counts: MakeCounts() })];
+        }
+        if (cmd === 'full_status') {
+          fullStatusCalls += 1;
+          return MakeStatus({ path: 'C:/work/a', counts: MakeCounts() });
+        }
+        return null;
+      });
+
+      await StartSession();
+      const repos = useReposStore();
+      repos.ToggleExpanded('C:/work/a');
+
+      drive.Send(channelId, {
+        kind: 'updated',
+        repos: [MakeStatus({ path: 'C:/work/a', counts: null })],
+      });
+      await Settle();
+
+      expect(fullStatusCalls).toBe(1);
+    });
+
+    /**
+     * And it costs nothing when there is nothing to do. A collapsed row is not on screen, so
+     * re-reading it would spend the expensive tier on a drawer nobody has open.
+     */
+    it('does not re-read Tier 2 for a collapsed row', async () => {
+      const drive = MakeChannelDriver();
+      let channelId = 0;
+      let fullStatusCalls = 0;
+      mockIPC((cmd, args) => {
+        if (cmd === 'subscribe') {
+          channelId = drive.Capture(args);
+          return [MakeStatus({ path: 'C:/work/a', counts: MakeCounts() })];
+        }
+        if (cmd === 'full_status') {
+          fullStatusCalls += 1;
+          return MakeStatus({ path: 'C:/work/a' });
+        }
+        return null;
+      });
+
+      await StartSession();
+      drive.Send(channelId, {
+        kind: 'updated',
+        repos: [MakeStatus({ path: 'C:/work/a', counts: null })],
+      });
+      await Settle();
+
+      expect(fullStatusCalls).toBe(0);
     });
 
     it('subscribes only once, so HMR remounts do not stack channels', async () => {

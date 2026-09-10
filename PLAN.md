@@ -69,8 +69,8 @@ Rust (crates/ + src-tauri/) ..... all system work
   - `git` CLI subprocess for fetch/pull/push, and the configured editor/terminal for `open_in`
   - path normalization, editor/terminal/file-manager launch
   - plugin calls (dialog, opener, store) — the frontend never imports a plugin package
-  - settings and cache persistence: the roots, the `open_in` commands, the view state, and a
-    snapshot of both row maps, all through `persist.rs` (§6.3)
+  - settings and cache persistence: the roots, the `open_in` commands, the `watch` settings, the
+    view state, and a snapshot of both row maps, all through `persist.rs` (§6.3)
 ```
 
 The boundary is structural, not aspirational: `src/` cannot import the engine, because one is
@@ -119,7 +119,7 @@ Two views live outside this document so they sit where they are used:
 | `serde` / `serde_json`           | 1.0.229 / 1.0.151 | IPC payloads                                                               |
 | `thiserror`                      | 2.0.20            | engine errors                                                              |
 | `anyhow`                         | 1.0.104           | `src-tauri` layer only                                                     |
-| `tracing` / `tracing-subscriber` | 0.1.44 / 0.3.23   | structured diagnostics — declared, not yet instrumented                    |
+| `tracing` / `tracing-subscriber` | 0.1.44 / 0.3.23   | structured diagnostics — the subscriber is installed by `run()`            |
 | `ts-rs`                          | 12.0.1            | TypeScript type generation (§4.2)                                          |
 | `dunce`                          | 1.0.5             | strips the `\\?\` prefix `canonicalize()` returns on Windows (§5.2)        |
 | `tempfile`                       | 3.27.0            | dev-only, test fixtures                                                    |
@@ -452,16 +452,23 @@ An unspecified `threads` means **half** the core count, not all of it: from Tier
 walk and the rayon pool run at the same time, so taking both defaults would put twice as many
 threads on the machine as it has cores.
 
-Discovery yields `DiscoveredRepo` — path, name, parent, kind, and the resolved Git directory —
-rather than a partial `RepoStatus`. The §8.1 Tier 0 fields are not `Option`, because a row that
+Discovery yields `DiscoveredRepo` — path, name, parent, kind, and the resolved Git and common
+directories — rather than a partial `RepoStatus`. The §8.1 Tier 0 fields are not `Option`, because a row that
 has been read always has them, and discovery has read nothing; a "partial" row would have to lie.
 This is what the `ReposFound` event carries, and Tier 0 turns it into a `RepoStatus`. `ScanOpts` and
 `ScanSummary` cross the same boundary and live in `model.rs` beside it.
 
 The Git directory is resolved once, here: `<path>/.git` for a normal repo, `<path>` itself when
-bare, and the private directory the `.git` _file_ names for a worktree or submodule. Later phases
-consume it rather than re-resolving — Tier 0 opens it, and §7.2's watch set is registered against
-it.
+bare, and the private directory the `.git` _file_ names for a worktree or submodule. Everything
+downstream consumes it rather than re-resolving — Tier 0 opens it, and §7.2's watch set is
+registered against it.
+
+The **common** directory is resolved here too, and for the same reason. It is where `refs/`,
+`logs/` and `FETCH_HEAD` actually live, which for a linked worktree is not `git_dir` — so the watch
+set spans both, and Tier 0's fetch age has to read `Repository::common_dir()` rather than
+`git_dir()`. Read through `gix::discover::path::from_plain_file_relative_to_file` against the
+`commondir` file, which is the function `is_git` itself uses; every other kind has no such file and
+so falls through to `git_dir`, which for a submodule is exactly the absence that identified it.
 
 ### 5.2 Cases that must be handled
 
@@ -616,6 +623,20 @@ every `Option` would report a deleted upstream as live for the rest of the sessi
 `conflicted`, `counts`, `submodules` — mean "not computed yet" when `None`, and only those survive
 a merge from another tier.
 
+**There is one deliberate exception, and it is a separate operation rather than a softening of the
+rule.** A watcher refresh re-reads Tiers 0 and 1, which by tier ownership leaves `counts` and
+`submodules` exactly as they were — so a repository that just changed would show a pre-change count
+beside a post-change branch, and the drawer shows those counts with **no age beside them**, so the
+pair reads as one freshly measured moment. `AppState::invalidate_tier2` nulls them first, which is
+the same carve-out the cache load path already makes and for the same reason. It is called by the
+watcher only: a poll tick has no evidence anything changed, and `refresh_repo` was asked for the
+tiers it named.
+
+That obliges the frontend, because "counting…" must be transient (§8.1) and Rust cannot discharge
+the obligation — which rows are expanded is window state Rust neither knows nor should.
+`src/scripts/detail.ts` re-reads Tier 2 for an expanded row whose counts have gone, which is the
+same guard chain an expand already uses.
+
 ### 6.4 Cancellation
 
 Every scan gets an `Arc<AtomicBool>`. Discovery checks it and returns `WalkState::Quit`; `gix`
@@ -624,18 +645,41 @@ status calls take it via `should_interrupt`; the rayon fan-out checks it between
 and window close flips all of them. The scan body runs on `tauri::async_runtime::spawn_blocking`
 so the Tauri runtime's threads are never occupied by a walk.
 
+**A per-repository read is not cancellable, and that is a known gap rather than an oversight.**
+`full_status`, `refresh_repo`, a watcher refresh and a poll pass each make a private flag that
+nothing ever flips, so collapsing a drawer part-way through a large repository does not stop the
+read — the flag is there because `gix` requires one. Fixing it means a registry keyed by
+repository, and the flags handed out of it must stay **private** per walk for the
+`should_interrupt_owned` reason in [AGENTS.md](./AGENTS.md). What bounds the damage today is that
+these reads are single-repository and short; the whole-tree work is the part that can be cancelled.
+
+Window close is the exception that is handled: it flips every scan flag and drops the watcher, which
+stops the debouncer's thread and — by dropping the sender its callback holds — ends the refresh
+thread too, while the runtime is still up.
+
 ---
 
 ## 7. Live updates
 
 ### 7.1 One watcher, many paths
 
-`notify` spawns a thread per `Watcher` object, so 300 watchers means 300 threads. Create **one**
-`recommended_watcher()` and call `watch()` once per repo.
+`notify` spawns a thread per `Watcher` object, so 300 watchers means 300 threads. There is **one**,
+created by `notify_debouncer_full::new_debouncer` — which owns a `RecommendedWatcher` underneath,
+so reaching for `recommended_watcher()` directly would mean either a second watcher or an
+undebounced one. `RepoWatcher::sync` then calls `watch()` once per **path**, and a repository
+contributes three of them (§7.2), so the count that matters against a platform's limit is paths and
+not repositories: **903 paths for 301 repositories**, measured.
+
+`Debouncer`'s `Drop` stops its thread, so the handle lives on `AppState` for the session. A watcher
+owned by the function that built it stops watching the moment that function returns, and nothing
+fails when it does.
 
 ### 7.2 What to watch
 
-Three watches per repo, all inside the git dir:
+Three watches per repo, all inside the git dir — five for a linked worktree, and fewer for a
+repository with no commits. The set is built by `crates/repo-scan/src/watch/set.rs` and **filtered
+by existence**, because `notify`'s `watch()` fails with `PathNotFound` and `git init` does not write
+`logs/` until the first ref update.
 
 - the git dir root, **non-recursive** — catches `HEAD`, `index`, `packed-refs`, `FETCH_HEAD`,
   `ORIG_HEAD`, `MERGE_HEAD`, and the `index.lock` bursts (§7.3)
@@ -647,7 +691,15 @@ Three watches per repo, all inside the git dir:
 
 A linked worktree has a private git dir (`.git/worktrees/<name>/`, its own `HEAD` and `index`)
 and a shared common dir (refs, objects); both are watched, resolved through `gitdir:` and
-`commondir`.
+`commondir` — which discovery already did, onto `DiscoveredRepo.common_dir`. **Both `refs/` trees
+are watched, not just the common one**: the per-worktree refs (`refs/bisect/*`, `refs/worktree/*`)
+live in the private directory, so a bisect running in that worktree is visible nowhere else.
+
+The common dir is shared with the repository the worktree was linked from, so one watched path can
+belong to two rows. `watch/mod.rs`'s reverse index maps a path to **every** repository that asked
+for it — both are reported for a write there, because they share remotes and a remote-tracking
+update moves both their ahead/behind counts — and that list is also the reference count, so a
+worktree going away cannot release the refs its parent is still watching.
 
 The worktree itself is never watched: recursively watching worktrees means watching
 `node_modules`, which is how tools burn CPU and blow past inotify limits. Worktree edits are
@@ -657,30 +709,56 @@ picked up by the poll, by refresh-on-focus, or by the `index` change that follow
 
 Git does not write `.git/index` once; it writes `index.lock`, writes, then renames, so a single
 `git add` produces a create/modify/remove burst. `notify-debouncer-full` with a ~300–500 ms
-window plus a per-repo refresh cooldown is required to avoid a refresh storm. Never let a watcher
-callback block: if it stalls, OS events pile up in the kernel buffer and are silently dropped on
-overflow.
+window plus a per-repo refresh cooldown is required to avoid a refresh storm, and the two are not
+the same guard: the debouncer collapses one operation's burst, while `live.rs`'s `COOLDOWN`
+collapses separate operations — `add`, then `commit`, then `push` — arriving a second apart.
+
+Never let a watcher callback block: if it stalls, OS events pile up in the kernel buffer and are
+silently dropped on overflow. Everything the callback in `live::start` does is one `mpsc` send; the
+work belongs to the thread draining it, which batches through the same `stream::next_batch` the
+scan pipeline uses.
 
 ### 7.4 Watching is an optimization, never the source of truth
 
 - **Linux:** inotify has a per-user watch limit; exceeding it surfaces as "No space left on
-  device". Detect that specific error and surface actionable guidance
-  (`sysctl fs.inotify.max_user_watches=524288`) rather than failing opaquely.
+  device". `watch/mod.rs` matches `notify::ErrorKind::MaxFilesWatch` — the kind, never the message,
+  which is what the backend maps `ENOSPC` onto — appends
+  `sysctl fs.inotify.max_user_watches=524288`, and sends it as `RepoEvent::WatchFailed` so it
+  reaches the window rather than only the log.
 - **macOS:** FSEvents cannot observe files the process does not own; Docker on Apple Silicon
   returns `os error 38`.
 - **All platforms:** `notify`'s own docs warn it "may fail to receive all events" at high file
   counts, and that backends are "not a 100% reliable source".
 
-So always ship a low-frequency poll (Tier 0 every ~60 s, configurable) and a refresh-on-focus,
-with `PollWatcher` available as a manual fallback for network mounts and containers.
+So always ship a low-frequency poll (Tier 0 every ~60 s, configurable) and a refresh-on-focus. Both
+run on one thread parked on `recv_timeout`: the timeout is the poll and a message is the focus
+refresh, which is what makes §7.5's "the poll and the focus handler take the same path" true of the
+code rather than only of the design.
+
+**`PollWatcher` is not the escape hatch for a network mount or a container; `watch.enabled: false`
+is.** Swapping the backend would keep the watcher's shape while making it walk the tree itself,
+which is the poll again with a worse interface — where turning the watcher off leaves the Tier 0
+poll already there and running. The setting exists for exactly that case and drops to slower
+updates rather than to none.
+
+The poll claims **Tier 0 and nothing else**, which is tier ownership applied to triggers: it has
+evidence that time passed, not that anything changed. The watcher has the latter, so it re-reads
+Tier 1 as well and drops Tier 2 — see §6.3.
 
 ### 7.5 Refresh happens in Rust
 
-A debounced event never crosses the IPC boundary as a "something changed" notice. The watcher
-task re-runs Tier 0 and Tier 1 for that repo, merges the result into the canonical map (§6.3),
-and pushes the merged row on the session channel. The poll and the focus handler
-(`WindowEvent::Focused(true)`) take the same path. The frontend has nothing to do but render
-what arrives.
+A debounced event never crosses the IPC boundary as a "something changed" notice. The watcher's
+refresh thread re-runs Tier 0 and Tier 1 for that repo through `live::refresh_one`, merges each
+tier into the canonical map (§6.3), and pushes the merged row on the session channel. The frontend
+has nothing to do but render what arrives.
+
+`refresh_one` has exactly two callers — that thread and the `refresh_repo` command — so a
+user-requested refresh and a watcher-driven one cannot disagree about what a refresh is. The
+**poll** is the third trigger and deliberately does not use it: a whole-tree pass wants
+`read_tier0_all_with`'s rayon fan-out rather than three hundred sequential opens. What all three
+share is that Rust owns the read and the merge, and that a full row is what goes out — not one
+function. The focus handler (`WindowEvent::Focused(true)`) is not a fourth: it sends a tick to the
+poll's own thread, so it _is_ the poll, run early.
 
 ---
 
@@ -966,9 +1044,9 @@ the built bundle's `import.meta.env.PROD` flag (§3.3).
 ## 11. Roadmap
 
 Each phase gets a runbook in `docs/` when it starts, written against the tree as it exists then,
-and is deleted when the phase completes — durable facts move into README.md and AGENTS.md, which is
-why `docs/` is empty or absent whenever no phase is open.
-No phase is currently open; Phase 6 gets the next one.
+and is deleted when the phase completes — durable facts move into README.md, AGENTS.md, and the
+phase's own entry below, which is why `docs/` is empty or absent whenever no phase is open.
+No phase is currently open; Phase 7 gets the next one.
 
 **Phase 0 — Environment and structure.** The Cargo workspace with its root `[profile.release]`
 (§4.1), `pnpm-workspace.yaml` with the catalog and the `vite`→core override, `vite.config.ts`
@@ -1182,7 +1260,76 @@ its bands already existed for the fetch-age column, so the chip and the badge ca
 `tauri-plugin-window-state` needed no code at all beyond the registration it already had.
 
 **Phase 6 — Watching.** Single debounced watcher over the §7.2 watch set, Rust-side refresh
-(§7.5), poll fallback, focus refresh, inotify-limit error handling.
+(§7.5), poll fallback, focus refresh, inotify-limit error handling. **The point at which a row stops
+being as old as the last scan.**
+
+_Verified:_ 130 Rust tests (11 discovery, 20 Tier 0, 12 Tier 1, 14 Tier 2, 9 watch, 64 in
+`src-tauri`) and 203 frontend tests across 26 files, with `vp check`, `vp run typecheck`,
+`vp run build` and `vp run verify` clean. `vp run types` touches two of the generated files —
+`DiscoveredRepo` gains `commonDir`, `RepoEvent` gains `watchFailed` — and regenerating a second
+time changes nothing, which is the property CI's diff check depends on.
+
+Nine watch tests split in two halves deliberately. The `watch_set` half is pure assertions over the
+`git`-built fixture tree: the set per repository kind, `refs/` recursion asserted per entry rather
+than only membership, a linked worktree's two directories, and a repository with no commits
+contributing no `logs/HEAD`. The `RepoWatcher` half drives a real OS backend and waits for a
+callback, because a debounce window has to elapse before anything can arrive — a write under
+`plain/.git/refs/` is reported as `plain`, the same write is reported for the linked worktree
+watching that directory as its common one, a released repository stops being reported, and a
+repository sharing a path with one that just left keeps reporting.
+
+**Driven end to end against the real app**, because none of the above proves the phase works. Over
+a seeded three-repository root: the launch reconcile registered 9 paths over 3 repositories; a
+`git commit` in one produced exactly **one** push, with the new tip commit landing in the canonical
+map; a worktree edit with no `git add` produced **no** event at all and the `git add` that followed
+produced one, which is §7.2's rule confirmed rather than assumed; the 20-second poll ran on
+schedule; deleting a repository and relaunching evicted its row and released its three watches
+(9 paths to 6); and closing the window unwound the poll thread, the watcher and the refresh thread
+in that order before the exit cache write. With `enabled: false` the watcher never starts and the
+poll alone still picked up a commit made while it was off.
+
+Watch registration timings, from `cargo run --release --example scan -- <path> --watch`:
+
+| Tree                           | Repos | Paths | Register | Per repo |
+| ------------------------------ | ----- | ----- | -------- | -------- |
+| `C:/Working/Source`            | 52    | 156   | 287 ms   | 5.5 ms   |
+| `examples/synth.rs`, 300 repos | 301   | 903   | 1956 ms  | 6.5 ms   |
+
+Exactly **3.00 paths per repository** on both, since neither tree has a linked worktree or an
+uncommitted repository. Engine timings are otherwise unchanged: nothing in the tiered path was
+touched.
+
+_Settled by writing it:_ four things.
+
+**Registration is slow enough to belong after the terminal event.** At 6.5 ms per repository a
+300-repository tree spends two seconds registering, and the first draft synced the watch set before
+emitting `ScanEvent::Finished` — which would have made a user wait those two seconds to be told the
+scan had finished. It moved to after the event, beside the row cache, for exactly the reason the
+cache is there.
+
+**The poll owns Tier 0 and nothing else, which is tier ownership applied to triggers.** A watcher
+event is evidence that something changed, so it re-reads Tiers 0 and 1 and invalidates Tier 2. A
+poll tick is evidence only that time passed — so nulling `counts` on it would put a `counting…`
+flicker into an untouched drawer once a minute, and leaving `dirty` alone while clearing `counts`
+would be incoherent anyway. The exception is the watcher's alone, and `refresh_repo` keeps neither:
+it was asked for the tiers it named.
+
+**Invalidating Tier 2 obliges the frontend, and Rust cannot discharge it.** `counting…` is a claim
+that work is in progress, so a row whose counts were just dropped has to be re-read — but which
+rows are expanded is window state that Rust neither knows nor should. `src/scripts/detail.ts`'s
+`EnsureDetail` is the discharge, called for every expanded row in a session update, and it is the
+existing expand-guard chain lifted out rather than a second copy of it.
+
+**A linked worktree's private directory has its own `refs/`, and watching it is correct.** The
+first draft asserted it did not exist and the test failed: per-worktree refs — `refs/bisect/*` and
+`refs/worktree/*` — live there rather than in the common directory, so a bisect in that worktree is
+visible nowhere else. Both `refs/` trees are watched, which is why the path count is five for a
+linked worktree and three for everything else.
+
+Also settled, and cheaper than expected: the reverse index needed to map a watched path to
+**several** repositories rather than one — a worktree and its parent share a common directory — and
+making it a list gave the reference counting for free, so a worktree going away cannot release the
+refs its parent is still watching.
 
 **Phase 7 — Fetch.** Opt-in `git fetch` via CLI with the §8.2 subprocess hygiene, rate-limited,
 with visible last-fetched state and a clear failure surface for auth problems.

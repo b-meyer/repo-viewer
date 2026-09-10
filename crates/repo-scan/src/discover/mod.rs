@@ -175,6 +175,7 @@ where
                 path,
                 kind: found.kind,
                 git_dir: canonical(&found.git_dir),
+                common_dir: canonical(&found.common_dir),
             });
 
             // A bare repository is itself a Git directory, so everything under it is object

@@ -3,6 +3,7 @@
 //!     cargo run --release --example scan -- C:/Working
 //!     cargo run --release --example scan -- C:/Working --rows
 //!     cargo run --release --example scan -- C:/Working --tier2
+//!     cargo run --release --example scan -- C:/Working --watch
 //!
 //! This exists to produce the timing number the whole design defends, to debug one repository
 //! without a webview in the way, and to check behaviour in a CI container. Cargo compiles
@@ -18,7 +19,7 @@ use std::{
     path::PathBuf,
     process::ExitCode,
     sync::atomic::AtomicBool,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use repo_scan::{
@@ -29,7 +30,7 @@ use repo_scan::{
 fn main() -> ExitCode {
     let mut args = env::args_os().skip(1);
     let Some(root) = args.next().map(PathBuf::from) else {
-        eprintln!("usage: scan <path> [--rows] [--tier2]");
+        eprintln!("usage: scan <path> [--rows] [--tier2] [--watch]");
         return ExitCode::FAILURE;
     };
     let flags: Vec<_> = args.collect();
@@ -38,6 +39,7 @@ fn main() -> ExitCode {
     // whole design keeps off the scan path, so an example that ran it over a tree by default would
     // be measuring something the app never does.
     let tier2 = flags.iter().any(|arg| arg == "--tier2");
+    let watch = flags.iter().any(|arg| arg == "--watch");
 
     if !root.is_dir() {
         eprintln!("not a directory: {}", root.display());
@@ -107,12 +109,71 @@ fn main() -> ExitCode {
         print_tier2(&repos);
     }
 
+    if watch {
+        println!();
+        print_watch(&repos);
+    }
+
     if rows {
         println!();
         print_rows(&statuses);
     }
 
     ExitCode::SUCCESS
+}
+
+/// Register the whole tree's watch set and report what it cost.
+///
+/// The number that matters is **paths**, not repositories: each one is an OS handle, and on Linux
+/// each one counts against `fs.inotify.max_user_watches`. It is lower than three per repository,
+/// because linked worktrees share their common directory with the repository they came from and a
+/// repository with no commits has no `logs/HEAD` to watch.
+///
+/// The watcher is dropped at the end of this function, which stops it — so this measures
+/// registration and nothing else. Watching a tree for events has no meaning without an app to push
+/// them to.
+fn print_watch(repos: &[DiscoveredRepo]) {
+    let started = std::time::Instant::now();
+    let mut watcher = match repo_scan::RepoWatcher::new(Duration::from_millis(400), |_| {}) {
+        Ok(watcher) => watcher,
+        Err(error) => {
+            println!("watch:     could not start a watcher: {error}");
+            return;
+        }
+    };
+    let built = started.elapsed();
+
+    let registering = std::time::Instant::now();
+    let failures = watcher.sync(repos);
+    let registered = registering.elapsed();
+
+    println!(
+        "watch:     {} paths over {} repos",
+        watcher.watched_paths(),
+        watcher.watched_repos()
+    );
+    println!(
+        "  build:     {} ms to create the debouncer",
+        built.as_millis()
+    );
+    println!(
+        "  register:  {} ms, {:.2} ms per repo",
+        registered.as_millis(),
+        registered.as_secs_f64() * 1000.0 / repos.len().max(1) as f64
+    );
+    println!(
+        "  per repo:  {:.2} paths",
+        watcher.watched_paths() as f64 / repos.len().max(1) as f64
+    );
+    print_errors("watch", &failures);
+
+    // The release half of the diff, measured because it runs on every completed scan.
+    let releasing = std::time::Instant::now();
+    watcher.sync(&[]);
+    println!(
+        "  release:   {} ms to unwatch everything",
+        releasing.elapsed().as_millis()
+    );
 }
 
 /// Time Tier 2 one repository at a time, and report the spread.

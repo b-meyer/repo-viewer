@@ -15,6 +15,14 @@
  * The corollary is that a stale count needs an explicit re-read, which is {@link RefreshDetail} —
  * and its `Tier.Two` is cumulative, so it re-reads the refs and the worktree too rather than
  * pairing fresh counts with a stale branch.
+ *
+ * # A changed repository is the other way counts go missing
+ *
+ * A watcher refresh drops Tier 2 for a repository that changed underneath an open drawer, because
+ * those counts are shown with no age beside them and would otherwise read as freshly measured. That
+ * makes `counts` go back to `null` on a row nobody touched, and `counting…` is a claim about work
+ * in progress — so {@link EnsureDetail} exists to make the claim true, and `scan.ts` calls it for
+ * the expanded rows in every update it applies.
  */
 import type { RepoStatus } from '@/scripts/generated/RepoStatus';
 import * as ipc from '@/scripts/ipc';
@@ -31,6 +39,24 @@ export async function ToggleRow(path: string): Promise<void> {
   const repos = useReposStore();
   if (!repos.ToggleExpanded(path)) return;
 
+  await EnsureDetail(path);
+}
+
+/**
+ * Reads Tier 2 for a row if it needs reading, and does nothing if it does not.
+ *
+ * The one place that decides whether an expand costs a command. Two callers, and the second is what
+ * keeps `counting…` honest: a watcher refresh invalidates Tier 2 for a repository that changed, so
+ * `counts` can go back to `null` **while the drawer is open**. Nothing would then re-read it, and
+ * the drawer would claim work was in progress for the rest of the session — the false-activity bug
+ * this whole vocabulary exists to prevent. So `scan.ts` calls this for every expanded row in an
+ * update it applies, and the guards below make that call free whenever there is nothing to do.
+ *
+ * @param path - The row to read.
+ */
+export async function EnsureDetail(path: string): Promise<void> {
+  const repos = useReposStore();
+
   const row = repos.byPath.get(path);
   // A row discovery found but Tier 0 could not read has no `RepoStatus` to fill in, and Rust
   // refuses the command for exactly that reason. Opening the drawer is still allowed — it is where
@@ -43,6 +69,9 @@ export async function ToggleRow(path: string): Promise<void> {
   if (row.kind === 'bare') return;
   // Already read, and Rust has not forgotten it. Nothing to ask for.
   if (row.counts !== null) return;
+  // A read is already in flight, which is the case a watcher push lands in most often: the row
+  // arrives, this runs, and the update that follows must not start a second read of the same thing.
+  if (repos.loadingDetail.has(path)) return;
 
   await Read(path, () => ipc.fullStatus(path));
 }

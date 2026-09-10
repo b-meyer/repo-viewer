@@ -21,8 +21,8 @@
 //!
 //! Each call makes its own interrupt flag and nothing ever flips it, so collapsing the drawer
 //! part-way through a large repository's read does not stop the read. A per-repository interrupt
-//! registry would fix it and has no second caller until the watcher arrives, so the flag exists
-//! to satisfy `gix`'s signature and nothing more.
+//! registry would fix it, and both callers of [`crate::live::refresh_one`] have the same gap, so
+//! the flag exists to satisfy `gix`'s signature and nothing more.
 
 use std::{
     path::PathBuf,
@@ -30,11 +30,12 @@ use std::{
 };
 
 use anyhow::{Context, anyhow};
-use repo_scan::{DiscoveredRepo, RepoEvent, RepoStatus, Tier, read_tier0, read_tier1, read_tier2};
+use repo_scan::{DiscoveredRepo, RepoEvent, RepoStatus, Tier, read_tier2};
 use tauri::State;
 
 use crate::{
     error::{CommandError, CommandResult},
+    live::refresh_one,
     state::AppState,
 };
 
@@ -101,8 +102,14 @@ fn read_full(state: &AppState, found: &DiscoveredRepo) -> anyhow::Result<RepoSta
 /// flag with a stale ref. `Tier::Two` therefore means all three.
 ///
 /// Pushes the merged row on the session channel **as well as** returning it. The return value
-/// answers this invocation; the push is what makes this the one code path a watcher, a poll, and a
-/// focus refresh can all reuse — none of those has an invocation to answer.
+/// answers this invocation; the push is what makes the read itself reusable by the watcher and the
+/// poll, neither of which has an invocation to answer — see [`crate::live::refresh_one`], which is
+/// the read both use.
+///
+/// What this command does **not** do is invalidate Tier 2. An explicit `refresh_repo(path, tier)`
+/// asked for the tiers it named and tier ownership answers exactly that, so a Tier 0 refresh leaves
+/// a Tier 2 read alone. The watcher does invalidate, because a change on disk is evidence those
+/// counts are wrong rather than merely old — the difference is the trigger, not the tier.
 #[tauri::command]
 pub async fn refresh_repo(
     state: State<'_, Arc<AppState>>,
@@ -116,43 +123,12 @@ pub async fn refresh_repo(
         .ok_or_else(|| not_a_known_repository(&path))?;
 
     let handle = Arc::clone(&state);
-    let merged = spawn(move || refresh(&handle, &found, tier)).await?;
+    let merged = spawn(move || refresh_one(&handle, &found, tier)).await?;
 
     // A row change untied to any scan, which is what the session channel carries.
     state.push(RepoEvent::Updated {
         repos: vec![merged.clone()],
     });
-    Ok(merged)
-}
-
-/// Re-read `found` up to `tier`, merging each tier as it completes.
-///
-/// Each tier is merged separately rather than assembled and merged once, so this shares the
-/// pipeline's merge functions exactly — and so a Tier 1 failure still leaves Tier 0's fresh values
-/// in the map.
-fn refresh(state: &AppState, found: &DiscoveredRepo, tier: Tier) -> anyhow::Result<RepoStatus> {
-    let flag = Arc::new(AtomicBool::new(false));
-
-    // Tier 0 always runs: it is the tier that produces the row at all, and the only one whose
-    // failure means there is no honest row to return.
-    let row = read_tier0(found).context("could not read the repository's refs")?;
-    let mut merged = state
-        .merge_tier0_batch(vec![row])
-        .pop()
-        .ok_or_else(|| anyhow!("`{}` was read but produced no row", found.path.display()))?;
-
-    if tier >= Tier::One
-        && let Some(dirty) = read_tier1(found, &flag).context("could not read the worktree")?
-    {
-        merged = state.merge_tier1_batch(vec![dirty]).pop().unwrap_or(merged);
-    }
-
-    if tier >= Tier::Two
-        && let Some(counts) = read_tier2(found, &flag).context("could not read the file counts")?
-    {
-        merged = state.merge_tier2(counts).unwrap_or(merged);
-    }
-
     Ok(merged)
 }
 
@@ -179,7 +155,7 @@ fn not_a_known_repository(path: &std::path::Path) -> CommandError {
 mod tests {
     use std::path::Path;
 
-    use repo_scan::{RepoKind, ScanOpts, discover_roots};
+    use repo_scan::{RepoKind, ScanOpts, discover_roots, read_tier0};
 
     use super::*;
 
@@ -258,7 +234,7 @@ mod tests {
         };
         read_full(&state, &repo).expect("Tier 2 reads this repository");
 
-        let refreshed = refresh(&state, &repo, Tier::Zero).expect("Tier 0 re-reads");
+        let refreshed = refresh_one(&state, &repo, Tier::Zero).expect("Tier 0 re-reads");
 
         assert!(
             refreshed.counts.is_some(),
@@ -278,7 +254,7 @@ mod tests {
             return;
         };
 
-        let refreshed = refresh(&state, &repo, Tier::Two).expect("all three tiers read");
+        let refreshed = refresh_one(&state, &repo, Tier::Two).expect("all three tiers read");
 
         assert!(refreshed.dirty.is_some(), "Tier 1 ran");
         assert!(refreshed.counts.is_some(), "and so did Tier 2");
@@ -292,7 +268,7 @@ mod tests {
             return;
         };
 
-        let refreshed = refresh(&state, &repo, Tier::One).expect("two tiers read");
+        let refreshed = refresh_one(&state, &repo, Tier::One).expect("two tiers read");
 
         assert!(refreshed.dirty.is_some(), "Tier 1 ran");
         assert_eq!(refreshed.counts, None, "Tier 2 did not");
@@ -329,7 +305,7 @@ mod tests {
             "but a refresh can produce one"
         );
 
-        let refreshed = refresh(&state, &repo, Tier::Zero).expect("Tier 0 creates the row");
+        let refreshed = refresh_one(&state, &repo, Tier::Zero).expect("Tier 0 creates the row");
         assert!(
             state.has_repo(&repo.path),
             "and the retry inserted it where there was none"

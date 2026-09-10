@@ -12,11 +12,16 @@ use std::{
     sync::{
         Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard,
         atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc::Sender,
     },
 };
 
-use repo_scan::{DiscoveredRepo, RepoEvent, RepoStatus, ScanError, ScanId, Tier1, Tier2};
+use repo_scan::{
+    DiscoveredRepo, RepoEvent, RepoStatus, RepoWatcher, ScanError, ScanId, Tier1, Tier2,
+};
 use tauri::ipc::Channel;
+
+use crate::live::Tick;
 
 /// Everything the app owns between commands.
 ///
@@ -65,6 +70,24 @@ pub struct AppState {
     /// fires when the last clone goes — so using the argument and letting it fall out of scope at
     /// the end of `subscribe` would close the channel the instant it was opened.
     session: Mutex<Option<Channel<RepoEvent>>>,
+
+    /// The one filesystem watcher, once [`crate::live::start`] has built it.
+    ///
+    /// Held here for the same reason the session channel is: `Debouncer`'s `Drop` stops its thread,
+    /// so a watcher owned by the function that created it would stop watching the moment that
+    /// function returned.
+    ///
+    /// `Option` because construction is fallible and because `None` is a state the app genuinely
+    /// runs in — watching turned off in the settings file, or a backend that refused to start. The
+    /// poll and the refresh-on-focus are what make that survivable, which is why nothing here
+    /// treats a missing watcher as an error.
+    watcher: Mutex<Option<RepoWatcher>>,
+
+    /// Wakes the poll thread, once [`crate::live::start`] has spawned it.
+    ///
+    /// The focus refresh and the shutdown signal both go through here, which is what makes them the
+    /// poll's own code path rather than two more of their own.
+    poll: Mutex<Option<Sender<Tick>>>,
 }
 
 /// Hand-written because `tauri::ipc::Channel` implements no `Debug`, and because dumping every row
@@ -78,6 +101,13 @@ impl std::fmt::Debug for AppState {
             .field("roots", &self.read_roots().len())
             .field("scans", &self.lock_scans().len())
             .field("session", &self.lock_session().is_some())
+            .field(
+                "watching",
+                &self
+                    .lock_watcher()
+                    .as_ref()
+                    .map_or(0, RepoWatcher::watched_paths),
+            )
             .finish()
     }
 }
@@ -129,6 +159,39 @@ impl AppState {
         let merged = merge_tier2(existing, row);
         repos.insert(merged.path.clone(), merged.clone());
         Some(merged)
+    }
+
+    /// Drop Tier 2's fields from these rows, because something changed underneath them.
+    ///
+    /// **The one deliberate exception to tier ownership**, and it is not a softening of the rule
+    /// but the honesty rule the merge exists to serve, applied where the merge cannot reach. A
+    /// watcher or a poll re-reads Tiers 0 and 1; tier ownership therefore leaves `counts` and
+    /// `submodules` exactly as they were, which for a repository that just changed means a
+    /// pre-change count sitting beside a post-change branch. The drawer shows those counts with no
+    /// age beside them, so the pair reads as one freshly measured moment. `persist.rs` drops the
+    /// same two fields on the load path for the same reason.
+    ///
+    /// Deliberately **not** folded into [`AppState::merge_tier0_batch`]: an explicit
+    /// `refresh_repo(path, Tier::Zero)` asked for refs and nothing more, and must leave a Tier 2
+    /// read alone. The difference is the trigger, not the tier — so it is a separate call the two
+    /// unsolicited triggers make and the command does not.
+    ///
+    /// Sends nothing. The caller re-reads immediately afterwards and pushes one merged row, so a
+    /// push here would put a row on the wire that is emptier than anything a user should see.
+    ///
+    /// A path with no row is skipped: there is nothing to invalidate, and no row to invent.
+    pub fn invalidate_tier2(&self, paths: &[PathBuf]) {
+        let mut repos = self.write_repos();
+        for path in paths {
+            if let Some(existing) = repos.get(path) {
+                let cleared = RepoStatus {
+                    counts: None,
+                    submodules: None,
+                    ..existing.clone()
+                };
+                repos.insert(path.clone(), cleared);
+            }
+        }
     }
 
     /// Record what discovery found, so a later per-row read can reach its resolved Git directory.
@@ -342,6 +405,74 @@ impl AppState {
         }
     }
 
+    /// Whether any scan is running.
+    ///
+    /// What the watcher and the poll check before doing anything: a scan is about to re-read every
+    /// row in the tree, so refreshing one underneath it is duplicated I/O whose only effect is to
+    /// put a second copy of the same answer on a second channel.
+    pub fn scan_in_flight(&self) -> bool {
+        !self.lock_scans().is_empty()
+    }
+
+    /// Install the watcher, replacing any previous one.
+    ///
+    /// The replaced watcher is dropped here, which stops its thread — so this is a handover rather
+    /// than a leak, and calling it twice does not accumulate watchers.
+    pub fn set_watcher(&self, watcher: RepoWatcher) {
+        *self.lock_watcher() = Some(watcher);
+    }
+
+    /// Make the watch set match what discovery has found, and report what could not be watched.
+    ///
+    /// Empty when there is no watcher — which is not the same as "everything is watched", and is
+    /// why the registration counts are logged here rather than inferred from an empty list by the
+    /// caller. That log line is also the only place the path count is visible, and it is the number
+    /// that matters against a platform's watch limit.
+    pub fn sync_watches(&self) -> Vec<ScanError> {
+        let found = self.discovered_all();
+        let mut watcher = self.lock_watcher();
+        let Some(watcher) = watcher.as_mut() else {
+            return Vec::new();
+        };
+
+        let failures = watcher.sync(&found);
+        tracing::debug!(
+            repos = watcher.watched_repos(),
+            paths = watcher.watched_paths(),
+            failed = failures.len(),
+            "watch set synced"
+        );
+        failures
+    }
+
+    /// Install the poll thread's sender.
+    pub fn set_poll(&self, sender: Sender<Tick>) {
+        *self.lock_poll() = Some(sender);
+    }
+
+    /// Wake the poll thread, if there is one.
+    ///
+    /// A send failure means the thread has already ended, which on the shutdown path is the
+    /// expected outcome rather than a problem — so it is dropped rather than logged.
+    pub fn tick(&self, tick: Tick) {
+        if let Some(sender) = self.lock_poll().as_ref() {
+            let _ = sender.send(tick);
+        }
+    }
+
+    /// Stop watching and polling.
+    ///
+    /// Called on window close beside [`AppState::cancel_all`], and for the same reason: these
+    /// threads should unwind while the runtime is still up rather than at process exit. Dropping
+    /// the watcher stops the debouncer, which drops the sender its callback holds, which is what
+    /// ends the refresh thread — so the one drop shuts down two of the three.
+    pub fn stop_live(&self) {
+        self.tick(Tick::Stop);
+        if self.lock_watcher().take().is_some() {
+            tracing::debug!("watcher stopped");
+        }
+    }
+
     /// Install the session channel, replacing any previous one.
     ///
     /// A webview reload calls `subscribe` again. Dropping the old channel ends it on the JS side,
@@ -403,6 +534,16 @@ impl AppState {
     /// Lock the session channel, recovering from a poisoned lock.
     fn lock_session(&self) -> MutexGuard<'_, Option<Channel<RepoEvent>>> {
         self.session.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Lock the watcher, recovering from a poisoned lock.
+    fn lock_watcher(&self) -> MutexGuard<'_, Option<RepoWatcher>> {
+        self.watcher.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Lock the poll sender, recovering from a poisoned lock.
+    fn lock_poll(&self) -> MutexGuard<'_, Option<Sender<Tick>>> {
+        self.poll.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
@@ -698,6 +839,20 @@ mod tests {
         assert!(second.load(Ordering::Relaxed));
     }
 
+    /// What the watcher and the poll check before doing any work: a scan is about to re-read every
+    /// row in the tree, so a refresh underneath it is duplicated I/O.
+    #[test]
+    fn a_scan_is_in_flight_only_while_it_is_registered() {
+        let state = AppState::default();
+        assert!(!state.scan_in_flight());
+
+        let (id, _flag) = state.begin_scan();
+        assert!(state.scan_in_flight());
+
+        state.finish_scan(id);
+        assert!(!state.scan_in_flight());
+    }
+
     /// Cancelling a scan that already finished is a no-op, not a panic: the frontend cannot avoid
     /// that race, so it must not be punished for losing it.
     #[test]
@@ -923,6 +1078,69 @@ mod tier2_tests {
         );
     }
 
+    /// The exception to tier ownership, and only for the rows named. A watcher re-reads Tiers 0 and
+    /// 1, which by the ownership rule leaves `counts` untouched — so a repository that just changed
+    /// would show a pre-change count beside a post-change branch, with no age beside it to say so.
+    #[test]
+    fn invalidate_tier2_clears_the_counts_and_the_submodules() {
+        let state = AppState::default();
+        state.merge_tier0_batch(vec![row("C:/work/a"), row("C:/work/b")]);
+        state.merge_tier2(tier2("C:/work/a"));
+        state.merge_tier2(tier2("C:/work/b"));
+
+        state.invalidate_tier2(&[PathBuf::from("C:/work/a")]);
+
+        let cleared = state
+            .row(Path::new("C:/work/a"))
+            .expect("the row is still here");
+        assert_eq!(cleared.counts, None, "the counts are gone");
+        assert_eq!(cleared.submodules, None, "and so is the submodule list");
+        assert_eq!(
+            state
+                .row(Path::new("C:/work/b"))
+                .expect("b is untouched")
+                .counts,
+            Some(counts()),
+            "only the paths named are invalidated"
+        );
+    }
+
+    /// It clears Tier 2 and nothing else. Tier 0's and Tier 1's fields belong to the tiers about to
+    /// re-read them, and blanking those would put "counting…" on a row for values Rust still holds.
+    #[test]
+    fn invalidate_tier2_leaves_every_other_tier_alone() {
+        let state = AppState::default();
+        let mut existing = row("C:/work/a");
+        existing.dirty = Some(true);
+        existing.conflicted = Some(2);
+        state.merge_tier0_batch(vec![existing]);
+        state.merge_tier2(tier2("C:/work/a"));
+
+        state.invalidate_tier2(&[PathBuf::from("C:/work/a")]);
+
+        let cleared = state
+            .row(Path::new("C:/work/a"))
+            .expect("the row is still here");
+        assert_eq!(cleared.dirty, Some(true), "Tier 1's flag is not Tier 2's");
+        assert_eq!(cleared.conflicted, Some(2));
+        assert_eq!(
+            cleared.head,
+            row("C:/work/a").head,
+            "and neither is Tier 0's"
+        );
+    }
+
+    /// A path with no row has nothing to invalidate, and inventing one would be the absence-is-the-
+    /// signal rule broken from the other side.
+    #[test]
+    fn invalidate_tier2_inserts_nothing_for_an_unknown_path() {
+        let state = AppState::default();
+
+        state.invalidate_tier2(&[PathBuf::from("C:/work/ghost")]);
+
+        assert!(state.snapshot().is_empty());
+    }
+
     /// Tier 2 cannot insert a row of its own — it has no `head` to give one.
     #[test]
     fn merge_tier2_drops_a_result_for_a_path_with_no_row() {
@@ -943,6 +1161,7 @@ mod tier2_tests {
             parent: PathBuf::from("C:/work"),
             kind: repo_scan::RepoKind::Normal,
             git_dir: PathBuf::from("C:/work/broken/.git"),
+            common_dir: PathBuf::from("C:/work/broken/.git"),
         };
         state.record_found(&[unreadable]);
 
@@ -976,6 +1195,7 @@ mod tier2_tests {
             parent: PathBuf::from("C:/work"),
             kind: repo_scan::RepoKind::Normal,
             git_dir: PathBuf::from("C:/work/a/.git"),
+            common_dir: PathBuf::from("C:/work/a/.git"),
         }]);
         state.merge_tier0_batch(vec![row("C:/work/a")]);
 
@@ -1006,6 +1226,7 @@ mod cache_tests {
                 parent: PathBuf::from("C:/work"),
                 kind: repo_scan::RepoKind::Normal,
                 git_dir: PathBuf::from("C:/work/a/.git"),
+                common_dir: PathBuf::from("C:/work/a/.git"),
             }],
         );
 
@@ -1066,6 +1287,7 @@ mod cache_tests {
             parent: PathBuf::from("C:/work"),
             kind: repo_scan::RepoKind::Normal,
             git_dir: PathBuf::from("C:/work/gone/.git"),
+            common_dir: PathBuf::from("C:/work/gone/.git"),
         }]);
 
         state.retain_scanned(&[PathBuf::from("C:/work")], &HashSet::new());

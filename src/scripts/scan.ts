@@ -1,6 +1,3 @@
-import type { RepoEvent } from '@/scripts/generated/RepoEvent';
-import type { ScanEvent } from '@/scripts/generated/ScanEvent';
-import type { ScanId } from '@/scripts/generated/ScanId';
 /**
  * The scan session: which scan is current, and what its events do to the store.
  *
@@ -24,6 +21,10 @@ import type { ScanId } from '@/scripts/generated/ScanId';
  * `activeId` latches from the first accepted event, and once latched, an event bearing a different
  * id is dropped. The resolved id then cross-checks the latch rather than establishing it.
  */
+import { EnsureDetail } from '@/scripts/detail';
+import type { RepoEvent } from '@/scripts/generated/RepoEvent';
+import type { ScanEvent } from '@/scripts/generated/ScanEvent';
+import type { ScanId } from '@/scripts/generated/ScanId';
 import * as ipc from '@/scripts/ipc';
 import { ClearIndex, IndexRows, UnindexPaths } from '@/scripts/search';
 import { useReposStore } from '@/stores/repos';
@@ -305,6 +306,13 @@ function HandleSessionEvent(event: RepoEvent): void {
     case 'updated': {
       repos.UpsertMany(event.repos);
       IndexRows(event.repos);
+      // A watcher refresh drops Tier 2 for a repository that changed, so a row can arrive with
+      // `counts` back to `null` while its drawer is open. `EnsureDetail` is what turns the
+      // `counting…` that then appears into a true statement; it is a no-op for a collapsed row, a
+      // bare one, and one whose counts are still there.
+      for (const row of event.repos) {
+        if (repos.expanded.has(row.path)) void EnsureDetail(row.path);
+      }
       break;
     }
     case 'removed': {
@@ -312,6 +320,12 @@ function HandleSessionEvent(event: RepoEvent): void {
       // have to leave the index, or a search keeps offering a row the table no longer has.
       repos.Remove(event.paths);
       UnindexPaths(event.paths);
+      break;
+    }
+    case 'watchFailed': {
+      // Not fatal and not a command failure: the poll and the refresh-on-focus still run, so this
+      // says rows now update within a minute rather than within a second.
+      repos.SetWatchError(event.message);
       break;
     }
   }

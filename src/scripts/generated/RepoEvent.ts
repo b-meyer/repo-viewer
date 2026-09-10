@@ -17,4 +17,8 @@ repos: Array<RepoStatus>, } | { "kind": "removed",
 /**
  * Absolute paths, exactly as Rust spells them.
  */
-paths: Array<string>, };
+paths: Array<string>, } | { "kind": "watchFailed", 
+/**
+ * Rendered cause, with the platform's fix appended where there is one.
+ */
+message: string, };

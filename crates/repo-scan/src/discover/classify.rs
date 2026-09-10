@@ -22,6 +22,9 @@ pub(super) struct Classified {
     pub kind: RepoKind,
     /// The resolved Git directory, before canonicalisation.
     pub git_dir: PathBuf,
+    /// The common directory, before canonicalisation. Equal to `git_dir` unless a `commondir` file
+    /// beside it says otherwise, which only a linked worktree has.
+    pub common_dir: PathBuf,
 }
 
 /// Probe `dir` for a repository.
@@ -69,43 +72,54 @@ fn classify_bare(dir: &Path) -> Result<Option<Classified>, String> {
 /// `probed` is the path handed to `is_git`: `<dir>/.git` in the normal case, `<dir>` in the bare
 /// one. It is the fallback Git directory for the variants that do not name one.
 fn from_kind(kind: Kind, probed: PathBuf) -> Classified {
-    match kind {
+    let (kind, git_dir) = match kind {
         // A `.git` directory in the main worktree.
         Kind::WorkTree {
             linked_git_dir: None,
-        } => Classified {
-            kind: RepoKind::Normal,
-            git_dir: probed,
-        },
+        } => (RepoKind::Normal, probed),
         // A `.git` *file* whose private directory has a `commondir` — the object store is shared
         // with the main worktree, which is exactly what makes this a linked worktree and not a
         // second copy of the same repository.
         Kind::WorkTree {
             linked_git_dir: Some(git_dir),
-        } => Classified {
-            kind: RepoKind::LinkedWorktree,
-            git_dir,
-        },
+        } => (RepoKind::LinkedWorktree, git_dir),
         // A `.git` file with no `commondir` beside it.
-        Kind::Submodule { git_dir } => Classified {
-            kind: RepoKind::Submodule,
-            git_dir,
-        },
-        Kind::PossiblyBare => Classified {
-            kind: RepoKind::Bare,
-            git_dir: probed,
-        },
+        Kind::Submodule { git_dir } => (RepoKind::Submodule, git_dir),
+        Kind::PossiblyBare => (RepoKind::Bare, probed),
         // Both of these are the git-dir side of the pair — `.git/worktrees/<name>` and
         // `.git/modules/<name>`. The walk never descends into `.git`, so neither is reachable from
         // a scan; they are mapped rather than ignored so that pointing a root straight at one
         // still produces a row.
-        Kind::WorkTreeGitDir { .. } => Classified {
-            kind: RepoKind::LinkedWorktree,
-            git_dir: probed,
-        },
-        Kind::SubmoduleGitDir => Classified {
-            kind: RepoKind::Submodule,
-            git_dir: probed,
-        },
+        Kind::WorkTreeGitDir { .. } => (RepoKind::LinkedWorktree, probed),
+        Kind::SubmoduleGitDir => (RepoKind::Submodule, probed),
+    };
+
+    Classified {
+        kind,
+        common_dir: common_dir(&git_dir),
+        git_dir,
+    }
+}
+
+/// Where `refs/`, `logs/` and `FETCH_HEAD` live for `git_dir`.
+///
+/// Resolved uniformly for every kind rather than only for the two worktree variants, because that
+/// is what the answer *is*: git reads the `commondir` file when there is one and uses the Git
+/// directory itself when there is not. A normal repository, a bare one and a submodule all have no
+/// such file — for a submodule that absence is precisely what told `is_git` it was not a worktree —
+/// so they fall through to the same branch that a failed read does.
+///
+/// `from_plain_file_relative_to_file` rather than reading and joining by hand: the recorded path is
+/// usually relative (`../..`), and this is the function `gix_discover::is_git` itself uses to
+/// resolve it against the file's own directory.
+///
+/// A `commondir` that exists and cannot be read falls back to `git_dir` rather than failing.
+/// Discovery has no fallible signature, and a watch set that misses one worktree's remote-tracking
+/// refs is a great deal better than a repository with no row at all.
+fn common_dir(git_dir: &Path) -> PathBuf {
+    let marker = git_dir.join("commondir");
+    match gix::discover::path::from_plain_file_relative_to_file(&marker) {
+        Some(Ok(common)) => common,
+        Some(Err(_)) | None => git_dir.to_path_buf(),
     }
 }

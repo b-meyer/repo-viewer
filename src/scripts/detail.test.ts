@@ -1,7 +1,7 @@
 import { clearMocks, mockIPC } from '@tauri-apps/api/mocks';
 import { createPinia, setActivePinia } from 'pinia';
 import { afterEach, beforeEach, describe, expect, it } from 'vite-plus/test';
-import { OpenIn, RefreshDetail, ToggleRow } from '@/scripts/detail';
+import { EnsureDetail, OpenIn, RefreshDetail, ToggleRow } from '@/scripts/detail';
 import { useReposStore } from '@/stores/repos';
 import { MakeCounts, MakeDiscovered, MakeStatus } from '@/tests/fixtures';
 
@@ -151,6 +151,56 @@ describe('row detail', () => {
     // failure path just as much as on the successful one.
     expect(store.loadingDetail.has('C:/work/alpha')).toBe(false);
     expect(store.byPath.get('C:/work/alpha')).toMatchObject({ counts: null });
+  });
+
+  /**
+   * The obligation a watcher refresh creates. It invalidates Tier 2 for a repository that changed,
+   * so `counts` goes back to `null` on a row whose drawer is already open — and `counting…` is a
+   * claim about work in progress, so something has to make the claim true.
+   */
+  it('re-reads counts that were invalidated under an open drawer', async () => {
+    const store = useReposStore();
+    store.Upsert(MakeStatus({ path: 'C:/work/alpha', counts: MakeCounts() }));
+    await ToggleRow('C:/work/alpha');
+
+    // What the watcher's push looks like on this side: the same row, Tier 2 cleared.
+    store.Upsert(MakeStatus({ path: 'C:/work/alpha', counts: null }));
+    const calls = mockReads({ counts: MakeCounts({ staged: 5 }) });
+    await EnsureDetail('C:/work/alpha');
+
+    expect(calls).toEqual(['full_status']);
+    expect(store.byPath.get('C:/work/alpha')).toMatchObject({
+      counts: MakeCounts({ staged: 5 }),
+    });
+  });
+
+  /**
+   * And it is free when there is nothing to do, which is what makes it safe to call for every
+   * expanded row in every update the session channel delivers.
+   */
+  it('asks for nothing when the counts are already there', async () => {
+    const store = useReposStore();
+    store.Upsert(MakeStatus({ path: 'C:/work/alpha', counts: MakeCounts() }));
+    const calls = mockReads();
+
+    await EnsureDetail('C:/work/alpha');
+
+    expect(calls).toEqual([]);
+  });
+
+  /**
+   * A read already in flight is the common case for a watcher push: the row lands, this runs, and
+   * the very next batch must not start a second read of the same repository.
+   */
+  it('does not start a second read while one is in flight', async () => {
+    const store = useReposStore();
+    store.Upsert(MakeStatus({ path: 'C:/work/alpha', counts: null }));
+    store.SetLoadingDetail('C:/work/alpha', true);
+    const calls = mockReads();
+
+    await EnsureDetail('C:/work/alpha');
+
+    expect(calls).toEqual([]);
   });
 
   /**

@@ -112,6 +112,10 @@ pub async fn remove_root(
         // A row change untied to any scan, which is exactly what the session channel is for.
         state.push(RepoEvent::Removed { paths: evicted });
     }
+    // The rows are gone from both maps, so the watches over them are now watches over nothing.
+    // Registration failures are impossible on a removal — nothing is being added — so the return
+    // value has nothing to report and is deliberately dropped.
+    let _ = state.sync_watches();
     Ok(roots)
 }
 

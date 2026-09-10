@@ -100,6 +100,7 @@ describe('repos store', () => {
     store.AddRepoErrors([{ path: 'C:/work/broken', message: 'boom' }]);
     store.SetDetailError('C:/work/alpha', 'counts failed');
     store.SetScanError('boom');
+    store.SetWatchError('watch limit reached');
 
     store.Reset();
 
@@ -109,6 +110,23 @@ describe('repos store', () => {
     expect(store.repoErrors.size).toBe(0);
     expect(store.detailErrors.size).toBe(0);
     expect(store.scanError).toBeNull();
+    expect(store.watchError).toBeNull();
+  });
+
+  /**
+   * A degraded watcher is its own state, not a failed command. The distinction is what lets the
+   * page word it as "rows update on a timer" rather than as something having broken — the poll and
+   * the refresh-on-focus are still running.
+   */
+  it('keeps a watch failure separate from a command failure', () => {
+    const store = useReposStore();
+
+    store.SetWatchError('OS file watch limit reached.');
+
+    expect(store.watchError).toBe('OS file watch limit reached.');
+    expect(store.scanError).toBeNull();
+    store.SetWatchError(null);
+    expect(store.watchError).toBeNull();
   });
 
   /**

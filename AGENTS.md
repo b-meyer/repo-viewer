@@ -31,7 +31,7 @@ because `vp` is not global on an ADO agent — a pipeline detail, not a pattern 
 | Add a dependency                          | `vp add <pkg>` then pin it exact in the catalog                                                 |
 | Bump a dependency                         | `vp update -L <pkg>`                                                                            |
 | Rust checks                               | `vp run rust` — `cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test`  |
-| Engine without the GUI                    | `cargo run --release --example scan -- <path>` (`--rows` per repo, `--tier2` to time expands)   |
+| Engine without the GUI                    | `cargo run --release --example scan -- <path>` (`--rows`, `--tier2`, `--watch`)                 |
 | A tree to time against                    | `cargo run --release --example synth -- <dir> [count] [depth]` — generated, so safe to write to |
 
 Imports: configs from `vite-plus`, tests from `vite-plus/test`. **Never `vite` / `vitest`
@@ -55,7 +55,8 @@ Break any of these and the design stops working. They are not style preferences.
 - **`src-tauri/src/persist.rs` is the only file that uses `tauri_plugin_store`**, beyond the one
   line in `lib.rs` that registers it. Two files under
   it, because they have two lifetimes: `settings.json` is what the user meant — roots, the
-  `openIn` commands, and the view state — and is left on the plugin's own auto-save; `cache.json`
+  `openIn` commands, the `watch` settings, and the view state — and is left on the plugin's own
+  auto-save; `cache.json`
   is the whole row map, written once at the end of a scan and again on exit, with auto-save
   **disabled**. Everything else asks `persist` for a value or hands it one.
 
@@ -102,20 +103,52 @@ Break any of these and the design stops working. They are not style preferences.
   the value is uncomputed — so preferring a stale `Some` over a fresh `None` would report a deleted
   upstream as live forever. Only `dirty`, `conflicted`, `counts` and `submodules` mean "not yet"
   when `None`. `state.rs` has a test for each half; they are the only inputs on which a correct
-  merge and a wholesale replace disagree while Tier 0 is the sole writer.
+  merge and a wholesale replace disagree while Tier 0 is the sole writer. There is exactly one
+  exception, and it is a **separate operation** rather than a merge that behaves differently —
+  `AppState::invalidate_tier2`, described three bullets down.
 - **Everything streams over `tauri::ipc::Channel`; `emit()`/`listen()` are not used.** Tauri's
   event system is documented as "not designed for low latency or high throughput" — payloads are
   always JSON strings. One `Channel<ScanEvent>` per scan, one `Channel<RepoEvent>` per session
-  opened by `subscribe` at startup for watcher, poll, and fetch pushes. Batch sends (~50 ms, or
+  opened by `subscribe` at startup, carrying watcher, poll, and fetch pushes plus the one thing on
+  it that is not a row — `RepoEvent::WatchFailed`, which is how §7.4's guidance reaches a user
+  rather than only a log. Batch sends (~50 ms, or
   25 repos) rather than one per repo. Every scan event carries its `ScanId`; the frontend drops
   events from any scan it did not ask for — but the id **cannot** be the primary filter, because
   Rust starts the pipeline before `scan_roots`'s reply crosses back and a batch can arrive before
   the id is known. `src/scripts/scan.ts` keys acceptance on a generation counter captured in the
   handler closure before the invoke, and uses the id as the guard on top.
 - **One `notify` watcher for all repos.** `notify` spawns a thread per `Watcher`, so N watchers
-  means N threads. Create one and call `watch()` per repo, non-recursively, on the git dir only —
-  which discovery already resolved onto `DiscoveredRepo.git_dir`, including the indirection for a
-  worktree or submodule whose `.git` is a file. Do not re-resolve it.
+  means N threads. `crates/repo-scan/src/watch/` holds the one, and `watch/set.rs` is the only
+  place the §7.2 set is decided: the git dir root non-recursively, `refs/` **recursively**, and
+  `logs/HEAD`. Both directories for a linked worktree, because `DiscoveredRepo` carries `git_dir`
+  **and** `common_dir` and discovery resolved both — do not re-resolve either.
+
+  The reverse index is watched path → **the repositories that asked for it**, plural, and it
+  doubles as the reference count. A linked worktree shares its common directory with the
+  repository it came from, so one `refs/remotes/` write there moves both their ahead/behind counts
+  and both are reported; and a path is unwatched only when its last holder goes, or removing a
+  worktree would silently stop reporting its parent's commits.
+
+  **The worktree itself is never watched.** Recursively watching worktrees means recursively
+  watching `node_modules`. A worktree-only edit is picked up by the poll, by refresh-on-focus, or
+  by the `index` write that follows any `git add` — measured: an edit with no `git add` produces no
+  event at all, and the `git add` produces exactly one.
+
+- **The poll owns Tier 0, the watcher owns Tiers 0 and 1, and only the watcher invalidates Tier 2.**
+  Same tier-ownership rule, applied to triggers. A watcher event is evidence that something
+  changed, so `AppState::invalidate_tier2` nulls `counts` and `submodules` for that row — the one
+  deliberate exception to "a tier leaves other tiers' fields alone", made for the reason
+  `persist.rs` makes it on the load path: the drawer shows those counts with no age beside them, so
+  a pre-change count reads as freshly measured. A poll tick is evidence only that time passed, so it
+  claims Tier 0 and touches neither `dirty` nor `counts`; nulling on a timer would put a
+  `counting…` flicker in an untouched drawer every minute. And `refresh_repo` never invalidates:
+  it was asked for the tiers it names.
+
+  Invalidating obliges the frontend, because `counting…` must be transient. Rust cannot discharge
+  that — which rows are expanded is window state — so `src/scripts/detail.ts`'s `EnsureDetail` is
+  called for every expanded row in a session update and re-reads Tier 2 when its counts have gone.
+  Without it an open drawer claims work in progress for the rest of the session.
+
 - **Uncomputed tiers render as unknown, never as `0`.** Every tiered field is `Option`, and the UI
   must say "counting…" rather than showing a number it does not have. This is the most common bug
   in this class of app. The corollary for a repository that cannot be read at all: it produces
@@ -126,9 +159,10 @@ Break any of these and the design stops working. They are not style preferences.
 - **"counting…" is a claim that work is in progress, so it must be transient.** The four kinds of
   absence are four different facts and `AppUnknown` is the single place they are worded, because
   collapsing any two of them is how the rule above gets diluted:
-  - `pending` → "counting…" — a tier that has not run **yet**. Never for a tier that will not run:
-    the Worktree column once read this for the life of the session because Tier 1 was a phase away,
-    which is a false claim of activity and cost a user an overnight wait.
+  - `pending` → "counting…" — a tier that has not run **yet**. Never for a tier that will not run,
+    and never for one whose run nothing will trigger: a column left on this for the life of a
+    session is a false claim of activity, and it costs a user an overnight wait for a number that
+    was never coming. Whatever sets it must guarantee something clears it.
   - `na` → "n/a" — cannot ever apply. A bare repository has no worktree, so its `dirty` is not
     pending.
   - `unreadable` → red, with the cause — tried and failed. Two independent ways to know, and either
@@ -182,7 +216,7 @@ sequenceDiagram
     U->>V: pick root folder, or a launch reconciles
     V->>T: invoke scan_roots with Channel
     T->>D: parallel walk, prune heavy dirs
-    D-->>T: DiscoveredRepo streamed - path, kind, resolved git dir
+    D-->>T: DiscoveredRepo streamed - path, kind, resolved git dir + common dir
     T-->>V: ReposFound batches
     Note over V: rows paint immediately<br/>tiered fields render as "unknown", never 0
 
@@ -197,10 +231,14 @@ sequenceDiagram
     T-->>V: RepoErrors - repos that produced no row, per batch
     Note over V: so a broken row reads "unreadable" now,<br/>not "counting…" until the scan ends
 
-    T->>T: evict rows the walk did not find, then write the cache
+    T->>T: evict rows the walk did not find
     Note over T: only a completed scan may evict<br/>a cancelled one has not seen the whole tree
 
-    T->>W: register one watcher over N git dirs
+    T-->>V: Finished - ScanTotals
+
+    T->>W: sync the watch set
+    T->>T: write the row cache
+    Note over T,W: both after the terminal event, so neither<br/>delays it - registering is ~6.5 ms per repo,<br/>two seconds at three hundred
 
     U->>V: expand a row
     V->>T: invoke full_status
@@ -208,10 +246,10 @@ sequenceDiagram
     G-->>V: four per-column counts + submodule list, merged onto the row
     Note over G: ~35 ms per expand warm - sequential, no fan-out
 
-    W-->>T: debounced change on a git dir
-    T->>G: Tier 0 + 1 for that repo
+    W-->>T: debounced change, resolved to its repos
+    T->>G: Tier 0 + 1 for that repo, Tier 2 dropped
     G-->>V: merged row on the session channel
-    Note over V,W: watching is an optimization<br/>a 60 s poll and focus-refresh are the safety net<br/>and take the same Rust-side path
+    Note over V,W: watching is an optimization<br/>a 60 s poll and focus-refresh are the safety net<br/>and claim Tier 0 only
 ```
 
 Never move Tier 2 work into the default scan path. Tier 0 is refs-only and must stay that way.
@@ -221,7 +259,14 @@ Tier 2 is the one tier with **no rayon fan-out**, and that is deliberate rather 
 runs for one expanded row at a time, so a `read_tier2_all_with` would exist only to be called from
 the pipeline — which is the thing this section forbids. `full_status` merges it and returns the
 whole row; `refresh_repo(path, tier)` re-reads tiers `0..=tier` and both returns the row and pushes
-it on the session channel, so the watcher can reuse that one path rather than duplicating it.
+it on the session channel.
+
+The read itself is `live::refresh_one`, and it has two callers: that command, and the watcher's
+refresh thread. Neither reimplements it, which is what keeps a user-requested refresh and a
+watcher-driven one from disagreeing about what a refresh is. The **poll** deliberately does not use
+it — a whole-tree pass wants `read_tier0_all_with`'s rayon fan-out rather than three hundred
+sequential opens — so what the three triggers share is Rust-side ownership and the merge-then-push,
+not one function.
 
 ## Hard rules
 
@@ -560,6 +605,40 @@ for that comparison passes `-c maintenance.auto=false -c gc.auto=0`, and deletes
 so `refs/heads/feature/x` and every `refs/remotes/origin/*` update are invisible. Watch `refs/`
 recursively (it is tiny), the git-dir root non-recursively, and `logs/HEAD`.
 
+**A repository with no commits has no `logs/HEAD`, and `notify::watch()` fails on a path that is
+not there.** `git init` writes `refs/heads/` and `refs/tags/` but no `logs/` — that arrives with the
+first ref update. So `watch_set` is filtered by existence, or every freshly `init`ed repository in
+the tree reports a registration failure for a file git has simply not written yet. The same filter
+covers a bare repository with no commits.
+
+**A linked worktree's private directory has its own `refs/`, and it is not redundant.** The
+per-worktree refs — `refs/bisect/*` and `refs/worktree/*` — live there rather than in the common
+directory, so a bisect running in that worktree is visible nowhere else. Watching both `refs/` trees
+is correct, not belt-and-braces; the worktree's `commondir` is what makes the second one reachable,
+and `DiscoveredRepo.common_dir` carries it.
+
+**`notify-debouncer-full` 0.7 moved `watch`/`unwatch` onto `Debouncer` and deprecated
+`.watcher()`.** Every example still shows `debouncer.watcher().watch(…)`, and `.watcher()` and
+`.cache()` now carry `#[deprecated]` — so with this workspace's `clippy -- -D warnings` the old
+idiom is a build failure rather than a warning. `Debouncer::Drop` also stops its thread, which is
+why the handle lives on `AppState`: a watcher owned by the function that built it stops watching the
+moment that function returns, silently, because nothing fails.
+
+**`Debouncer::unwatch` drops its record of every root beneath the path it is given.** It calls an
+internal `remove_root` that retains only roots which do not `starts_with` that path — so unwatching
+a git dir before the `refs/` tree inside it discards the debouncer's bookkeeping for a watch still
+registered with the OS. Unwatch **deepest first** — `RepoWatcher::forget` sorts by component count
+descending before it unwatches anything, which is not tidiness but the only order that leaves the
+bookkeeping and the OS agreeing.
+
+**Watch registration costs ~6.5 ms per repository, which is seconds on a large tree.** Measured
+with `cargo run --release --example scan -- <path> --watch`: 156 paths over 52 repositories in
+287 ms warm, and **903 paths over 301 repositories in 1956 ms**. Exactly 3.00 paths per repository
+on a tree of ordinary checkouts. That is why `pipeline.rs` syncs the watch set **after** the
+terminal `ScanEvent::Finished` rather than before it — in front of the event, a 300-repository
+scan would make the user wait two extra seconds to be told it had finished, which is the same
+reason the row cache is written there.
+
 **Windows long paths bite on the way out, not in.** `std::fs` already applies the `\\?\` prefix
 for long paths, so the walk does not fail on deep `node_modules`. `canonicalize()` _returns_
 `\\?\C:\...` paths, which render badly, confuse `git` CLI arguments, and compare unequal to the
@@ -597,14 +676,26 @@ signing or an IT allow indicator is a prerequisite for distributing to colleague
 
 **Git writes `.git/index` three times per operation.** It writes `index.lock`, writes, then
 renames, so one `git add` produces a create/modify/remove burst. Debouncing
-(`notify-debouncer-full`, ~300–500 ms, plus a per-repo cooldown) is mandatory, not an
-optimization. Never let a watcher callback block: if it stalls, OS events pile up in the kernel
-buffer and are dropped on overflow.
+(`notify-debouncer-full`, ~300–500 ms, plus `live.rs`'s per-repo `COOLDOWN`) is mandatory, not an
+optimization — and the two are not the same guard: the debouncer collapses one operation's burst,
+the cooldown collapses `add` then `commit` then `push` arriving a second apart.
+
+Never let a watcher callback block: if it stalls, OS events pile up in the kernel buffer and are
+dropped on overflow. Everything the callback in `live::start` can do is one `mpsc` send, and that
+is deliberate — the refresh work belongs to the thread draining it. Do not grow a branch there
+that touches the filesystem, takes a lock, or pushes on a channel.
 
 **Watching is never the source of truth.** `notify`'s own docs warn it "may fail to receive all
 events" at high file counts. Linux inotify has a per-user watch limit that surfaces as "No space
-left on device" — detect that specific error and print the `sysctl` fix rather than failing
-opaquely. Always ship the ~60 s poll and refresh-on-focus.
+left on device"; `watch/mod.rs`'s `render` matches **`notify::ErrorKind::MaxFilesWatch`** rather
+than that message — the kind is what the inotify backend maps `ENOSPC` onto, and matching prose
+across platforms and versions is how this quietly stops working — and appends the `sysctl` fix. It
+reaches a user as `RepoEvent::WatchFailed`, not just a log line, because guidance nobody sees is
+not guidance. Always ship the ~60 s poll and refresh-on-focus.
+
+A backend can also say outright that it lost track, as an event flagged `Flag::Rescan`. `resolve`
+answers that by reporting **every** watched repository as changed, because "nothing else changed"
+is not a claim anything can make after a rescan.
 
 **Ahead/behind is relative to the last fetch, not the remote.** It is measured against
 `refs/remotes/origin/*`. Never present it without the `last_fetched` age beside it.
