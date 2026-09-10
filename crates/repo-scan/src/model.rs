@@ -435,6 +435,113 @@ pub struct ScanSummary {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Fetch
+// ---------------------------------------------------------------------------------------------
+
+/// How one repository's fetch ended.
+///
+/// Nine variants and **no catch-all success**. Four of them are not failures at all:
+/// [`FetchStatus::NoRemote`] is an answered question, [`FetchStatus::TooSoon`] and
+/// [`FetchStatus::Cancelled`] mean nothing was attempted, and [`FetchStatus::Ok`] means it ran.
+/// Collapsing any two would be the four-kinds-of-absence rule broken in a new place — "there is
+/// nothing to fetch from" and "the fetch failed" are different facts and a user acts on them
+/// differently.
+///
+/// The first six are decided **structurally** — from a pre-flight read, from our own bookkeeping,
+/// or from an exit status. Only [`FetchStatus::Auth`] and [`FetchStatus::Network`] come from
+/// matching git's prose, which is why they are advisory: see [`crate::fetch`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS), ts(export))]
+pub enum FetchStatus {
+    /// `git` ran and exited zero.
+    Ok,
+    /// Nothing is configured to fetch from. Answered before a process was spawned.
+    NoRemote,
+    /// Fetched too recently for a bulk pass to fetch it again. Never applies to a single request.
+    TooSoon,
+    /// The interrupt flag was set before this repository was reached, or while it ran.
+    Cancelled,
+    /// Credentials were refused, or none were available with prompting disabled.
+    Auth,
+    /// The host could not be resolved, reached, or connected to.
+    Network,
+    /// Killed at the deadline. **Our** bookkeeping, never inferred from an exit code.
+    TimedOut,
+    /// The `git` CLI could not be run at all.
+    GitMissing,
+    /// Anything else. `detail` carries git's own words.
+    Failed,
+}
+
+impl FetchStatus {
+    /// Whether a process actually ran, which is what decides if a re-read is worth doing.
+    ///
+    /// A killed or failed `git` may still have written some refs before it died, so everything
+    /// that spawned earns a Tier 0 re-read — 2.6 ms is cheaper than reasoning about which
+    /// failures are ref-safe.
+    #[must_use]
+    pub fn ran(self) -> bool {
+        !matches!(
+            self,
+            Self::NoRemote | Self::TooSoon | Self::Cancelled | Self::GitMissing
+        )
+    }
+}
+
+/// How one repository's fetch ended, and what it said.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS), ts(export))]
+pub struct FetchOutcome {
+    /// The repository, spelled as Rust's own map key.
+    pub path: PathBuf,
+    /// What happened.
+    pub status: FetchStatus,
+    /// Git's own last words: the tail of stderr, trimmed and capped. `None` when nothing ran.
+    ///
+    /// The **tail** rather than the head, because git prints its `fatal:` line last — truncating
+    /// from the front throws away the only line worth reading. This is always shown, whatever
+    /// [`FetchOutcome::status`] says, so a misclassification costs an icon and never the truth.
+    pub detail: Option<String>,
+    /// How long the process ran, milliseconds. Zero when none was spawned.
+    pub elapsed_ms: u64,
+}
+
+/// What a whole fetch pass did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS), ts(export))]
+pub struct FetchSummary {
+    /// Processes actually spawned.
+    pub attempted: u32,
+    /// Of those, the ones that exited zero.
+    pub succeeded: u32,
+    /// Of those, the ones that did not.
+    pub failed: u32,
+    /// Repositories that never ran one: no remote, too soon, or cancelled.
+    pub skipped: u32,
+    /// Whether the pass was interrupted rather than running to the end of its list.
+    pub cancelled: bool,
+    /// Wall-clock duration of the whole pass, milliseconds.
+    pub elapsed_ms: u64,
+}
+
+/// The `git` this process found.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS), ts(export))]
+pub struct GitInfo {
+    /// Where it was resolved to.
+    pub path: PathBuf,
+    /// `git --version`'s own output, trimmed.
+    ///
+    /// Carried rather than discarded because several fetch behaviours are version-sensitive, and
+    /// because a bug report that names the git is worth more than one that says it was present.
+    pub version: String,
+}
+
+// ---------------------------------------------------------------------------------------------
 // IPC events
 //
 // The engine does not use these types. They live here because `vp run types` is scoped to
@@ -606,5 +713,87 @@ pub enum RepoEvent {
     WatchFailed {
         /// Rendered cause, with the platform's fix appended where there is one.
         message: String,
+    },
+}
+
+/// Identifies one fetch pass for the lifetime of the process.
+///
+/// Exists for `cancel_fetch` and nothing else — the same counter shape as [`ScanId`], starting at
+/// 1 so `0` is never live.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, Default,
+)]
+// See [`ScanId`] for why this is stated on a newtype and why `ts-rs` complains about it.
+#[serde(transparent)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS), ts(export))]
+pub struct FetchId(pub u64);
+
+impl std::fmt::Display for FetchId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}", self.0)
+    }
+}
+
+/// What a fetch reports as it runs. One `Channel<FetchEvent>` per `fetch_repos` call.
+///
+/// # The rows are not here
+///
+/// This channel carries **outcomes**; the refreshed rows go out on the session
+/// [`RepoEvent::Updated`] like every other row change, because Rust owns the canonical copy and a
+/// second shape carrying the same row would be a second source of truth for it. A consumer that
+/// only wants the table updated can ignore this channel entirely.
+///
+/// # No id on the events, unlike [`ScanEvent`]
+///
+/// [`ScanEvent`] tags every variant with its [`ScanId`] because a superseded scan's batches would
+/// interleave stale rows into the table. A fetch owns no table state: every outcome is keyed by
+/// path and is an idempotent write to a per-path map, each invocation has its own channel and its
+/// own handler closure, and a fetch never supersedes another — two can run at once and both are
+/// legitimate. Adding an id would be §6.2's guard copied for a hazard that does not exist here.
+/// [`FetchId`] exists so a pass can be *cancelled*, which is a different question.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS), ts(export))]
+pub enum FetchEvent {
+    /// Everything accepted, in the order it will be attempted. Sent once, first.
+    ///
+    /// The denominator a progress bar needs, and the set of rows a caller may mark as queued —
+    /// which it must, because "queued" is a claim that work is coming and [`FetchEvent::Finished`]
+    /// is what discharges it.
+    #[serde(rename_all = "camelCase")]
+    Queued {
+        /// Absolute paths, exactly as Rust spells them.
+        paths: Vec<PathBuf>,
+    },
+
+    /// A process is now running for these. Batched, like everything else on a channel.
+    ///
+    /// Sent because a fetch's unit of work is measured in seconds: with a concurrency cap, a
+    /// repository can legitimately sit unstarted for minutes, and "queued" and "running" are
+    /// different things to say about it. Tier 0 has no equivalent event because 2.6 ms of work
+    /// does not have a middle.
+    #[serde(rename_all = "camelCase")]
+    Fetching {
+        /// Absolute paths, exactly as Rust spells them.
+        paths: Vec<PathBuf>,
+    },
+
+    /// Repositories that have settled, whatever the outcome. Batched.
+    #[serde(rename_all = "camelCase")]
+    Results {
+        /// One per repository, never more.
+        results: Vec<FetchOutcome>,
+    },
+
+    /// The pass is over. Terminal, and sent exactly once on every path including a panic.
+    ///
+    /// There is no separate cancelled variant: `summary.cancelled` carries it, and every
+    /// repository a cancellation skipped has already been reported as
+    /// [`FetchStatus::Cancelled`]. A variant meaning "the same as finished, but stopped early"
+    /// earns nothing — the same call [`ScanEvent`] makes about a failed scan.
+    #[serde(rename_all = "camelCase")]
+    Finished {
+        /// What the pass did.
+        summary: FetchSummary,
     },
 }

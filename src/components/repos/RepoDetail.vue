@@ -61,7 +61,14 @@
     </app-alert>
 
     <!-- Actions -->
-    <repo-actions :open-error="openError" @open="emit('open', $event)">
+    <repo-actions
+      :open-error="openError"
+      :fetch-state="fetchState"
+      :fetch-error="fetchError"
+      :git-missing="gitMissing"
+      @open="emit('open', $event)"
+      @fetch="emit('fetch')"
+    >
       <app-button
         label="Re-read"
         variant="outline"
@@ -85,6 +92,7 @@ import type { FileCounts } from '@/scripts/generated/FileCounts';
 import type { RepoStatus } from '@/scripts/generated/RepoStatus';
 import type { OpenTarget } from '@/scripts/ipc';
 import { formatAge, shortId } from '@/scripts/utils';
+import type { FetchRowState } from '@/stores/repos';
 
 /// Setup
 const props = defineProps<{
@@ -106,6 +114,18 @@ const props = defineProps<{
    */
   openError: string | null;
   /**
+   * Whether a fetch of this row is queued, running, or neither.
+   */
+  fetchState: FetchRowState | null;
+  /**
+   * Why the last fetch of this row failed, if it did.
+   */
+  fetchError: string | null;
+  /**
+   * Why fetching is unavailable, or `null` when it is available.
+   */
+  gitMissing: string | null;
+  /**
    * The current time, for the age line.
    */
   now: number;
@@ -120,6 +140,10 @@ const emit = defineEmits<{
    * The user asked to open this repository elsewhere.
    */
   open: [target: OpenTarget];
+  /**
+   * The user asked to fetch this repository.
+   */
+  fetch: [];
 }>();
 
 /// Computed

@@ -139,6 +139,8 @@ const SORT_VALUE: Record<SortKey, (row: RepoStatus) => Sortable> = {
  * @param options - The active view state.
  * @param now - The current time, for the fetch-age chip.
  * @param matches - Paths the search matched, or `null` when there is no query.
+ * @param busy - Paths with a fetch in flight or a failed one. Never hidden by a chip; defaulted so
+ *   every existing call site keeps its meaning.
  * @returns What to render, and what was left out.
  */
 export function buildView(
@@ -146,6 +148,7 @@ export function buildView(
   options: UiSettings,
   now: number,
   matches: Set<string> | null,
+  busy: Set<string> = new Set(),
 ): RepoView {
   const kept: RepoRow[] = [];
   let pending = 0;
@@ -153,7 +156,7 @@ export function buildView(
   for (const row of rows) {
     if (matches !== null && !matches.has(row.path)) continue;
 
-    const verdict = judge(row, options.chips, now);
+    const verdict = judge(row, options.chips, now, busy.has(row.path));
     if (verdict === 'match') kept.push(row);
     else if (verdict === 'pending') pending += 1;
   }
@@ -177,13 +180,19 @@ export function buildView(
  * @param row - The row to judge.
  * @param chips - The active chips.
  * @param now - The current time.
+ * @param busy - Whether a fetch is in flight for it or its last one failed.
  * @returns Whether it is shown, hidden, or not yet knowable.
  */
-function judge(row: RepoRow, chips: FilterChip[], now: number): Verdict {
+function judge(row: RepoRow, chips: FilterChip[], now: number, busy: boolean): Verdict {
   if (chips.length === 0) return 'match';
   // No `RepoStatus` at all: nothing to judge, and the row is the interesting one. See the note at
   // the top of this file.
   if (!isRead(row)) return 'match';
+  // A row this user is fetching, or one whose fetch just failed, is the same kind of row. With the
+  // `stale-fetch` chip active it would otherwise **vanish at the moment its result arrived** —
+  // and a row that failed would keep matching and stay put, visually identical to one not yet
+  // reached, which hides the only thing worth reading on the screen.
+  if (busy) return 'match';
 
   let waiting = false;
   for (const chip of chips) {

@@ -5,8 +5,12 @@
  * per app, none of this state is rendered directly, and the module-singleton shape is already the
  * house pattern for a single shared instance.
  *
- * **This is the only file in `src/` that switches on an event's `kind`.** Everything above it sees
- * domain calls; everything below it sees rows.
+ * **Event-kind dispatch happens only in this layer — never in a component and never in a store —
+ * and there is one module per channel.** This file owns the scan channel and the session channel,
+ * switching on both their event types; `fetch.ts` owns the fetch channel. Everything above them
+ * sees domain calls; everything below sees rows. The layer is the rule rather than the file,
+ * because three channels in one module would be three unrelated sessions sharing a generation
+ * counter.
  *
  * # Why a generation counter and not just the scan id
  *

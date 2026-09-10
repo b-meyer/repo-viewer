@@ -16,6 +16,9 @@ function mountDetail(
       loading: extra.loading ?? false,
       detailError: extra.detailError ?? null,
       openError: extra.openError ?? null,
+      fetchState: null,
+      fetchError: null,
+      gitMissing: null,
       now: NOW,
     },
   });

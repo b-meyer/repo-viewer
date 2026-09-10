@@ -34,6 +34,9 @@ function mountTable(
       loadingDetail: extra.loadingDetail ?? new Set<string>(),
       detailErrors: extra.detailErrors ?? new Map(),
       openErrors: extra.openErrors ?? new Map(),
+      fetchStates: new Map(),
+      fetchErrors: new Map(),
+      gitMissing: null,
       emptyMessage: 'Nothing here.',
     },
   });

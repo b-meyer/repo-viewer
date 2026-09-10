@@ -4,10 +4,16 @@
       :roots="repos.roots"
       :scanning="repos.scanning"
       :disabled="!bridgeReady"
+      :fetchable="repoView.visible"
+      :total="repos.count"
+      :fetching="repos.fetching"
+      :git-missing="gitMissing"
       @pick="PickAndAdd"
       @scan="Scan"
       @cancel="Cancel"
       @remove="Remove"
+      @fetch="Fetch"
+      @cancel-fetch="StopFetch"
     />
 
     <filter-bar
@@ -38,12 +44,32 @@
       </app-alert>
     </div>
 
+    <!--
+      Reading status needs no `git` at all, so this says what is unavailable rather than that
+      something is wrong. An `info` tone and a line on the page, not only a tooltip on a disabled
+      button: a tooltip is unreachable by keyboard and invisible to anyone who does not hover,
+      which is not §10.2's "with an explanation".
+    -->
+    <div v-if="gitMissing" class="px-20 pt-10">
+      <app-alert tone="info" title="Fetching is unavailable">{{ gitMissing }}</app-alert>
+    </div>
+
     <scan-progress
       v-if="repos.phase !== 'idle'"
       :progress="repos.progress"
       :discovery="repos.discovery"
       :totals="repos.totals"
       :repo-errors="repos.repoErrors"
+    />
+
+    <!--
+      Its own `v-if`, not folded into `ScanProgress`: that one is gated on a scan phase, and a
+      fetch has none. It stays up after the pass so the failures remain readable.
+    -->
+    <fetch-progress
+      v-if="fetchProgress !== null"
+      :progress="fetchProgress"
+      :fetch-errors="repos.fetchErrors"
     />
 
     <repo-table
@@ -57,10 +83,14 @@
       :loading-detail="repos.loadingDetail"
       :detail-errors="repos.detailErrors"
       :open-errors="repos.openErrors"
+      :fetch-states="repos.fetchStates"
+      :fetch-errors="repos.fetchErrors"
+      :git-missing="gitMissing"
       :empty-message="emptyMessage"
       @toggle="ToggleRow"
       @refresh="RefreshDetail"
       @open="OpenIn"
+      @fetch="FetchRow"
       @sort="view.SortBy"
     />
   </div>
@@ -70,17 +100,19 @@
 import { useNow, watchDebounced } from '@vueuse/core';
 import { computed, inject, ref, watch } from 'vue';
 import AppAlert from '@/components/feedback/AppAlert.vue';
+import FetchProgress from '@/components/feedback/FetchProgress.vue';
 import ScanProgress from '@/components/feedback/ScanProgress.vue';
 import FilterBar from '@/components/repos/FilterBar.vue';
 import RepoTable from '@/components/repos/RepoTable.vue';
 import RootBar from '@/components/repos/RootBar.vue';
 import { OpenIn, RefreshDetail, ToggleRow } from '@/scripts/detail';
+import { CancelFetch, LoadGitInfo, StartFetch } from '@/scripts/fetch';
 import * as ipc from '@/scripts/ipc';
 import { CancelScan, ReconcileOnLaunch, StartScan } from '@/scripts/scan';
 import { indexVersion, searchPaths } from '@/scripts/search';
 import { parseUiSettings } from '@/scripts/settings';
 import { buildView } from '@/scripts/view';
-import { useReposStore } from '@/stores/repos';
+import { type FetchProgress as FetchProgressState, useReposStore } from '@/stores/repos';
 import { useViewStore } from '@/stores/view';
 
 /// Composed
@@ -119,6 +151,15 @@ let persisted = '';
  */
 let hydrating = false;
 
+/**
+ * How many repositories the current fetch was asked for.
+ *
+ * Captured at the click rather than derived from the store, because the store's counts shrink as
+ * results land — a denominator taken from them would fall towards the numerator and the bar would
+ * never move.
+ */
+const fetchTotal = ref(0);
+
 /// Computed
 /**
  * The clock as epoch milliseconds, which is what every row field is measured in.
@@ -135,9 +176,54 @@ const now = computed(() => clock.value.getTime());
 const matches = computed(() => searchPaths(view.query, indexVersion.value));
 
 /**
+ * Rows a chip must never hide: one being fetched, and one whose fetch failed.
+ *
+ * Without this the `stale-fetch` chip makes each row vanish at the moment its result arrives, and
+ * leaves a failed one looking identical to one not yet reached — hiding the only thing on the
+ * screen worth reading.
+ */
+const busyPaths = computed(() => new Set([...repos.fetchingPaths, ...repos.fetchErrors.keys()]));
+
+/**
  * What the table renders, and what it is withholding.
  */
-const repoView = computed(() => buildView(repos.rows, view.settings, now.value, matches.value));
+const repoView = computed(() =>
+  buildView(repos.rows, view.settings, now.value, matches.value, busyPaths.value),
+);
+
+/**
+ * Why fetching is unavailable, or `null` when it is available.
+ *
+ * `undefined` — not yet asked — is deliberately not "missing": saying so before the answer arrives
+ * would disable the controls with an explanation that might be false.
+ */
+const gitMissing = computed(() =>
+  repos.gitInfo === null
+    ? 'No usable `git` was found on PATH. Reading repository status needs none; only fetching does.'
+    : null,
+);
+
+/**
+ * Where the fetch has got to, or `null` when none has run this session.
+ *
+ * Determinate from the first event, because the denominator is the list the frontend handed Rust.
+ * Kept up after the pass so its failures stay readable, and cleared only by the next fetch.
+ */
+const fetchProgress = computed<FetchProgressState | null>(() => {
+  const running = [...repos.fetchStates.values()].filter((state) => state === 'running').length;
+  const outstanding = repos.fetchStates.size;
+  const failed = repos.fetchErrors.size;
+  if (outstanding === 0 && failed === 0) return null;
+
+  return {
+    total: fetchTotal.value,
+    // Settled is the total less what is still queued or running — never a count of what has
+    // started, which would read 100% with four fetches left to finish.
+    settled: Math.max(fetchTotal.value - outstanding, 0),
+    running,
+    failed,
+  };
+});
 
 /**
  * What the table says when it has no rows, which depends on why it has none.
@@ -236,6 +322,39 @@ async function Cancel(): Promise<void> {
 }
 
 /**
+ * Fetches every repository the table is currently showing.
+ *
+ * The paths are snapshotted at the click, not read as the pass runs: the view changes underneath as
+ * results land, and a set that shifted mid-pass would be a different button than the one whose
+ * label the user read.
+ */
+async function Fetch(): Promise<void> {
+  const paths = repoView.value.groups.flatMap((group) => group.rows.map((row) => row.path));
+  fetchTotal.value = paths.length;
+  await StartFetch(paths);
+}
+
+/**
+ * Fetches one repository.
+ *
+ * A single path, which Rust exempts from the repeat guard: clicking one row's button is intent,
+ * where a batch is where "fetching 300 repositories unprompted" applies.
+ *
+ * @param path - The repository to fetch.
+ */
+async function FetchRow(path: string): Promise<void> {
+  fetchTotal.value = 1;
+  await StartFetch([path]);
+}
+
+/**
+ * Stops the running fetch.
+ */
+async function StopFetch(): Promise<void> {
+  await CancelFetch();
+}
+
+/**
  * Writes the view state.
  *
  * A failure is logged and not shown. The user's click has already taken effect on screen — what
@@ -267,6 +386,10 @@ async function Hydrate(): Promise<void> {
     console.warn('could not read the saved view settings', error);
   }
   persisted = JSON.stringify(view.settings);
+
+  // Before the reconcile rather than after it: the fetch controls render immediately and would
+  // otherwise sit enabled for the length of a scan on a machine with no `git`.
+  await LoadGitInfo();
 
   await ReconcileOnLaunch(repos.roots);
 }

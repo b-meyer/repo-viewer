@@ -128,9 +128,13 @@
         :loading="loadingDetail"
         :detail-error="detailError"
         :open-error="openError"
+        :fetch-state="fetchState"
+        :fetch-error="fetchError"
+        :git-missing="gitMissing"
         :now="now"
         @refresh="emit('refresh')"
         @open="emit('open', $event)"
+        @fetch="emit('fetch')"
       />
 
       <!-- No status, so there is nothing to count and nothing to re-read. What is left is the
@@ -141,7 +145,14 @@
         </app-alert>
         <app-unknown v-else reason="pending" hint="Tier 0 has not reached this repository yet." />
 
-        <repo-actions :open-error="openError" @open="emit('open', $event)" />
+        <repo-actions
+          :open-error="openError"
+          :fetch-state="fetchState"
+          :fetch-error="fetchError"
+          :git-missing="gitMissing"
+          @open="emit('open', $event)"
+          @fetch="emit('fetch')"
+        />
       </div>
     </td>
   </tr>
@@ -159,7 +170,7 @@ import RepoStateBadge from '@/components/repos/RepoStateBadge.vue';
 import type { RepoKind } from '@/scripts/generated/RepoKind';
 import type { OpenTarget } from '@/scripts/ipc';
 import { formatAge } from '@/scripts/utils';
-import { type RepoRow, isRead } from '@/stores/repos';
+import { type FetchRowState, type RepoRow, isRead } from '@/stores/repos';
 
 /// Setup
 const props = defineProps<{
@@ -196,6 +207,18 @@ const props = defineProps<{
    */
   openError: string | null;
   /**
+   * Whether a fetch of this row is queued, running, or neither.
+   */
+  fetchState: FetchRowState | null;
+  /**
+   * Why this row's last fetch failed, if it did.
+   */
+  fetchError: string | null;
+  /**
+   * Why fetching is unavailable, or `null` when it is available.
+   */
+  gitMissing: string | null;
+  /**
    * How many columns the table has, for the drawer's `colspan`.
    *
    * Passed rather than restated here: `RepoTable` owns the column list, and a second copy of its
@@ -218,6 +241,10 @@ const emit = defineEmits<{
    * The user asked to open this repository elsewhere.
    */
   open: [target: OpenTarget];
+  /**
+   * The user asked to fetch this repository.
+   */
+  fetch: [];
 }>();
 
 /// Computed

@@ -18,6 +18,9 @@
  * stay camelCase while the actions in `scan.ts` are PascalCase.
  */
 import { Channel, invoke } from '@tauri-apps/api/core';
+import type { FetchEvent } from '@/scripts/generated/FetchEvent';
+import type { FetchId } from '@/scripts/generated/FetchId';
+import type { GitInfo } from '@/scripts/generated/GitInfo';
 import type { RepoEvent } from '@/scripts/generated/RepoEvent';
 import type { RepoStatus } from '@/scripts/generated/RepoStatus';
 import type { ScanEvent } from '@/scripts/generated/ScanEvent';
@@ -178,6 +181,53 @@ export function listRoots(): Promise<string[]> {
  */
 export function openIn(path: string, target: OpenTarget): Promise<void> {
   return invoke<void>('open_in', { path, target });
+}
+
+/**
+ * Fetches every repository in `paths`, and streams what happens to each.
+ *
+ * The **rows** do not arrive here. Rust re-reads each repository it fetched and pushes the merged
+ * row on the session channel, like every other row change — this channel carries outcomes only, so
+ * a caller that just wants the table updated can ignore it.
+ *
+ * A single path is never subject to the repeat guard; a batch is. Rust decides that from the
+ * length, so there is no flag to pass and no way for the two call sites to disagree.
+ *
+ * @param paths - The repositories to fetch. Each must be one Rust already knows.
+ * @param onEvent - Receives each fetch event.
+ * @returns The id of the pass, for {@link cancelFetch}.
+ */
+export function fetchRepos(
+  paths: string[],
+  onEvent: (event: FetchEvent) => void,
+): Promise<FetchId> {
+  const channel = new Channel<FetchEvent>(onEvent);
+  return invoke<FetchId>('fetch_repos', { paths, onEvent: channel });
+}
+
+/**
+ * Stops a fetch pass.
+ *
+ * Cancelling a pass that has already finished is a no-op, because the frontend cannot know it ended
+ * between rendering the button and the click.
+ *
+ * @param id - The pass to stop.
+ */
+export function cancelFetch(id: FetchId): Promise<void> {
+  return invoke<void>('cancel_fetch', { id });
+}
+
+/**
+ * The `git` the app found at startup, or `null` when there is none.
+ *
+ * An affordance for the fetch controls, not a guarantee: Rust resolves `git` again on every fetch,
+ * because a `PATH` can change while the app runs. So this decides whether the buttons are enabled
+ * and what the explanation says, and a fetch can still fail at click time.
+ *
+ * @returns What was found, or `null`.
+ */
+export function gitInfo(): Promise<GitInfo | null> {
+  return invoke<GitInfo | null>('git_info');
 }
 
 /**

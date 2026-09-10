@@ -650,3 +650,141 @@ fn build_tier2_states(root: &Path, origin: &str) {
     git(&parent, &["submodule", "add", origin, "sub"]);
     git(&parent, &["commit", "-m", "add submodule"]);
 }
+
+// ---------------------------------------------------------------------------------------------
+// The fetch tree
+// ---------------------------------------------------------------------------------------------
+
+/// A throwaway origin and whatever clones a test makes of it.
+///
+/// **Deliberately not shared, unlike [`status_tree`].** A fetch *mutates* the repository it runs
+/// in — it moves `refs/remotes/*` and writes `FETCH_HEAD` — so a shared tree would have tests
+/// changing each other's ahead/behind counts, and cargo runs the tests in one binary in parallel.
+/// Building one is a bare `init` and one clone, which is cheap enough that isolation is the
+/// obvious trade.
+pub struct FetchFixture {
+    /// Held for its `Drop`. The directory goes away with it.
+    _dir: TempDir,
+    root: PathBuf,
+    origin: PathBuf,
+}
+
+impl FetchFixture {
+    /// The tree's root, canonicalised.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// A path inside the tree, from `/`-separated components.
+    pub fn path(&self, relative: &str) -> PathBuf {
+        let mut path = self.root.clone();
+        for part in relative.split('/') {
+            path.push(part);
+        }
+        path
+    }
+
+    /// The bare repository every clone here points at.
+    pub fn origin(&self) -> &Path {
+        &self.origin
+    }
+
+    /// Clone the origin into `name`, and return the clone's path.
+    pub fn clone_origin(&self, name: &str) -> PathBuf {
+        git(&self.root, &["clone", &local_url(&self.origin), name]);
+        self.path(name)
+    }
+
+    /// Clone the origin into `name` as a **bare** repository, and return its path.
+    ///
+    /// `clone --bare` is what gives a bare repository an `origin` remote; `init --bare` does not,
+    /// and a bare repository with no remote would test the wrong thing.
+    pub fn clone_origin_bare(&self, name: &str) -> PathBuf {
+        git(
+            &self.root,
+            &["clone", "--bare", &local_url(&self.origin), name],
+        );
+        self.path(name)
+    }
+
+    /// An ordinary repository with one commit and **no remote** — the commonest non-success on a
+    /// developer's tree, and the case the pre-flight answers without spawning anything.
+    pub fn init_without_remote(&self, name: &str) -> PathBuf {
+        git(&self.root, &["init", name]);
+        let path = self.path(name);
+        write_commit(&path, "a.txt", "one\n", "seed");
+        path
+    }
+
+    /// Add `count` commits to the origin's `main`, so every existing clone falls behind.
+    pub fn advance_origin(&self, count: usize) {
+        let seed = self.path("seed");
+        for index in 0..count {
+            write_commit(
+                &seed,
+                &format!("ahead-{index}.txt"),
+                "upstream\n",
+                &format!("upstream commit {index}"),
+            );
+        }
+        git(&seed, &["push", "origin", "main"]);
+    }
+
+    /// Push a branch to the origin, so a clone can fetch a tracking ref for it.
+    pub fn push_branch(&self, name: &str) {
+        let seed = self.path("seed");
+        git(&seed, &["branch", name]);
+        git(&seed, &["push", "origin", name]);
+    }
+
+    /// Delete a branch from the origin, which is what `--prune` is asked to notice.
+    pub fn delete_branch(&self, name: &str) {
+        let seed = self.path("seed");
+        git(&seed, &["push", "origin", "--delete", name]);
+    }
+
+    /// Point a clone's `origin` at somewhere nothing is listening.
+    ///
+    /// **Loopback port 1, never a `.invalid` hostname.** A refused connection needs no DNS and no
+    /// network and is the same everywhere; a `.invalid` lookup depends on the resolver, and a
+    /// corporate one that rewrites NXDOMAIN turns this into a multi-second hang instead of an
+    /// instant failure.
+    pub fn break_remote(&self, repo: &Path) {
+        git(
+            repo,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "http://127.0.0.1:1/nothing.git",
+            ],
+        );
+    }
+
+    /// Run `git` inside the tree and return its trimmed stdout.
+    pub fn git_out(&self, repo: &Path, args: &[&str]) -> String {
+        git_out(repo, args)
+    }
+}
+
+/// Build a fresh origin with one commit, and a `seed` clone that can push to it.
+///
+/// One per test. See [`FetchFixture`] for why this is not a `OnceLock`.
+pub fn fetch_tree() -> FetchFixture {
+    let dir = TempDir::new().expect("create temp dir");
+    let root = dunce::canonicalize(dir.path()).expect("canonicalise temp dir");
+
+    git(&root, &["init", "--bare", "origin.git"]);
+    let origin = root.join("origin.git");
+
+    git(&root, &["clone", &local_url(&origin), "seed"]);
+    let seed = root.join("seed");
+    write_commit(&seed, "a.txt", "one\n", "seed");
+    git(&seed, &["push", "-u", "origin", "main"]);
+
+    FetchFixture {
+        _dir: dir,
+        root,
+        origin,
+    }
+}

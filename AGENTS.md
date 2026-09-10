@@ -32,6 +32,7 @@ because `vp` is not global on an ADO agent — a pipeline detail, not a pattern 
 | Bump a dependency                         | `vp update -L <pkg>`                                                                            |
 | Rust checks                               | `vp run rust` — `cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test`  |
 | Engine without the GUI                    | `cargo run --release --example scan -- <path>` (`--rows`, `--tier2`, `--watch`)                 |
+| Time a fetch (**writes** — needs `--yes`) | `cargo run --release --example scan -- <path> --fetch --yes`                                    |
 | A tree to time against                    | `cargo run --release --example synth -- <dir> [count] [depth]` — generated, so safe to write to |
 
 Imports: configs from `vite-plus`, tests from `vite-plus/test`. **Never `vite` / `vitest`
@@ -44,6 +45,14 @@ Break any of these and the design stops working. They are not style preferences.
 - **`crates/repo-scan/` has no Tauri dependency.** All discovery, Git reads, watching, and fetch
   live there. `src-tauri/` is glue: commands, state, channel adaptation. If engine code needs a
   Tauri type, the boundary is in the wrong place.
+- **The engine spawns no _detached_ threads, and has no `mpsc`.** Cross-thread work is rayon plus
+  atomics plus an `on_*` callback — the callback is the channel. The one exception is `fetch.rs`,
+  whose pool is `std::thread::scope`: a fetch is a blocking subprocess measured in seconds, so
+  putting it on rayon would park workers that Tier 0 and Tier 1 share, and there is no way to
+  bound in-flight work to four across a 300-item `par_iter` except chunking, which serialises
+  within a chunk. Scoped threads keep the property the habit protects — bounded by the concurrency
+  cap, joined before the call returns, unable to outlive their borrows, and a worker panic
+  surfaces at the join rather than vanishing. What is still forbidden is a thread nobody owns.
 - **`src/scripts/ipc.ts` is the only file that imports `@tauri-apps/api`, and no
   `@tauri-apps/plugin-*` package exists in the frontend.** Components and stores go through
   `ipc.ts`; dialog, opener, and store are reached through the app's own commands, from their
@@ -55,7 +64,7 @@ Break any of these and the design stops working. They are not style preferences.
 - **`src-tauri/src/persist.rs` is the only file that uses `tauri_plugin_store`**, beyond the one
   line in `lib.rs` that registers it. Two files under
   it, because they have two lifetimes: `settings.json` is what the user meant — roots, the
-  `openIn` commands, the `watch` settings, and the view state — and is left on the plugin's own
+  `openIn` commands, the `watch` and `fetch` settings, and the view state — and is left on the plugin's own
   auto-save; `cache.json`
   is the whole row map, written once at the end of a scan and again on exit, with auto-save
   **disabled**. Everything else asks `persist` for a value or hands it one.
@@ -148,6 +157,34 @@ Break any of these and the design stops working. They are not style preferences.
   that — which rows are expanded is window state — so `src/scripts/detail.ts`'s `EnsureDetail` is
   called for every expanded row in a session update and re-reads Tier 2 when its counts have gone.
   Without it an open drawer claims work in progress for the rest of the session.
+
+- **A fetch owns the refresh of the repositories it touches, and the watcher must not duplicate
+  it.** A fetch writes `FETCH_HEAD` and `refs/remotes/*`, both of which are in the §7.2 watch set,
+  so every fetch makes the watcher report the repository it just fetched — a 300-repository pass
+  would run 300 redundant Tier 0+1 refreshes on top of the ones the fetch already did.
+  `AppState::begin_fetch_group` takes ownership before the process is spawned, and `live.rs`'s
+  `due_paths` withholds those paths from the refresh it would otherwise drive.
+
+  **The suppression is a deadline, never bare set membership.** A path left in a set by a fetch
+  that panicked, timed out or was dropped stops that repository updating for the rest of the
+  session — silently, because nothing fails and nothing logs. So the entry expires on its own at
+  `timeout + tail`; the explicit release and `FetchGuard`'s sweep are optimisations on top of that
+  floor rather than the only things standing between a user and a dead row. Release keeps a
+  **tail** derived from `debounce_ms`, because the fetch's own writes are still inside the
+  debouncer when the process exits and an immediate release just delays the duplicate.
+
+  **Suppression defers a notice, it does not drop one.** A fetch writes nothing Tier 2 measures, so
+  a fetch alone must not invalidate — but the notice it suppressed might have been the user's own
+  `git add`, and `resolve` does not report which file moved. So the entry records that a notice
+  arrived and `end_fetch_group` reports it, and Tier 2 is invalidated then. The rule above survives
+  verbatim: the watcher's evidence is still the only thing that invalidates, just delivered late.
+  It is a derivation rather than a new exception, and the difference is observable — with
+  `watch.enabled: false` no notice arrives, nothing defers, and a fetch behaves exactly like
+  `refresh_repo`, which is what it is.
+
+  In the filter chain, **suppression is checked before the cooldown**. `Cooldown::due` _records_
+  `now` when it answers `true`, so the other order burns a suppressed path's slot on a refresh that
+  never happens, and the first genuine event after release is dropped for another 750 ms.
 
 - **Uncomputed tiers render as unknown, never as `0`.** Every tiered field is `Option`, and the UI
   must say "counting…" rather than showing a number it does not have. This is the most common bug
@@ -261,12 +298,19 @@ the pipeline — which is the thing this section forbids. `full_status` merges i
 whole row; `refresh_repo(path, tier)` re-reads tiers `0..=tier` and both returns the row and pushes
 it on the session channel.
 
-The read itself is `live::refresh_one`, and it has two callers: that command, and the watcher's
-refresh thread. Neither reimplements it, which is what keeps a user-requested refresh and a
-watcher-driven one from disagreeing about what a refresh is. The **poll** deliberately does not use
-it — a whole-tree pass wants `read_tier0_all_with`'s rayon fan-out rather than three hundred
-sequential opens — so what the three triggers share is Rust-side ownership and the merge-then-push,
-not one function.
+The read itself is `live::refresh_one`, and it has three callers: that command, the watcher's
+refresh thread, and the fetch driver's drain loop. None of them reimplements it, which is what
+keeps a user-requested refresh, a watcher-driven one and a post-fetch one from disagreeing about
+what a refresh is. The **poll** deliberately does not use it — a whole-tree pass wants
+`read_tier0_all_with`'s rayon fan-out rather than three hundred sequential opens — so what the four
+triggers share is Rust-side ownership and the merge-then-push, not one function.
+
+**A fetch is the fourth trigger, and it takes Tier 1.** Not a `last_fetched_ms` patch: a fetch moves
+`behind`, can move `ahead`, moves the tracking ref's tip, and with `--prune` can remove `upstream`
+outright, so writing one field would leave four stale beside it — §8.2's premise inverted. Tier 1
+rather than Tier 0 because the fetch **suppresses the watcher** for the repositories it touches
+(see the invariant below), and the watcher's notice is what would otherwise have caught a `git add`
+made while the fetch ran.
 
 ## Hard rules
 
@@ -534,11 +578,23 @@ asset. The count is what `git stash list` reads: the `refs/stash` reflog, one li
 whose own docs call it expensive and only suitable for the last few entries. An absent `refs/stash`
 is a count of zero, not a failure — it is the overwhelmingly common case.
 
-**`FETCH_HEAD` lives in the common directory, not the Git directory.** For a linked worktree
-`Repository::git_dir()` is the private `worktrees/<name>` directory, which never holds one, so
-reading it there reports "never fetched" forever. Use `Repository::common_dir()`. `state()` is the
-opposite case — it reads `git_dir()`, which is correct, because a parked rebase _is_ per-worktree.
-The two accessors are not interchangeable.
+**`FETCH_HEAD` is written to the Git directory of whichever worktree ran the fetch, so neither
+directory alone is the answer.** For a normal repository the two are the same path and the
+question does not arise. For a linked worktree it cuts both ways, and it is measured on git
+2.54.0.windows.1 in both directions: a fetch run in the **parent** leaves a `FETCH_HEAD` in the
+common directory and none in the worktree's private `worktrees/<name>` directory, and a fetch run
+**in the worktree** leaves one in the private directory and none in the common one. The
+`refs/remotes/*` both of them update are shared either way, which is why fetching a worktree moves
+its parent's ahead/behind too.
+
+So `tier0::fetch_head_ms` takes **both** and returns the newer. Reading only the common directory
+is the obvious simplification and it is wrong: it reports "never fetched" for a repository fetched
+a second ago, in the one field whose whole job is to say how stale the counts beside it are.
+`crates/repo-scan/tests/fetch.rs` pins both directions.
+
+`state()` is the genuinely one-sided case — it reads `git_dir()`, which is correct, because a
+parked rebase _is_ per-worktree. The two accessors are not interchangeable, and `FETCH_HEAD` needs
+neither of them on its own.
 
 **`gix::state::InProgress` has ten variants; `RepoState` has five plus `Clean`.** Map it with **no
 wildcard arm**, so a new variant on the next `gix` bump is a compile error rather than a silent
@@ -721,17 +777,68 @@ Linux the window state lands in `~/.config/<identifier>` and `settings.json` in
 **Windows' `PATH` search inside `std::process::Command` only appends `.exe`.** So
 `Command::new("code")` cannot find `code.cmd` — the shim every VS Code install actually puts on
 `PATH` — and fails with "program not found" as though nothing were installed.
-`commands/open.rs`'s `resolve_in` walks `PATH` against `PATHEXT` instead, which is what the shell
-does. Going through `cmd.exe /C` also works and is the obvious fix; it is not used, because it puts
-a second layer of argument parsing between a repository path and the program meant to receive it.
-Note that the resolved path carries the casing of the extension that matched rather than the one on
-disk — `code.CMD` for a `code.cmd` — because Windows compares them case-insensitively, so a test
-asserting the exact path fails for a reason that has nothing to do with the lookup.
+`crates/repo-scan/src/exe.rs`'s `resolve_program` walks `PATH` against `PATHEXT` instead, which is
+what the shell does. Going through `cmd.exe /C` also works and is the obvious fix; it is not used,
+because it puts a second layer of argument parsing between a repository path and the program meant
+to receive it. Note that the resolved path carries the casing of the extension that matched rather
+than the one on disk — `code.CMD` for a `code.cmd` — because Windows compares them
+case-insensitively, so a test asserting the exact path fails for a reason that has nothing to do
+with the lookup.
+
+It lives in the **engine** because two crates need it: `commands/open.rs` resolves the configured
+editor and terminal, and `fetch.rs` resolves `git`. `examples/scan.rs` needs it with no
+application around it at all, which is what settles the direction.
 
 **`CREATE_NO_WINDOW` is exactly wrong for a terminal.** Every `git` invocation needs it or the
 fetch flashes a console; a spawned terminal must not have it, because the console is the point of
-the launch. Same platform, same flag, opposite answers — which is why `commands/open.rs` decides it
-per target rather than setting it once in a helper.
+the launch. Same platform, same flag, opposite answers — which is why `commands/open.rs` and
+`fetch.rs` each declare the constant and decide it per target, rather than sharing one helper that
+would have to take the answer as a parameter anyway.
+
+**A piped stderr you do not read while the child runs is a deadlock.** `fetch.rs` pipes `git`'s
+stderr and reads it only after the process exits, which is safe **because** of `--quiet` and
+because git suppresses progress output when stderr is not a tty — so what it writes is a line or
+two, orders of magnitude under any platform's pipe buffer. Adding `--progress` for a nicer log
+line reintroduces a genuine deadlock:
+git blocks writing to a full pipe, never exits, and the per-process deadline then kills a fetch
+that was working. It presents as "only large repositories time out".
+
+**`git fetch` runs auto-maintenance, exactly as `git commit` does.** Without
+`-c gc.auto=0 -c maintenance.auto=false` a bulk fetch can spend most of its wall clock repacking,
+and because a repack is unbounded the largest repositories are the ones that come back
+`TimedOut`. The config form rather than `--no-auto-maintenance` because it does not depend on how
+old the user's `git` is, and because it reaches anything `git` spawns for itself.
+
+**`GIT_TERMINAL_PROMPT=0` does not cover a credential helper's GUI or `ssh`.** It stops git's own
+username/password prompt and nothing else. Git Credential Manager runs _before_ that prompt and
+pops a window of its own — the likeliest prompt on a Windows dev box — so `GCM_INTERACTIVE=never`
+and `-c credential.interactive=false` go alongside it, and `SSH_ASKPASS_REQUIRE=never` covers a
+graphical askpass. `ssh`'s own host-key and passphrase prompts are **not** closed by any of them:
+overriding `core.sshCommand` to add `-o BatchMode=yes` would stomp a user's jump-host
+configuration, which is the thing §8.2 chose the CLI to preserve. The per-process **timeout** is
+the only universal backstop, which is why it is not optional.
+
+**Never `env_clear()` a `git` subprocess.** Sanitising a subprocess environment is a reflex and it
+would destroy the reason for using the CLI at all: `GIT_SSH_COMMAND`, `SSH_AUTH_SOCK`,
+`HTTP(S)_PROXY`, `HOME` and the credential-helper configuration all arrive that way. Note the
+deliberate contrast with `tests/support/fixtures.rs`, which points `GIT_CONFIG_GLOBAL` at a file
+that does not exist — correct for a fixture, catastrophic in the app.
+
+**`Child::kill` terminates the direct child only.** It is `TerminateProcess` on that one handle,
+and `git.exe` spawns `git-remote-https.exe` or `ssh.exe` of its own, so a timed-out or cancelled
+fetch can leave a transport process alive for a moment after the fetch has been reported. It is
+expected to be self-limiting — the transport's inherited stderr pipe closes as the `Child` drops
+— but that has not been measured here, so treat it as "not instant" rather than as a bound: a
+test asserting "no git processes remain" immediately after a kill will flake.
+
+**A row resurrected by a fetch completing after eviction is permanent.** `merge_tier0` inserts
+where there was no row, deliberately, so `refresh_repo` can retry a §8.1 total failure. A fetch
+takes seconds, and `remove_root` or a completing scan's `retain_scanned` can land inside that
+window — merging the result afterwards re-inserts a row under no configured root, which
+`retain_scanned` can never evict again because it is scoped to the roots it walked, and which then
+survives into `cache.json` and comes back next launch. Silent, permanent, and caused by a
+documented feature. Every completion path re-checks `state.discovered(path)` immediately before
+merging — the same guard `live.rs`'s refresh loop uses, for the same reason.
 
 **`vue-tsc` type-checks the props object, so a fallthrough attribute on an `App*` wrapper is a
 compile error.** Passing `:title` to a wrapper that does not declare it fails the typecheck even

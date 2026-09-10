@@ -1,6 +1,7 @@
 import { defineStore } from 'pinia';
 import { computed, ref } from 'vue';
 import type { DiscoveredRepo } from '@/scripts/generated/DiscoveredRepo';
+import type { GitInfo } from '@/scripts/generated/GitInfo';
 import type { RepoStatus } from '@/scripts/generated/RepoStatus';
 import type { ScanError } from '@/scripts/generated/ScanError';
 import type { ScanSummary } from '@/scripts/generated/ScanSummary';
@@ -20,6 +21,40 @@ export type RepoRow = DiscoveredRepo | RepoStatus;
  * How far a scan has got. A boolean could not express `cancelled`.
  */
 export type ScanPhase = 'idle' | 'discovering' | 'reading' | 'done' | 'cancelled' | 'failed';
+
+/**
+ * Where one row is in a fetch pass.
+ *
+ * Two states rather than a boolean, because a concurrency cap means a repository can wait minutes
+ * before its process starts, and rendering that as "running" claims work that is not happening.
+ */
+export type FetchRowState = 'queued' | 'running';
+
+/**
+ * What the fetch progress indicator needs, in one object.
+ */
+export type FetchProgress = {
+  /**
+   * How many repositories the pass was asked for. Known before the first process starts, which is
+   * why this bar is determinate where the scan's is not.
+   */
+  total: number;
+  /**
+   * How many have **settled** — succeeded, failed, or been skipped.
+   *
+   * Never how many have started: with four running at the end, a started-count bar would read 100%
+   * with a minute of work left.
+   */
+  settled: number;
+  /**
+   * How many have a process running right now.
+   */
+  running: number;
+  /**
+   * How many failed. Shown beside the bar, because the bar cannot carry it.
+   */
+  failed: number;
+};
 
 /**
  * What the progress indicator needs, in one object.
@@ -156,6 +191,37 @@ export const useReposStore = defineStore('repos', () => {
   const openErrors = ref(new Map<string, string>());
 
   /**
+   * Which rows have a fetch queued or running, by path. Absence is neither.
+   *
+   * One map rather than two sets, because "queued" and "running" are one question about a row and
+   * two sets could disagree about it. Unlike {@link loadingDetail} a fetch has a middle: with a
+   * concurrency cap a repository can legitimately sit unstarted for minutes, and saying "running"
+   * for it would be a claim that work is in progress when none is.
+   */
+  const fetchStates = ref(new Map<string, FetchRowState>());
+
+  /**
+   * Why a row's last fetch failed, by path.
+   *
+   * A fourth error map, and the rule that keeps all four apart is that **each is owned by one
+   * operation and cleared by that operation's next attempt**. A fetch failure is not a failed read
+   * ({@link detailErrors}), not a failed launch ({@link openErrors}), and not page-wide
+   * ({@link scanError}).
+   *
+   * It cannot go on `RepoStatus.error`: Tier 0 owns that slot and replaces it, so the fetch's own
+   * Tier 0 re-read would erase the failure milliseconds after recording it.
+   */
+  const fetchErrors = ref(new Map<string, string>());
+
+  /**
+   * The `git` the app found at startup, or `null` when there is none.
+   *
+   * `undefined` until asked, which is not the same as `null` and must not render as "not installed"
+   * before the answer arrives.
+   */
+  const gitInfo = ref<GitInfo | null | undefined>(undefined);
+
+  /**
    * A failed command — not a per-repository failure, which rides on the row itself.
    */
   const scanError = ref<string | null>(null);
@@ -225,7 +291,59 @@ export const useReposStore = defineStore('repos', () => {
    */
   const tier0Done = computed(() => totals.value !== null);
 
+  /**
+   * Whether any row has a fetch queued or running.
+   */
+  const fetching = computed(() => fetchStates.value.size > 0);
+
+  /**
+   * The paths a fetch pass is still working on.
+   */
+  const fetchingPaths = computed(() => new Set(fetchStates.value.keys()));
+
   /// Methods
+
+  /**
+   * Marks a row as queued, running, or neither.
+   *
+   * @param path - The repository.
+   * @param state - Its new state, or `null` when the fetch has settled.
+   */
+  function SetFetchState(path: string, state: FetchRowState | null): void {
+    if (state === null) fetchStates.value.delete(path);
+    else fetchStates.value.set(path, state);
+  }
+
+  /**
+   * Records why a row's fetch failed.
+   *
+   * @param path - The repository.
+   * @param message - The failure, or `null` to clear it.
+   */
+  function SetFetchError(path: string, message: string | null): void {
+    if (message === null) fetchErrors.value.delete(path);
+    else fetchErrors.value.set(path, message);
+  }
+
+  /**
+   * Clears every row's fetch state.
+   *
+   * The terminal event calls this, which is what discharges the claim `queued` makes: a row left on
+   * it for the life of a session would say work is coming that never is. Failures are **not**
+   * cleared — they are what the user is meant to read afterwards.
+   */
+  function ClearFetchStates(): void {
+    fetchStates.value.clear();
+  }
+
+  /**
+   * Records what `git` the app found.
+   *
+   * @param info - What was found, or `null` when there is none.
+   */
+  function SetGitInfo(info: GitInfo | null): void {
+    gitInfo.value = info;
+  }
   /**
    * Replaces one row with the version Rust sent.
    *
@@ -275,6 +393,11 @@ export const useReposStore = defineStore('repos', () => {
    * `expanded` survives on purpose: it describes what the user has open, and a rescan of the same
    * tree should not collapse their drawers. Everything derived from the _previous_ scan's reads
    * goes, including the Tier 2 failures — a fresh scan is a fresh chance for that read to work.
+   *
+   * **The fetch state survives too, and for a different reason.** Every other map here describes
+   * work that has finished; `fetchStates` describes work still running in Rust. A launch reconcile
+   * starting must not claim a fetch stopped, because it did not — only the fetch's own terminal
+   * event knows that, and clearing here would strand the row's spinner either way.
    */
   function ResetSummaries(): void {
     discovery.value = null;
@@ -421,6 +544,9 @@ export const useReposStore = defineStore('repos', () => {
     loadingDetail,
     detailErrors,
     openErrors,
+    fetchStates,
+    fetchErrors,
+    gitInfo,
     scanError,
     watchError,
     roots,
@@ -430,6 +556,8 @@ export const useReposStore = defineStore('repos', () => {
     scanning,
     progress,
     tier0Done,
+    fetching,
+    fetchingPaths,
     Upsert,
     UpsertMany,
     Remove,
@@ -444,6 +572,10 @@ export const useReposStore = defineStore('repos', () => {
     SetLoadingDetail,
     SetDetailError,
     SetOpenError,
+    SetFetchState,
+    SetFetchError,
+    ClearFetchStates,
+    SetGitInfo,
     SetScanError,
     SetWatchError,
     SetRoots,

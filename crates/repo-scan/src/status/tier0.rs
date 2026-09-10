@@ -157,9 +157,8 @@ pub fn read_tier0(found: &DiscoveredRepo) -> Result<RepoStatus> {
     let state =
         optional(git_dir, &mut failures, || Ok(read_state(&repo))).unwrap_or(RepoState::Clean);
 
-    // FETCH_HEAD is per-repository, not per-worktree, so it lives in the common directory. For a
-    // linked worktree `git_dir()` is the private `worktrees/<name>` directory, which has none.
-    let last_fetched_ms = fetch_head_ms(repo.common_dir());
+    // Both directories, newest wins. See `fetch_head_ms` — neither alone is the answer.
+    let last_fetched_ms = fetch_head_ms(repo.git_dir(), repo.common_dir());
 
     Ok(RepoStatus {
         path: found.path.clone(),
@@ -379,12 +378,42 @@ fn read_state(repo: &gix::Repository) -> RepoState {
     }
 }
 
-/// Modification time of `FETCH_HEAD`, epoch milliseconds.
+/// Modification time of the newest `FETCH_HEAD`, epoch milliseconds.
 ///
 /// `None` when the repository has never been fetched. Ahead/behind is measured against
 /// `refs/remotes/*`, so this is the age of that measurement and must be shown beside it.
-fn fetch_head_ms(common_dir: &Path) -> Option<u64> {
-    let modified = std::fs::metadata(common_dir.join("FETCH_HEAD"))
+///
+/// # Both directories, and neither one alone is right
+///
+/// `git fetch` writes `FETCH_HEAD` into the git directory of **whichever worktree ran it**, while
+/// the `refs/remotes/*` it updates are shared. For a normal repository the two directories are the
+/// same path and the distinction does not exist. For a linked worktree it does, and it cuts both
+/// ways: a fetch run in the parent leaves one in the common directory and none in the worktree's
+/// private directory, and a fetch run in the worktree leaves one in the private directory and
+/// none in the common one. Either file can therefore be the most recent evidence, and reading
+/// only one reports "never fetched" for a repository that was fetched seconds ago — in the field
+/// whose entire job is to say how stale the counts beside it are.
+///
+/// Measured on git 2.54.0.windows.1, in both directions.
+///
+/// `pub(crate)` for [`crate::fetch`], whose repeat-fetch guard asks the same question of the same
+/// files, and must get the same answer.
+pub(crate) fn fetch_head_ms(git_dir: &Path, common_dir: &Path) -> Option<u64> {
+    let one = read_fetch_head_ms(git_dir);
+    if git_dir == common_dir {
+        return one;
+    }
+    let other = read_fetch_head_ms(common_dir);
+
+    match (one, other) {
+        (Some(one), Some(other)) => Some(one.max(other)),
+        (found, None) | (None, found) => found,
+    }
+}
+
+/// Modification time of one directory's `FETCH_HEAD`.
+fn read_fetch_head_ms(dir: &Path) -> Option<u64> {
+    let modified = std::fs::metadata(dir.join("FETCH_HEAD"))
         .ok()?
         .modified()
         .ok()?;

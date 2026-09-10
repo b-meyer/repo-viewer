@@ -4,6 +4,13 @@
 //!     cargo run --release --example scan -- C:/Working --rows
 //!     cargo run --release --example scan -- C:/Working --tier2
 //!     cargo run --release --example scan -- C:/Working --watch
+//!     cargo run --release --example scan -- C:/Working --fetch --yes
+//!
+//! **`--fetch` is the one flag here that writes.** Every other mode reads; that one runs
+//! `git fetch` in every repository under the given path, over whatever network those repositories
+//! point at, in a developer's own working tree. It therefore refuses to do anything without
+//! `--yes` beside it. There is no equivalent guard on the read flags because there is nothing to
+//! guard.
 //!
 //! This exists to produce the timing number the whole design defends, to debug one repository
 //! without a webview in the way, and to check behaviour in a CI container. Cargo compiles
@@ -30,7 +37,7 @@ use repo_scan::{
 fn main() -> ExitCode {
     let mut args = env::args_os().skip(1);
     let Some(root) = args.next().map(PathBuf::from) else {
-        eprintln!("usage: scan <path> [--rows] [--tier2] [--watch]");
+        eprintln!("usage: scan <path> [--rows] [--tier2] [--watch] [--fetch --yes]");
         return ExitCode::FAILURE;
     };
     let flags: Vec<_> = args.collect();
@@ -40,6 +47,19 @@ fn main() -> ExitCode {
     // be measuring something the app never does.
     let tier2 = flags.iter().any(|arg| arg == "--tier2");
     let watch = flags.iter().any(|arg| arg == "--watch");
+    // The only writing mode. Guarded, because the others cannot do harm and this one runs `git
+    // fetch` against real remotes in a real working tree.
+    let fetch = flags.iter().any(|arg| arg == "--fetch");
+    let confirmed = flags.iter().any(|arg| arg == "--yes");
+
+    if fetch && !confirmed {
+        eprintln!(
+            "--fetch runs `git fetch` in every repository under {}, over the network.\n\
+             Add --yes if that is what you want.",
+            root.display()
+        );
+        return ExitCode::FAILURE;
+    }
 
     if !root.is_dir() {
         eprintln!("not a directory: {}", root.display());
@@ -114,6 +134,11 @@ fn main() -> ExitCode {
         print_watch(&repos);
     }
 
+    if fetch {
+        println!();
+        print_fetch(&repos);
+    }
+
     if rows {
         println!();
         print_rows(&statuses);
@@ -174,6 +199,83 @@ fn print_watch(repos: &[DiscoveredRepo]) {
         "  release:   {} ms to unwatch everything",
         releasing.elapsed().as_millis()
     );
+}
+
+/// Fetch the whole tree and report what it cost, per outcome.
+///
+/// The wall clock here is dominated by the network and by the concurrency cap, not by this crate,
+/// so the number worth reading is the **spread**: a tree of local clones finishes in milliseconds
+/// and one real VPN'd monorepo can hold the whole pass for a minute. That is exactly why the app
+/// counts a repository as done when it has *settled* rather than when it has started.
+///
+/// Outcomes are counted rather than listed, except the failures — a hundred lines of `ok` is not
+/// a report. `NoRemote` is broken out because on a developer's tree it is usually the largest
+/// bucket and it costs no process at all, which is the pre-flight earning its place.
+fn print_fetch(repos: &[DiscoveredRepo]) {
+    let Some(git) = repo_scan::probe_git() else {
+        println!("fetch:     no usable `git` on PATH");
+        return;
+    };
+    println!("fetch:     {} ({})", git.version, git.path.display());
+
+    let opts = repo_scan::FetchOpts {
+        program: git.path,
+        ..repo_scan::FetchOpts::default()
+    };
+
+    let started = std::time::Instant::now();
+    let mut failures: Vec<repo_scan::ScanError> = Vec::new();
+    let mut slowest: Option<(u64, PathBuf)> = None;
+    let mut no_remote = 0_u32;
+
+    let collected = std::sync::Mutex::new(Vec::new());
+    let summary = repo_scan::fetch_all_with(repos, &opts, &AtomicBool::new(false), |notice| {
+        if let repo_scan::FetchNotice::Done(result) = notice {
+            collected.lock().expect("not poisoned").push(result);
+        }
+    });
+
+    for result in collected.into_inner().expect("not poisoned") {
+        match result.status {
+            repo_scan::FetchStatus::Ok => {}
+            repo_scan::FetchStatus::NoRemote => no_remote += 1,
+            _ => failures.push(repo_scan::ScanError {
+                path: result.path.clone(),
+                message: format!(
+                    "{:?}: {}",
+                    result.status,
+                    result.detail.clone().unwrap_or_default()
+                ),
+            }),
+        }
+        if slowest
+            .as_ref()
+            .is_none_or(|(ms, _)| result.elapsed_ms > *ms)
+        {
+            slowest = Some((result.elapsed_ms, result.path));
+        }
+    }
+
+    let wall = started.elapsed();
+    println!(
+        "  spawned:   {} of {} repos, {} concurrent",
+        summary.attempted,
+        repos.len(),
+        opts.concurrency
+    );
+    println!(
+        "  ok:        {}, failed {}, skipped {} (of which {no_remote} have no remote)",
+        summary.succeeded, summary.failed, summary.skipped
+    );
+    println!(
+        "  wall:      {} ms, {:.1} ms per repo attempted",
+        wall.as_millis(),
+        wall.as_secs_f64() * 1000.0 / f64::from(summary.attempted.max(1))
+    );
+    if let Some((ms, path)) = slowest {
+        println!("  slowest:   {ms} ms — {}", path.display());
+    }
+    print_errors("fetch", &failures);
 }
 
 /// Time Tier 2 one repository at a time, and report the spread.

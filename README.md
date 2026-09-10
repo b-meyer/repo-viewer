@@ -19,8 +19,11 @@ the dirty flag and conflicted count from the worktree. Expanding a row reads its
 counts and submodule list on demand, and keeps them when it is collapsed again. Rows then keep
 themselves current: a commit or a fetch in another window updates its row without a rescan, with a
 one-minute poll and a refresh-on-focus underneath in case the filesystem watcher misses something.
-Scans are cancellable and roots are managed in-app. The engine also still works without a GUI,
-through the `scan` example. Each phase gets its own runbook in `docs/` while it is being worked on.
+And the ahead/behind counts can be **made** current rather than only dated — a button per row and
+one in the toolbar run `git fetch`, four at a time, against whatever credential helper and SSH
+config you already have. Scans and fetches are cancellable and roots are managed in-app. The engine
+also still works without a GUI, through the `scan` example. Each phase gets its own runbook in
+`docs/` while it is being worked on.
 
 ---
 
@@ -63,10 +66,10 @@ flowchart TB
     end
 
     subgraph L7["7 &nbsp;Side channels &mdash; subprocess and OS, all driven from Rust"]
-        L7A["git CLI subprocess<br/>fetch / pull / push ONLY<br/>real credential helpers, SSH config, proxies<br/>CREATE_NO_WINDOW, GIT_TERMINAL_PROMPT=0, timeout"]
+        L7A["git CLI subprocess &mdash; FETCH ONLY, the one thing this app writes<br/>real credential helpers, SSH config, proxies<br/>scoped thread pool, 4 at once &middot; CREATE_NO_WINDOW &middot; no prompts &middot; 60 s timeout<br/>the watcher is suppressed per repo while its fetch runs"]
         L7B["tauri-plugin-opener 2.5.5<br/>reveal in the file manager &mdash; the shell's own API<br/>path must be one discovery found"]
         L7C["configured editor / terminal, spawned<br/>command from settings.json, PATH resolved as a shell would<br/>CREATE_NO_WINDOW for the editor and NOT for the terminal<br/>path must be one discovery found"]
-        L7D["tauri-plugin-store 2.4.4<br/>settings.json &mdash; roots, open-in commands, live-update settings, view state<br/>cache.json &mdash; both row maps, so a launch paints at once"]
+        L7D["tauri-plugin-store 2.4.4<br/>settings.json &mdash; roots, open-in commands, live-update and fetch settings, view state<br/>cache.json &mdash; both row maps, so a launch paints at once"]
     end
 
     OUT["Rows paint progressively, tier by tier, back up through Channel to the repo table.<br/>Tiers not yet computed render as unknown &mdash; never as 0."]
@@ -106,8 +109,9 @@ Nothing. The frontend is bundled into the native binary — no Node, no Rust.
 Ubuntu 20.04 and Debian 11 are **not supported** — Tauri 2 needs webkit2gtk **4.1**, which those
 releases do not ship. See [PLAN.md §10](./PLAN.md) for the full platform matrix.
 
-The `git` CLI is needed only for fetch/pull/push. Viewing status works without it; those actions
-disable themselves with an explanation if it is absent.
+The `git` CLI is needed only for fetching. Viewing status works without it — that is all
+in-process — and the fetch buttons disable themselves with an explanation if it is absent. The app
+looks for it once at startup and again on every fetch, so installing it does not need a restart.
 
 Opening a repository in an editor or a terminal runs whatever `settings.json` names — VS Code and
 Windows Terminal by default. Neither is required: if the command is missing the button reports why,
@@ -167,11 +171,11 @@ to `allowBuilds:` in `pnpm-workspace.yaml`.
 
 The app keeps three files under its identifier, `net.citsolutions.repoviewer`:
 
-| File                 | What it holds                                                                        |
-| -------------------- | ------------------------------------------------------------------------------------ |
-| `settings.json`      | the folders it scans, the open-in commands, the live-update settings, the view state |
-| `cache.json`         | the last scan's rows, so a launch paints before it rescans                           |
-| `.window-state.json` | window position and size, written by the window-state plugin                         |
+| File                 | What it holds                                                                                  |
+| -------------------- | ---------------------------------------------------------------------------------------------- |
+| `settings.json`      | the folders it scans, the open-in commands, the live-update and fetch settings, the view state |
+| `cache.json`         | the last scan's rows, so a launch paints before it rescans                                     |
+| `.window-state.json` | window position and size, written by the window-state plugin                                   |
 
 On Windows that directory is `%APPDATA%\net.citsolutions.repoviewer`, and on macOS
 `~/Library/Application Support/net.citsolutions.repoviewer`. On Linux the first two are under
@@ -229,6 +233,38 @@ watching `node_modules`. So an edit shows up when you stage it, and until then t
 notices. If watching cannot start at all, the window says so and says that rows now update on the
 timer instead.
 
+**Fetching is edited by hand too**, and its defaults are written on a first run the same way:
+
+```json
+{
+  "fetch": {
+    "concurrency": 4,
+    "timeoutSeconds": 60,
+    "minIntervalSeconds": 300,
+    "prune": true,
+    "allRemotes": true
+  }
+}
+```
+
+Nothing here ever fetches on its own: there is a button per row and one in the toolbar, and that is
+all. The toolbar's button fetches **what the table is showing**, so filtering to the stale
+repositories and then fetching them is one gesture — its label says which, and how many.
+
+`concurrency` is how many `git` processes run at once, and `timeoutSeconds` is when one is given up
+on. Both are clamped at both ends, because the values that hurt here are not only your own problem:
+a hundred concurrent fetches is a hundred sockets against somebody else's server, and no timeout at
+all is a fetch that waits forever on an SSH passphrase prompt nobody can see. `minIntervalSeconds`
+skips a repository the **toolbar** button fetched that recently — a single row's button is never
+skipped — and `0` turns that off. A failed fetch never counts as recent, so retrying the failures
+works immediately. `prune` deletes remote-tracking branches whose remote branch is gone, which is
+what stops "behind" counting against something that no longer exists; it never touches your own
+tags. Unlike the live-update settings, **these take effect on the next fetch** rather than the next
+launch.
+
+A fetch needs the `git` CLI. If there is none the buttons are disabled and the window says so, and
+because it is looked for again on every fetch, installing it does not need a restart.
+
 ---
 
 ## Layout
@@ -257,8 +293,8 @@ repo-viewer/
 │   ├── components/               #
 │   │   ├── inputs/               #    App*.vue reka-ui wrappers — always use at call sites
 │   │   ├── repos/                #    RepoTable, RepoRow, RepoDetail, RepoActions, FilterBar, RootBar …
-│   │   └── feedback/             #    AppUnknown, AppAlert, ScanProgress, ScanErrors
-│   ├── scripts/                  # ipc.ts, router.ts, scan.ts, detail.ts, view.ts, search.ts, settings.ts, utils.ts
+│   │   └── feedback/             #    AppUnknown, AppAlert, ScanProgress, FetchProgress, ScanErrors
+│   ├── scripts/                  # ipc.ts, router.ts, scan.ts, fetch.ts, detail.ts, view.ts, search.ts, settings.ts, utils.ts
 │   │   └── generated/            # ts-rs output, committed
 │   ├── stores/                   # Pinia: repos (rows, mirrored), view (chips, sort, grouping)
 │   ├── styles/                   # main.css, theme.css (custom palette)
@@ -274,8 +310,9 @@ repo-viewer/
 │       │   ├── discover/         # parallel walk, prune, .git → DiscoveredRepo
 │       │   ├── status/           # tier0.rs, tier1.rs, tier2.rs, ahead_behind.rs
 │       │   ├── watch/            # one debounced watcher: the watch set, the reverse index
-│       │   └── fetch.rs          # ← Phase 7: git CLI subprocess
-│       └── tests/                # discover.rs, tier0.rs, watch.rs + support/fixtures.rs, built into TempDirs
+│       │   ├── fetch.rs          # git CLI subprocess: the one place the engine writes
+│       │   └── exe.rs            # PATH+PATHEXT lookup, shared with the editor launcher
+│       └── tests/                # discover.rs, tier0-2.rs, watch.rs, fetch.rs + support/fixtures.rs, built into TempDirs
 │
 └── src-tauri/                    # ── THIN shell. Tauri glue only.
     ├── build.rs
@@ -289,9 +326,10 @@ repo-viewer/
         ├── stream.rs             # batching for tauri::ipc::Channel sends
         ├── pipeline.rs           # the scan driver: discovery → batch → Tier 0 → merge
         ├── live.rs               # the watcher drain, the poll, the focus refresh
+        ├── fetch.rs              # the fetch driver: the engine's pool → re-read → two channels
         ├── persist.rs            # settings.json + cache.json — the only consumer of the store plugin
         ├── error.rs              # CommandError: anyhow across the IPC boundary
-        └── commands/            # session, scan, roots, repo, open, settings  (+ fetch — Phase 7)
+        └── commands/             # session, scan, roots, repo, open, fetch, settings
 ```
 
 Coming from .NET: there is no `.sln` and no `.csproj`. The root `Cargo.toml` is the workspace

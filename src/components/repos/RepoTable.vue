@@ -50,10 +50,14 @@
           :loading-detail="loadingDetail.has(row.path)"
           :detail-error="detailErrors.get(row.path) ?? null"
           :open-error="openErrors.get(row.path) ?? null"
+          :fetch-state="fetchStates.get(row.path) ?? null"
+          :fetch-error="fetchErrors.get(row.path) ?? null"
+          :git-missing="gitMissing"
           :colspan="COLUMNS.length"
           @toggle="emit('toggle', row.path)"
           @refresh="emit('refresh', row.path)"
           @open="emit('open', row.path, $event)"
+          @fetch="emit('fetch', row.path)"
         />
       </tbody>
     </table>
@@ -66,6 +70,7 @@ import RepoRow from '@/components/repos/RepoRow.vue';
 import type { OpenTarget } from '@/scripts/ipc';
 import type { SortDirection, SortKey } from '@/scripts/settings';
 import type { RepoGroup } from '@/scripts/view';
+import type { FetchRowState } from '@/stores/repos';
 
 /// Setup
 const props = defineProps<{
@@ -117,6 +122,18 @@ const props = defineProps<{
    */
   openErrors: Map<string, string>;
   /**
+   * Which rows have a fetch queued or running, by path.
+   */
+  fetchStates: Map<string, FetchRowState>;
+  /**
+   * Why each row's last fetch failed, by path.
+   */
+  fetchErrors: Map<string, string>;
+  /**
+   * Why fetching is unavailable, or `null` when it is available.
+   */
+  gitMissing: string | null;
+  /**
    * What to say when there is nothing to show.
    */
   emptyMessage: string;
@@ -135,6 +152,10 @@ const emit = defineEmits<{
    * A row asked to be opened in an external tool.
    */
   open: [path: string, target: OpenTarget];
+  /**
+   * A row asked to be fetched.
+   */
+  fetch: [path: string];
   /**
    * A column header was clicked.
    */

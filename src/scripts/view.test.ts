@@ -144,6 +144,56 @@ describe('buildView — filtering', () => {
     expect(paths(view).toSorted()).toEqual(['C:/never', 'C:/old']);
   });
 
+  /**
+   * Without this the `stale-fetch` chip makes a row **vanish at the moment its result arrives** —
+   * exactly when the user is looking at it — because a freshly fetched row stops matching.
+   */
+  it('never hides a row whose fetch is in flight, whatever the chips say', () => {
+    const view = buildView(
+      [MakeStatus({ path: 'C:/fresh', lastFetchedMs: NOW - 1000 })],
+      options({ chips: ['staleFetch'] }),
+      NOW,
+      null,
+      new Set(['C:/fresh']),
+    );
+
+    expect(paths(view)).toEqual(['C:/fresh']);
+  });
+
+  /**
+   * And a row whose fetch failed is the row most worth looking at — the same argument that keeps a
+   * row Tier 0 never produced unfiltered. Hidden, it would be indistinguishable from one the pass
+   * has not reached.
+   */
+  it('never hides a row whose last fetch failed', () => {
+    const view = buildView(
+      [
+        MakeStatus({ path: 'C:/failed', lastFetchedMs: NOW - 1000 }),
+        MakeStatus({ path: 'C:/quiet', lastFetchedMs: NOW - 1000 }),
+      ],
+      options({ chips: ['staleFetch'] }),
+      NOW,
+      null,
+      new Set(['C:/failed']),
+    );
+
+    expect(paths(view)).toEqual(['C:/failed']);
+  });
+
+  /**
+   * The set is defaulted, so every existing call site keeps its meaning and none of them changed.
+   */
+  it('hides a fresh row again once its fetch is no longer in flight', () => {
+    const view = buildView(
+      [MakeStatus({ path: 'C:/fresh', lastFetchedMs: NOW - 1000 })],
+      options({ chips: ['staleFetch'] }),
+      NOW,
+      null,
+    );
+
+    expect(paths(view)).toEqual([]);
+  });
+
   it('narrows to the search matches when there is a query', () => {
     const view = buildView(
       [MakeStatus({ path: 'C:/a' }), MakeStatus({ path: 'C:/b' })],

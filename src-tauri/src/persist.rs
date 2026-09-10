@@ -62,6 +62,9 @@ const KEY_UI: &str = "ui";
 /// How live updates behave — see [`watch`].
 const KEY_WATCH: &str = "watch";
 
+/// How fetching behaves — see [`fetch`].
+const KEY_FETCH: &str = "fetch";
+
 /// The one key in the cache file, holding a whole [`CacheFile`].
 const KEY_CACHE: &str = "cache";
 
@@ -186,6 +189,79 @@ impl WatchSettings {
     }
 }
 
+/// How fetching behaves.
+///
+/// Read **per invocation**, like [`OpenInSettings`] and unlike [`WatchSettings`]. The watcher and
+/// the poll thread are built once and hold their values; a fetch is built per click, so re-reading
+/// costs one store lookup and lets a user try `concurrency: 2` without restarting. These are
+/// exactly the knobs somebody reaches for when a fetch misbehaves over a VPN, which is the worst
+/// possible moment to require a restart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct FetchSettings {
+    /// How many `git` processes may run at once. §8.2's ~4.
+    pub concurrency: u32,
+
+    /// The per-process deadline in seconds. §8.2's ~60.
+    ///
+    /// This is the only universal backstop against a fetch that sits waiting for a human:
+    /// `GIT_TERMINAL_PROMPT=0` stops git's own prompt, but not every credential helper's GUI and
+    /// not `ssh`'s host-key or passphrase prompts.
+    pub timeout_seconds: u64,
+
+    /// The shortest gap between two **bulk** fetches of one repository, in seconds.
+    ///
+    /// A single per-row fetch is never guarded: clicking one repository's button twice is intent,
+    /// and the hazard §8.2 names is three hundred unprompted.
+    pub min_interval_seconds: u64,
+
+    /// Delete remote-tracking refs whose remote branch is gone.
+    pub prune: bool,
+
+    /// Fetch every configured remote rather than only the current branch's.
+    pub all_remotes: bool,
+}
+
+impl Default for FetchSettings {
+    fn default() -> Self {
+        Self {
+            concurrency: 4,
+            timeout_seconds: 60,
+            min_interval_seconds: 300,
+            prune: true,
+            all_remotes: true,
+        }
+    }
+}
+
+impl FetchSettings {
+    /// How many at once, clamped at **both** ends — which is the difference from
+    /// [`WatchSettings`], whose values only need floors.
+    ///
+    /// A `0` would fetch nothing at all. A hand-edited `200` is not merely the user's own problem
+    /// the way a short debounce is: it is two hundred sockets opened against somebody else's
+    /// server, and two hundred processes on a machine that has other work to do.
+    pub fn concurrency(&self) -> usize {
+        (self.concurrency as usize).clamp(1, 16)
+    }
+
+    /// The per-process deadline, clamped at both ends. A `0` would kill every fetch the instant it
+    /// started, and no ceiling at all reintroduces the indefinite hang the timeout exists for.
+    pub fn timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.timeout_seconds.clamp(5, 600))
+    }
+
+    /// The bulk repeat guard, or `None` for no guard.
+    ///
+    /// **Deliberately not floored**, unlike everything else here. `0` means "always fetch", which
+    /// is a coherent choice on a LAN — and unlike a debounce of `0` it cannot storm, because the
+    /// concurrency cap still bounds it and a human still has to press the button.
+    pub fn min_interval(&self) -> Option<std::time::Duration> {
+        (self.min_interval_seconds > 0)
+            .then(|| std::time::Duration::from_secs(self.min_interval_seconds))
+    }
+}
+
 /// The persisted row cache.
 ///
 /// Both maps, not just the rows. `RepoStatus` carries no `git_dir` and every engine entry point
@@ -228,6 +304,9 @@ pub fn load<R: Runtime>(app: &AppHandle<R>, state: &AppState) {
     }
     if let Err(error) = seed_watch(app) {
         tracing::warn!(%error, "could not write the default watch settings");
+    }
+    if let Err(error) = seed_fetch(app) {
+        tracing::warn!(%error, "could not write the default fetch settings");
     }
 
     match cache(app) {
@@ -311,6 +390,33 @@ fn seed_watch<R: Runtime>(app: &AppHandle<R>) -> Result<()> {
         return Ok(());
     }
     write(app, KEY_WATCH, &WatchSettings::default())
+}
+
+/// How fetching behaves, defaulted when the key is absent or unreadable.
+///
+/// Read per invocation, so a hand-edit takes effect on the next click. Defaults whole on a
+/// malformed object, for the reason [`watch`] does.
+pub fn fetch<R: Runtime>(app: &AppHandle<R>) -> FetchSettings {
+    let stored = settings(app).ok().and_then(|store| store.get(KEY_FETCH));
+
+    let Some(stored) = stored else {
+        return FetchSettings::default();
+    };
+    match serde_json::from_value(stored) {
+        Ok(settings) => settings,
+        Err(error) => {
+            tracing::warn!(%error, "the fetch settings could not be read; using the defaults");
+            FetchSettings::default()
+        }
+    }
+}
+
+/// Write the default fetch settings if the key is absent, so the file shows what can be set.
+fn seed_fetch<R: Runtime>(app: &AppHandle<R>) -> Result<()> {
+    if settings(app)?.has(KEY_FETCH) {
+        return Ok(());
+    }
+    write(app, KEY_FETCH, &FetchSettings::default())
 }
 
 /// The view state, verbatim, or `null` when nothing has been saved.
@@ -518,6 +624,84 @@ mod tests {
 
         let file: CacheFile = serde_json::from_value(json).expect("the envelope still parses");
         assert_ne!(file.version, CACHE_VERSION, "which is what `cache` checks");
+    }
+
+    /// The shipped defaults, stated so a change to any of them is a deliberate edit here.
+    #[test]
+    fn the_fetch_defaults_are_the_documented_ones() {
+        let settings = FetchSettings::default();
+
+        assert_eq!(settings.concurrency(), 4);
+        assert_eq!(settings.timeout(), std::time::Duration::from_secs(60));
+        assert_eq!(
+            settings.min_interval(),
+            Some(std::time::Duration::from_secs(300))
+        );
+        assert!(settings.prune, "a dead tracking ref must not survive");
+        assert!(settings.all_remotes);
+    }
+
+    /// Clamped at both ends, unlike the watch settings.
+    ///
+    /// The ceiling is the half that differs: a hand-edited `concurrency: 1000` is not merely the
+    /// user's own problem, it is a thousand sockets against somebody else's server.
+    #[test]
+    fn a_hand_edited_concurrency_is_clamped_at_both_ends() {
+        let low = FetchSettings {
+            concurrency: 0,
+            ..FetchSettings::default()
+        };
+        let high = FetchSettings {
+            concurrency: 1_000,
+            ..FetchSettings::default()
+        };
+
+        assert_eq!(low.concurrency(), 1, "zero would fetch nothing at all");
+        assert_eq!(high.concurrency(), 16);
+    }
+
+    /// A `0` timeout would kill every fetch as it started; no ceiling reintroduces the hang.
+    #[test]
+    fn a_hand_edited_timeout_is_clamped_at_both_ends() {
+        let zero = FetchSettings {
+            timeout_seconds: 0,
+            ..FetchSettings::default()
+        };
+        let forever = FetchSettings {
+            timeout_seconds: 86_400,
+            ..FetchSettings::default()
+        };
+
+        assert_eq!(zero.timeout(), std::time::Duration::from_secs(5));
+        assert_eq!(forever.timeout(), std::time::Duration::from_secs(600));
+    }
+
+    /// The one value deliberately left un-floored: `0` means "no bulk guard", which is coherent
+    /// on a LAN and cannot storm, because the concurrency cap still bounds it and a human still
+    /// presses the button.
+    #[test]
+    fn a_zero_repeat_guard_means_no_guard_rather_than_a_floor() {
+        let off = FetchSettings {
+            min_interval_seconds: 0,
+            ..FetchSettings::default()
+        };
+
+        assert_eq!(off.min_interval(), None);
+    }
+
+    /// A hand-edit is the only way to change these, so the shortest plausible one has to parse.
+    #[test]
+    fn one_fetch_key_alone_is_a_valid_hand_edit() {
+        let settings: FetchSettings =
+            serde_json::from_str("{\"concurrency\":2}").expect("the rest default");
+
+        assert_eq!(settings.concurrency(), 2);
+        assert_eq!(
+            settings.timeout(),
+            std::time::Duration::from_secs(60),
+            "the untouched keys keep their defaults"
+        );
+        assert!(settings.prune);
     }
 
     /// A hand-edit is the only way to change these, so the shortest plausible one has to parse.

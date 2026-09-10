@@ -19,6 +19,7 @@
 
 mod commands;
 mod error;
+mod fetch;
 mod live;
 mod persist;
 mod pipeline;
@@ -56,6 +57,19 @@ pub fn run() {
 
             let state = app.state::<Arc<AppState>>();
             persist::load(app.handle(), state.inner());
+
+            // Probed once so the fetch controls can be disabled with a reason rather than failing
+            // at click time (§10.2). It is only that affordance: `fetch_repos` resolves `git`
+            // again per invocation, because a `PATH` can change while the app runs.
+            let git = repo_scan::probe_git();
+            match &git {
+                Some(info) => {
+                    tracing::info!(version = %info.version, path = %info.path.display(), "git")
+                }
+                None => tracing::info!("no usable `git` on PATH; fetching is unavailable"),
+            }
+            state.set_git(git);
+
             // After the cache is loaded, so the poll has the restored `found` map to work from if it
             // fires before the launch scan finishes. Nothing is watched yet: the watch set follows
             // from what discovery finds, and the first `sync_watches` is the launch scan's.
@@ -77,6 +91,11 @@ pub fn run() {
                 tauri::WindowEvent::CloseRequested { .. } => {
                     let state = window.state::<Arc<AppState>>();
                     state.cancel_all();
+                    // Not the same as cancelling a scan, and not optional: a fetch owns child
+                    // `git` processes. Without this they are orphaned when the app exits, and
+                    // keep writing into the user's repositories — holding directory handles open
+                    // on Windows — for as long as their transport takes to finish.
+                    state.cancel_fetches();
                     state.stop_live();
                 }
                 tauri::WindowEvent::Focused(true) => {
@@ -97,6 +116,9 @@ pub fn run() {
             commands::remove_root,
             commands::list_roots,
             commands::open_in,
+            commands::fetch_repos,
+            commands::cancel_fetch,
+            commands::git_info,
             commands::ui_settings,
             commands::save_ui_settings,
         ])

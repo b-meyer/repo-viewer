@@ -17,7 +17,8 @@ use std::{
 };
 
 use repo_scan::{
-    DiscoveredRepo, RepoEvent, RepoStatus, RepoWatcher, ScanError, ScanId, Tier1, Tier2,
+    DiscoveredRepo, FetchId, GitInfo, RepoEvent, RepoStatus, RepoWatcher, ScanError, ScanId, Tier1,
+    Tier2,
 };
 use tauri::ipc::Channel;
 
@@ -88,6 +89,52 @@ pub struct AppState {
     /// The focus refresh and the shutdown signal both go through here, which is what makes them the
     /// poll's own code path rather than two more of their own.
     poll: Mutex<Option<Sender<Tick>>>,
+
+    /// Live fetch passes and their cancellation flags. Mirrors [`AppState::scans`].
+    fetches: Mutex<HashMap<FetchId, Arc<AtomicBool>>>,
+
+    /// Hands out [`FetchId`]s. Starts at 1, so `0` is never a live fetch.
+    next_fetch: AtomicU64,
+
+    /// Repositories a fetch owns the refresh for, and when that ownership lapses.
+    ///
+    /// A fetch writes `FETCH_HEAD` and `refs/remotes/*`, both of which are in the §7.2 watch set,
+    /// so every fetch makes the watcher report the repository it just fetched. Left alone, a
+    /// three-hundred-repository pass would run three hundred redundant Tier 0+1 refreshes on top
+    /// of the ones the fetch already did.
+    ///
+    /// **A deadline rather than set membership, and that is the whole design.** A path left in a
+    /// plain set by a fetch that panicked, timed out, or was dropped would stop that repository
+    /// updating for the rest of the session — silently, because nothing fails and nothing logs.
+    /// An entry that expires on its own bounds the damage of every such bug to
+    /// `timeout + tail`, and the explicit release and the guard's sweep are then optimisations on
+    /// top of a floor rather than the only thing standing between a user and a dead row.
+    fetching: Mutex<HashMap<PathBuf, Suppression>>,
+
+    /// The `git` found at startup, or `None` when there is none.
+    ///
+    /// `OnceLock` because it is written once in `setup` before any command can run: no lock to
+    /// take on every read, and no poisoning to recover from. It is an **affordance**, not the
+    /// truth — `PATH` can change while the app runs, so the fetch path resolves `git` again per
+    /// invocation and this only decides whether the buttons are enabled.
+    git: std::sync::OnceLock<Option<GitInfo>>,
+}
+
+/// One repository's watcher suppression.
+#[derive(Debug, Clone, Copy)]
+struct Suppression {
+    /// When this stops suppressing, whatever else happens.
+    until: std::time::Instant,
+
+    /// Whether a watcher notice actually arrived while this was in force.
+    ///
+    /// The fetch consumes this on release, and invalidates Tier 2 if it is set. That is what keeps
+    /// "only the watcher invalidates Tier 2" true rather than adding a second exception to it: a
+    /// fetch writes nothing Tier 2 measures, so a fetch alone must not invalidate — but the notice
+    /// it suppressed might have been the user's own `git add`, and `resolve` does not report which
+    /// file moved. So the watcher's evidence is still the only thing that invalidates. It is just
+    /// delivered late.
+    deferred: bool,
 }
 
 /// Hand-written because `tauri::ipc::Channel` implements no `Debug`, and because dumping every row
@@ -108,6 +155,8 @@ impl std::fmt::Debug for AppState {
                     .as_ref()
                     .map_or(0, RepoWatcher::watched_paths),
             )
+            .field("fetches", &self.lock_fetches().len())
+            .field("fetching", &self.lock_fetching().len())
             .finish()
     }
 }
@@ -327,6 +376,12 @@ impl AppState {
 
         self.write_found().retain(|key, _| !key.starts_with(path));
 
+        // A suppression entry for a repository that is gone has nothing left to protect, and the
+        // deadline would expire it anyway — but leaving it means a path the app no longer knows
+        // sits in a map until it does, which is exactly the shape of the leak the deadline exists
+        // to bound. The map stays self-describing instead.
+        self.lock_fetching().retain(|key, _| !key.starts_with(path));
+
         (roots, evicted)
     }
 
@@ -359,6 +414,10 @@ impl AppState {
         // `found` goes on the same terms, or a removed repository would keep exactly the entry
         // that lets a command reach into it.
         self.write_found()
+            .retain(|key, _| !walked(key) || seen.contains(key));
+
+        // And so does its suppression, for the reason `remove_root` drops one.
+        self.lock_fetching()
             .retain(|key, _| !walked(key) || seen.contains(key));
 
         evicted
@@ -412,6 +471,142 @@ impl AppState {
     /// put a second copy of the same answer on a second channel.
     pub fn scan_in_flight(&self) -> bool {
         !self.lock_scans().is_empty()
+    }
+
+    /// Register a fetch pass and hand back its id and cancellation flag.
+    ///
+    /// Unlike [`AppState::begin_scan`], starting one does **not** cancel the others. A scan
+    /// supersedes the scan before it — they answer the same question about the same tree — where
+    /// two fetches are two sets of repositories a user asked for, and both are legitimate.
+    pub fn begin_fetch(&self) -> (FetchId, Arc<AtomicBool>) {
+        let id = FetchId(self.next_fetch.fetch_add(1, Ordering::Relaxed) + 1);
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.lock_fetches().insert(id, Arc::clone(&cancel));
+        (id, cancel)
+    }
+
+    /// Deregister a fetch pass.
+    pub fn finish_fetch(&self, id: FetchId) {
+        self.lock_fetches().remove(&id);
+    }
+
+    /// Flip one fetch pass's cancellation flag.
+    ///
+    /// A no-op for an id that has already finished: the frontend cannot know the pass ended
+    /// between rendering the button and the click.
+    pub fn cancel_fetch(&self, id: FetchId) {
+        if let Some(flag) = self.lock_fetches().get(&id) {
+            flag.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Flip every fetch pass's flag. Window close, which must not orphan a `git`.
+    pub fn cancel_fetches(&self) {
+        for flag in self.lock_fetches().values() {
+            flag.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Take ownership of these repositories' refreshes until `hold` has elapsed.
+    ///
+    /// The group is the repository and every sibling sharing its common directory, because a
+    /// fetch in a linked worktree writes the `refs/remotes/*` they share — so the watcher reports
+    /// all of them and the fetch refreshes all of them.
+    pub fn begin_fetch_group(&self, paths: &[PathBuf], hold: std::time::Duration) {
+        let until = std::time::Instant::now() + hold;
+        let mut fetching = self.lock_fetching();
+        for path in paths {
+            fetching.insert(
+                path.clone(),
+                Suppression {
+                    until,
+                    deferred: false,
+                },
+            );
+        }
+    }
+
+    /// Release these repositories after `tail`, and report which of them saw a watcher notice.
+    ///
+    /// Shortens the deadline rather than removing the entry, and the `tail` is not optional: the
+    /// debouncer is still holding the fetch's own `FETCH_HEAD` write when the process exits, so
+    /// releasing outright would hand the watcher exactly the burst this suppression exists to
+    /// absorb — the redundant refresh would simply arrive one debounce window later.
+    ///
+    /// The returned paths are the ones whose Tier 2 must be invalidated before the re-read. See
+    /// [`Suppression::deferred`].
+    pub fn end_fetch_group(&self, paths: &[PathBuf], tail: std::time::Duration) -> Vec<PathBuf> {
+        let until = std::time::Instant::now() + tail;
+        let mut fetching = self.lock_fetching();
+        let mut deferred = Vec::new();
+
+        for path in paths {
+            if let Some(entry) = fetching.get_mut(path) {
+                if entry.deferred {
+                    deferred.push(path.clone());
+                }
+                entry.until = until;
+                entry.deferred = false;
+            }
+        }
+        deferred
+    }
+
+    /// Drop these repositories' suppression outright.
+    ///
+    /// The guard's sweep, and the eviction path's. Unlike [`AppState::end_fetch_group`] this does
+    /// not keep a tail, because there is no fetch left whose writes a tail would be absorbing.
+    pub fn sweep_fetching(&self, paths: &[PathBuf]) {
+        let mut fetching = self.lock_fetching();
+        for path in paths {
+            fetching.remove(path);
+        }
+    }
+
+    /// Whether a fetch owns this repository's refresh right now.
+    ///
+    /// Records that a notice arrived, so the fetch can invalidate Tier 2 on release. An **expired**
+    /// entry is removed and reports `false`, so the notice that outlives the suppression is itself
+    /// processed rather than being the one event the recovery swallows.
+    pub fn defer_for_fetch(&self, path: &Path, now: std::time::Instant) -> bool {
+        let mut fetching = self.lock_fetching();
+        let Some(entry) = fetching.get_mut(path) else {
+            return false;
+        };
+
+        if now >= entry.until {
+            fetching.remove(path);
+            return false;
+        }
+
+        entry.deferred = true;
+        true
+    }
+
+    /// Whether any fetch is in flight, sweeping expired entries as it looks.
+    ///
+    /// The poll's gate. Sweeping here is what makes the poll resume on its own even if every other
+    /// release path failed.
+    pub fn fetch_in_flight(&self) -> bool {
+        let now = std::time::Instant::now();
+        let mut fetching = self.lock_fetching();
+        fetching.retain(|_, entry| now < entry.until);
+        !fetching.is_empty()
+    }
+
+    /// Every repository sharing `repo`'s common directory, including `repo` itself.
+    ///
+    /// A linked worktree and the repository it came from share one set of remote-tracking refs, so
+    /// fetching either moves both their ahead/behind counts — measured, not assumed; see
+    /// `fetching_a_worktree_moves_its_parents_counts_too`. Refreshing only the one that was
+    /// fetched would leave the other stale with nothing to correct it, because the watcher notice
+    /// that would have is the one this fetch suppressed.
+    pub fn siblings(&self, repo: &DiscoveredRepo) -> Vec<DiscoveredRepo> {
+        self.read_found()
+            .values()
+            .filter(|other| other.common_dir == repo.common_dir)
+            .cloned()
+            .collect()
     }
 
     /// Install the watcher, replacing any previous one.
@@ -471,6 +666,18 @@ impl AppState {
         if self.lock_watcher().take().is_some() {
             tracing::debug!("watcher stopped");
         }
+    }
+
+    /// Record the `git` found at startup. The first call wins; later ones are ignored.
+    pub fn set_git(&self, info: Option<GitInfo>) {
+        let _ = self.git.set(info);
+    }
+
+    /// The `git` found at startup, or `None` when there is none or the probe has not run.
+    ///
+    /// An affordance for the UI, never the truth at click time — see [`AppState::git`].
+    pub fn git(&self) -> Option<GitInfo> {
+        self.git.get().cloned().flatten()
     }
 
     /// Install the session channel, replacing any previous one.
@@ -544,6 +751,16 @@ impl AppState {
     /// Lock the poll sender, recovering from a poisoned lock.
     fn lock_poll(&self) -> MutexGuard<'_, Option<Sender<Tick>>> {
         self.poll.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Lock the fetch registry, recovering from a poisoned lock.
+    fn lock_fetches(&self) -> MutexGuard<'_, HashMap<FetchId, Arc<AtomicBool>>> {
+        self.fetches.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Lock the suppression map, recovering from a poisoned lock.
+    fn lock_fetching(&self) -> MutexGuard<'_, HashMap<PathBuf, Suppression>> {
+        self.fetching.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
@@ -1293,5 +1510,200 @@ mod cache_tests {
         state.retain_scanned(&[PathBuf::from("C:/work")], &HashSet::new());
 
         assert!(state.discovered(Path::new("C:/work/gone")).is_none());
+    }
+}
+
+#[cfg(test)]
+mod fetch_tests {
+    use std::time::{Duration, Instant};
+
+    use super::*;
+
+    fn found(path: &str, common: &str) -> DiscoveredRepo {
+        DiscoveredRepo {
+            path: PathBuf::from(path),
+            name: "alpha".into(),
+            parent: PathBuf::from("C:/work"),
+            kind: repo_scan::RepoKind::Normal,
+            git_dir: PathBuf::from(format!("{path}/.git")),
+            common_dir: PathBuf::from(common),
+        }
+    }
+
+    /// **The bug this whole design is against**, named for it.
+    ///
+    /// A fetch that panics, times out, or has its task dropped never releases. With a plain set
+    /// that repository would stop live-updating for the rest of the session — silently, because
+    /// nothing fails and nothing logs. The deadline is the floor under every other release path,
+    /// so it is asserted here with none of them running.
+    #[test]
+    fn a_fetch_that_never_released_stops_suppressing_on_its_own() {
+        let state = AppState::default();
+        let path = PathBuf::from("C:/work/alpha");
+
+        // A hold that has already elapsed, which is what a leaked entry looks like once its own
+        // deadline passes.
+        state.begin_fetch_group(std::slice::from_ref(&path), Duration::ZERO);
+
+        assert!(
+            !state.defer_for_fetch(&path, Instant::now()),
+            "an expired entry must not still be suppressing"
+        );
+        assert!(
+            !state.fetch_in_flight(),
+            "and the poll has to resume without anyone releasing it"
+        );
+    }
+
+    /// The ordinary path: suppressed while the fetch runs, and only that repository.
+    #[test]
+    fn a_repository_being_fetched_is_suppressed() {
+        let state = AppState::default();
+        let path = PathBuf::from("C:/work/alpha");
+
+        state.begin_fetch_group(std::slice::from_ref(&path), Duration::from_secs(60));
+
+        assert!(state.defer_for_fetch(&path, Instant::now()));
+        assert!(state.fetch_in_flight());
+        assert!(
+            !state.defer_for_fetch(Path::new("C:/work/other"), Instant::now()),
+            "suppression is per repository, not global"
+        );
+    }
+
+    /// Releasing keeps a tail, and the tail is not decoration.
+    ///
+    /// The debouncer is still holding the fetch's own `FETCH_HEAD` write when the process exits,
+    /// so a release that took effect immediately would hand the watcher exactly the burst the
+    /// suppression exists to absorb — the redundant refresh would simply arrive later.
+    #[test]
+    fn releasing_keeps_a_tail_rather_than_clearing_outright() {
+        let state = AppState::default();
+        let path = PathBuf::from("C:/work/alpha");
+        state.begin_fetch_group(std::slice::from_ref(&path), Duration::from_secs(60));
+
+        state.end_fetch_group(std::slice::from_ref(&path), Duration::from_secs(30));
+
+        assert!(
+            state.defer_for_fetch(&path, Instant::now()),
+            "still suppressing inside the tail"
+        );
+        assert!(
+            !state.defer_for_fetch(&path, Instant::now() + Duration::from_secs(31)),
+            "and not after it"
+        );
+    }
+
+    /// A notice that arrived during the fetch is reported on release, so Tier 2 is invalidated
+    /// once — by the watcher's evidence, just delivered late.
+    #[test]
+    fn a_notice_during_a_fetch_is_deferred_and_reported_on_release() {
+        let state = AppState::default();
+        let path = PathBuf::from("C:/work/alpha");
+        state.begin_fetch_group(std::slice::from_ref(&path), Duration::from_secs(60));
+
+        assert!(state.defer_for_fetch(&path, Instant::now()));
+
+        let deferred = state.end_fetch_group(std::slice::from_ref(&path), Duration::from_secs(2));
+
+        assert_eq!(deferred, vec![path.clone()], "the notice is not lost");
+        assert!(
+            state
+                .end_fetch_group(std::slice::from_ref(&path), Duration::from_secs(2))
+                .is_empty(),
+            "and it is consumed, so a second release does not invalidate again"
+        );
+    }
+
+    /// With no watcher running nothing defers, so a fetch invalidates no Tier 2 at all and
+    /// behaves exactly like `refresh_repo` — which is what it is. That the two cases differ
+    /// observably is what makes this a derivation rather than a second exception to tier
+    /// ownership.
+    #[test]
+    fn a_fetch_with_no_watcher_notice_invalidates_nothing() {
+        let state = AppState::default();
+        let path = PathBuf::from("C:/work/alpha");
+        state.begin_fetch_group(std::slice::from_ref(&path), Duration::from_secs(60));
+
+        let deferred = state.end_fetch_group(std::slice::from_ref(&path), Duration::from_secs(2));
+
+        assert!(deferred.is_empty());
+    }
+
+    /// A linked worktree and its parent share one set of remote-tracking refs, so a fetch in
+    /// either moves both — which is why both are suppressed and both are refreshed.
+    #[test]
+    fn siblings_are_the_repositories_sharing_a_common_directory() {
+        let state = AppState::default();
+        let common = "C:/work/alpha/.git";
+        let parent = found("C:/work/alpha", common);
+        let worktree = DiscoveredRepo {
+            git_dir: PathBuf::from("C:/work/alpha/.git/worktrees/wt"),
+            kind: repo_scan::RepoKind::LinkedWorktree,
+            ..found("C:/work/wt", common)
+        };
+        let unrelated = found("C:/work/beta", "C:/work/beta/.git");
+        state.record_found(&[parent.clone(), worktree.clone(), unrelated]);
+
+        let from_parent: Vec<PathBuf> = state
+            .siblings(&parent)
+            .into_iter()
+            .map(|repo| repo.path)
+            .collect();
+        let from_worktree: Vec<PathBuf> = state
+            .siblings(&worktree)
+            .into_iter()
+            .map(|repo| repo.path)
+            .collect();
+
+        for group in [&from_parent, &from_worktree] {
+            assert_eq!(group.len(), 2, "the pair, and nothing else: {group:?}");
+            assert!(group.contains(&PathBuf::from("C:/work/alpha")));
+            assert!(group.contains(&PathBuf::from("C:/work/wt")));
+        }
+    }
+
+    /// Cancelling one pass leaves the others alone, unlike a scan: two fetches are two sets of
+    /// repositories a user asked for, and neither supersedes the other.
+    #[test]
+    fn cancelling_one_fetch_does_not_touch_another() {
+        let state = AppState::default();
+        let (first, first_flag) = state.begin_fetch();
+        let (second, second_flag) = state.begin_fetch();
+        assert_ne!(first, second);
+
+        state.cancel_fetch(first);
+
+        assert!(first_flag.load(Ordering::Relaxed));
+        assert!(!second_flag.load(Ordering::Relaxed));
+
+        // Window close is the case that stops everything, so a `git` is never orphaned.
+        state.cancel_fetches();
+        assert!(second_flag.load(Ordering::Relaxed));
+    }
+
+    /// An id starts at 1, so a frontend default of `0` cannot cancel a live pass.
+    #[test]
+    fn a_fetch_id_is_never_zero() {
+        let state = AppState::default();
+
+        let (id, _) = state.begin_fetch();
+
+        assert_eq!(id, repo_scan::FetchId(1));
+        state.finish_fetch(id);
+        assert!(!state.lock_fetches().contains_key(&id));
+    }
+
+    /// A repository whose root is removed mid-fetch leaves no suppression behind.
+    #[test]
+    fn removing_a_root_drops_the_suppression_beneath_it() {
+        let state = AppState::default();
+        let path = PathBuf::from("C:/work/alpha");
+        state.add_root(PathBuf::from("C:/work"));
+        state.begin_fetch_group(std::slice::from_ref(&path), Duration::from_secs(60));
+
+        state.remove_root(Path::new("C:/work"));
+
+        assert!(!state.fetch_in_flight());
     }
 }

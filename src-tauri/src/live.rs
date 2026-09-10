@@ -1,9 +1,14 @@
 //! Live updates: the watcher, the poll, and the refresh-on-focus.
 //!
-//! Three triggers, one operation. A change notice never crosses the IPC boundary as "something
+//! Four triggers, one operation. A change notice never crosses the IPC boundary as "something
 //! happened" — Rust re-reads the repository, merges the result into the canonical map, and pushes
 //! the full merged row on the session channel. The frontend has nothing to do but render what
-//! arrives, which is why almost none of this phase is on that side of the boundary.
+//! arrives, which is why almost none of this is on that side of the boundary.
+//!
+//! The fourth is a **fetch**, which lives in [`crate::fetch`] and calls [`refresh_one`] the way
+//! the watcher does. A fetch also has to stop the watcher refreshing the same repository twice,
+//! because a fetch writes `FETCH_HEAD` and `refs/remotes/*` and both are in the watch set — see
+//! [`due_paths`] and `AppState::begin_fetch_group`.
 //!
 //! # Two threads, and what each one owns
 //!
@@ -66,6 +71,24 @@ const COOLDOWN: Duration = Duration::from_millis(750);
 /// between an editor and this window would otherwise run a Tier 0 pass over the whole tree every
 /// couple of seconds.
 const POLL_FLOOR: Duration = Duration::from_secs(5);
+
+/// The floor under [`suppress_tail`].
+const SUPPRESS_TAIL_FLOOR: Duration = Duration::from_millis(2_000);
+
+/// How long a fetch keeps ownership of a repository's refresh **after** pushing its own row.
+///
+/// Derived rather than a literal, because `debounceMs` is documented as hand-editable and a
+/// literal would silently stop covering anyone who raised it. The fetch's own `FETCH_HEAD` and
+/// `refs/remotes/*` writes are still inside the debouncer when the process exits, so releasing at
+/// exit would hand the watcher exactly the burst the fetch already answered — the redundant
+/// Tier 0+1 refresh would simply arrive one debounce window later, which is not a fix.
+///
+/// The cost is stated rather than hidden: a user's own `git commit` inside that window is dropped
+/// by the watcher. It is bounded, the poll picks it up within its interval, and `COOLDOWN` already
+/// drops anything inside 750 ms.
+pub fn suppress_tail(settings: &WatchSettings) -> Duration {
+    (settings.debounce() + COOLDOWN + Duration::from_millis(500)).max(SUPPRESS_TAIL_FLOOR)
+}
 
 /// What wakes the poll thread.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -230,10 +253,7 @@ fn refresh_loop(state: &Arc<AppState>, notices: &Receiver<Notice>) {
         }
 
         let now = Instant::now();
-        let due: Vec<PathBuf> = changed
-            .into_iter()
-            .filter(|path| cooldown.due(path, now))
-            .collect();
+        let due = due_paths(changed, &mut cooldown, state, now);
         if due.is_empty() {
             continue;
         }
@@ -270,6 +290,32 @@ fn refresh_loop(state: &Arc<AppState>, notices: &Receiver<Notice>) {
     tracing::debug!("refresh thread ended");
 }
 
+/// Narrow a batch of changed paths to the ones that should actually be refreshed.
+///
+/// **Suppression is checked before the cooldown, and the order is load-bearing.**
+/// [`Cooldown::due`] *records* `now` when it answers `true`, so asking it about a path a fetch
+/// owns would burn that path's cooldown slot on a refresh that never happens — and the first
+/// genuine event after the fetch released would then be dropped for another 750 ms. Nothing about
+/// that failure is visible: the row simply updates late, once.
+///
+/// Split out and given the clock so both the filtering and its order are testable without a
+/// watcher, a thread, or a sleep — the same reason `Cooldown::due` takes one.
+fn due_paths(
+    changed: Vec<PathBuf>,
+    cooldown: &mut Cooldown,
+    state: &AppState,
+    now: Instant,
+) -> Vec<PathBuf> {
+    changed
+        .into_iter()
+        // A fetch owns this repository's refresh and will re-read it when it finishes, so this
+        // notice is deferred rather than dropped: `defer_for_fetch` records that it arrived, and
+        // the fetch invalidates Tier 2 on release because of it.
+        .filter(|path| !state.defer_for_fetch(path, now))
+        .filter(|path| cooldown.due(path, now))
+        .collect()
+}
+
 /// Wait, then run a Tier 0 pass — on the timer, or when something asks.
 fn poll_loop(state: &Arc<AppState>, ticks: &Receiver<Tick>, interval: Duration) {
     // Seeded as though a pass had just run, because one effectively has: a launch reconciles, and
@@ -284,7 +330,15 @@ fn poll_loop(state: &Arc<AppState>, ticks: &Receiver<Tick>, interval: Duration) 
             Ok(Tick::Refresh) | Err(RecvTimeoutError::Timeout) => {}
         }
 
-        if state.scan_in_flight() {
+        // A scan or a fetch is already refreshing the rows this pass would read, so running it on
+        // top is duplicated I/O whose only effect is a second copy of the same answer on the same
+        // channel — the argument the scan gate already makes, applied to the other operation that
+        // owns rows. `continue` before `last` is set, so a gated tick does not consume the
+        // interval and the pass runs as soon as the tree is free.
+        //
+        // A whole-tree gate rather than a per-path skip, because `pass` has no per-path structure
+        // to hang one on: it is one `read_tier0_all_with` over the whole discovered map.
+        if state.scan_in_flight() || state.fetch_in_flight() {
             continue;
         }
         last = Instant::now();
@@ -435,6 +489,84 @@ mod tests {
         assert!(
             !cooldown.due(path, start + Duration::from_millis(700)),
             "200 ms after the second refresh is still inside the window"
+        );
+    }
+
+    /// A repository a fetch owns is not refreshed by the watcher: the fetch re-reads it and
+    /// pushes, so doing it here as well is the duplicate the suppression exists to remove.
+    #[test]
+    fn a_notice_for_a_repository_being_fetched_is_not_refreshed() {
+        let state = AppState::default();
+        let mut cooldown = Cooldown::new(COOLDOWN);
+        let fetching = PathBuf::from("C:/repos/one");
+        let other = PathBuf::from("C:/repos/two");
+        state.begin_fetch_group(std::slice::from_ref(&fetching), Duration::from_secs(60));
+
+        let due = due_paths(
+            vec![fetching.clone(), other.clone()],
+            &mut cooldown,
+            &state,
+            Instant::now(),
+        );
+
+        assert_eq!(due, vec![other], "the fetched one is left to its own fetch");
+    }
+
+    /// **The ordering trap.** `Cooldown::due` records `now` when it answers `true`, so checking
+    /// the cooldown before the suppression would burn a suppressed path's slot on a refresh that
+    /// never ran — and the first genuine event after the fetch released would then be dropped for
+    /// another 750 ms. Nothing about that is visible except a row that updates late, once.
+    #[test]
+    fn a_suppressed_notice_does_not_consume_its_cooldown_slot() {
+        let state = AppState::default();
+        let mut cooldown = Cooldown::new(COOLDOWN);
+        let path = PathBuf::from("C:/repos/one");
+        let start = Instant::now();
+        state.begin_fetch_group(std::slice::from_ref(&path), Duration::from_millis(10));
+
+        // Suppressed, and therefore not refreshed.
+        assert!(due_paths(vec![path.clone()], &mut cooldown, &state, start).is_empty());
+
+        // The moment suppression lapses, the very next notice must be acted on.
+        let after = start + Duration::from_millis(20);
+        assert_eq!(
+            due_paths(vec![path.clone()], &mut cooldown, &state, after),
+            vec![path],
+            "the cooldown was never stamped, so nothing is owed"
+        );
+    }
+
+    /// The notice that outlives the suppression is itself processed, rather than being the one
+    /// event the recovery swallows.
+    #[test]
+    fn an_expired_suppression_stops_deferring_immediately() {
+        let state = AppState::default();
+        let mut cooldown = Cooldown::new(COOLDOWN);
+        let path = PathBuf::from("C:/repos/one");
+        state.begin_fetch_group(std::slice::from_ref(&path), Duration::ZERO);
+
+        let due = due_paths(vec![path.clone()], &mut cooldown, &state, Instant::now());
+
+        assert_eq!(due, vec![path]);
+    }
+
+    /// The tail is derived from the debounce, not hard-coded — a literal would silently stop
+    /// covering anyone who raised `debounceMs`, which README.md documents as hand-editable.
+    #[test]
+    fn the_suppression_tail_grows_with_a_hand_edited_debounce() {
+        let default = suppress_tail(&WatchSettings::default());
+        let patient = suppress_tail(&WatchSettings {
+            debounce_ms: 5_000,
+            ..WatchSettings::default()
+        });
+
+        assert_eq!(
+            default, SUPPRESS_TAIL_FLOOR,
+            "400 ms + 750 ms + 500 ms < 2 s"
+        );
+        assert!(
+            patient > Duration::from_secs(6),
+            "a 5 s debounce needs more than the floor, got {patient:?}"
         );
     }
 }

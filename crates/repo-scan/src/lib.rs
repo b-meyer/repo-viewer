@@ -22,16 +22,24 @@
 
 pub mod discover;
 pub mod error;
+pub mod exe;
+pub mod fetch;
 pub mod model;
 pub mod status;
 pub mod watch;
 
 pub use discover::{canonical, discover_roots, discover_roots_with};
 pub use error::{Error, Result};
+pub use exe::{resolve_in, resolve_program};
+pub use fetch::{
+    DEFAULT_CONCURRENCY, DEFAULT_TIMEOUT, FetchNotice, FetchOpts, fetch_all_with, fetch_one,
+    probe_git,
+};
 pub use model::{
-    CommitSummary, DEFAULT_PRUNE_NAMES, DiscoveredRepo, FileCounts, Head, RepoEvent, RepoKind,
-    RepoState, RepoStatus, ScanError, ScanEvent, ScanId, ScanOpts, ScanSummary, ScanTotals,
-    SubmoduleStatus, Tier, Tier0Summary,
+    CommitSummary, DEFAULT_PRUNE_NAMES, DiscoveredRepo, FetchEvent, FetchId, FetchOutcome,
+    FetchStatus, FetchSummary, FileCounts, GitInfo, Head, RepoEvent, RepoKind, RepoState,
+    RepoStatus, ScanError, ScanEvent, ScanId, ScanOpts, ScanSummary, ScanTotals, SubmoduleStatus,
+    Tier, Tier0Summary,
 };
 pub use status::{
     AHEAD_BEHIND_CAP, Tier1, Tier1Summary, Tier2, ahead_behind, read_tier0, read_tier0_all,

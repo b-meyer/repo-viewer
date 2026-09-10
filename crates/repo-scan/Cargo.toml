@@ -27,4 +27,7 @@ ts-rs = { workspace = true, optional = true }
 
 [dev-dependencies]
 gix = { workspace = true } # integration tests cannot see a regular dependency; same workspace pin
+# Only to assert the wire spelling of the model's enums. The crate itself never serialises
+# anything — `tauri::ipc::Channel` does that, on the other side of the boundary.
+serde_json = { workspace = true }
 tempfile = { workspace = true }

@@ -66,11 +66,12 @@ Rust (crates/ + src-tauri/) ..... all system work
   - tiered Git reads
   - canonical row state: one map of path -> RepoStatus, merged per tier (§6.3)
   - filesystem watching and debounce
-  - `git` CLI subprocess for fetch/pull/push, and the configured editor/terminal for `open_in`
+  - `git` CLI subprocess for fetch — the one thing this app writes — and the configured
+    editor/terminal for `open_in`
   - path normalization, editor/terminal/file-manager launch
   - plugin calls (dialog, opener, store) — the frontend never imports a plugin package
-  - settings and cache persistence: the roots, the `open_in` commands, the `watch` settings, the
-    view state, and a snapshot of both row maps, all through `persist.rs` (§6.3)
+  - settings and cache persistence: the roots, the `open_in` commands, the `watch` and `fetch`
+    settings, the view state, and a snapshot of both row maps, all through `persist.rs` (§6.3)
 ```
 
 The boundary is structural, not aspirational: `src/` cannot import the engine, because one is
@@ -326,9 +327,12 @@ fixture. It carries two `git` invocation requirements that are not obvious and a
 refused, and a `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM` override so the developer's own config
 cannot change the shape of the tree.
 
-There are **two** trees, and they are separate on purpose: `discover.rs` asserts exact
+There are **three** trees, and they are separate on purpose. `discover.rs` asserts exact
 `repos_found` and `dirs_visited` counts, so adding a repository to the discovery tree would make
-every one of those counts a maintenance tax on tests that do not care about it.
+every one of those counts a maintenance tax on tests that do not care about it. And the fetch
+tree cannot be shared at all, for a different reason: a fetch **mutates** the repository it runs
+in, so one shared instance would have tests moving each other's ahead/behind — intermittently,
+because cargo runs a binary's tests in parallel.
 
 - `build()` — the discovery tree: all four repository kinds, a pruned directory, a nested checkout.
 - `status_tree()` — the status tree, shared by all three tiers: a bare upstream and clones off it
@@ -339,6 +343,11 @@ every one of those counts a maintenance tax on tests that do not care about it.
   behind a `OnceLock`, because eighty-odd `git` spawns is not something to repeat per test on
   Windows. It is safe to extend, which is the reason for the split above: nothing asserts a total
   over it, and the tier suites iterate discovery's output against oracles.
+- `fetch_tree()` — a bare origin and whatever clones one test makes of it. Built **per test**, not
+  behind a `OnceLock`, for the mutation reason above; a bare `init` and a local clone is cheap
+  enough that isolation is the obvious trade. It carries the helpers a fetch test needs to stage
+  a case: advance the origin, push and delete a branch, clone bare, make a repository with no
+  remote, and point one at a dead remote.
 
 Ahead/behind is asserted against `git rev-list --left-right --count HEAD...@{upstream}` rather
 than against hand-counted numbers. That is the point: a literal encodes what the author believed
@@ -510,7 +519,9 @@ scan_roots(roots: Vec<PathBuf>, opts: ScanOpts, on_event: Channel<ScanEvent>) ->
 cancel_scan(id: ScanId)
 refresh_repo(path: PathBuf, tier: Tier) -> RepoStatus  // tiers 0..=tier; also pushes the row
 full_status(path: PathBuf) -> RepoStatus          // Tier 2, on demand; the merged row
-fetch_repos(paths: Vec<PathBuf>, on_event: Channel<FetchEvent>)   // git CLI
+fetch_repos(paths: Vec<PathBuf>, on_event: Channel<FetchEvent>) -> FetchId   // git CLI
+cancel_fetch(id: FetchId)
+git_info() -> Option<GitInfo>                     // what the startup probe found
 open_in(path: PathBuf, target: OpenTarget)        // editor | terminal | file manager
 pick_root() -> Option<PathBuf>                    // native folder dialog, via the plugin's Rust API
 add_root(path) -> Vec<PathBuf>                    // canonicalises, validates, persists; returns the list
@@ -566,6 +577,18 @@ keys. `scan_roots` accepts only a path already on the root list, and `add_root` 
 a new path enters the app — it canonicalises through the same helper discovery uses and requires
 the path to be a directory. Canonicalising through that one helper is what makes a root a prefix of
 the row keys beneath it, which is what `remove_root` relies on to evict them.
+
+`fetch_repos` returns a `FetchId` and has a `cancel_fetch` beside it. At four concurrent with a
+60-second deadline, three hundred repositories over a slow link is minutes of work, and a batch
+with no way to stop it would be a worse gap than §6.4's documented per-repository one — that is
+bounded by a single read. Starting a fetch does **not** cancel another, unlike `scan_roots`: a
+scan supersedes the scan before it because both answer the same question about the same tree,
+where two fetches are two sets of repositories a user asked for.
+
+`git_info` is a command of its own rather than a field on `subscribe`'s reply. That command
+returns `Vec<RepoStatus>` and is what the whole app hangs off; widening it to a struct would touch
+every one of its tests to carry one optional value, where one small command per concern is the
+shape `list_roots` and `ui_settings` already have.
 
 `refresh_repo` is fallible for the §8.1 total-failure grade: a repository that will not open, or
 whose HEAD is unreadable, has no honest `RepoStatus` to return. It reports that failure rather than
@@ -752,13 +775,26 @@ refresh thread re-runs Tier 0 and Tier 1 for that repo through `live::refresh_on
 tier into the canonical map (§6.3), and pushes the merged row on the session channel. The frontend
 has nothing to do but render what arrives.
 
-`refresh_one` has exactly two callers — that thread and the `refresh_repo` command — so a
-user-requested refresh and a watcher-driven one cannot disagree about what a refresh is. The
-**poll** is the third trigger and deliberately does not use it: a whole-tree pass wants
-`read_tier0_all_with`'s rayon fan-out rather than three hundred sequential opens. What all three
-share is that Rust owns the read and the merge, and that a full row is what goes out — not one
-function. The focus handler (`WindowEvent::Focused(true)`) is not a fourth: it sends a tick to the
-poll's own thread, so it _is_ the poll, run early.
+`refresh_one` has exactly three callers — that thread, the `refresh_repo` command, and the fetch
+driver — so a user-requested refresh, a watcher-driven one and a post-fetch one cannot disagree
+about what a refresh is. The **poll** is the fourth trigger and deliberately does not use it: a
+whole-tree pass wants `read_tier0_all_with`'s rayon fan-out rather than three hundred sequential
+opens. What all four share is that Rust owns the read and the merge, and that a full row is what
+goes out — not one function. The focus handler (`WindowEvent::Focused(true)`) is not a fifth: it
+sends a tick to the poll's own thread, so it _is_ the poll, run early.
+
+**A fetch owns the refresh of what it touched, and suppresses the watcher for it.** A fetch writes
+`FETCH_HEAD` and `refs/remotes/*`, both of which are in the §7.2 watch set, so without this every
+fetch is refreshed twice — once by the fetch and once by the watcher noticing the fetch's own
+writes. The suppression is a **deadline** rather than set membership, because a path left behind by
+a fetch that panicked would stop that repository updating for the session, silently. It **defers**
+a notice rather than dropping one: a fetch writes nothing Tier 2 measures, so a fetch alone does
+not invalidate, but the notice it suppressed might have been the user's own `git add` — so the
+entry records that one arrived and Tier 2 is invalidated on release. The poll is gated
+whole-pass on a fetch being in flight, symmetrically with a scan.
+
+The group is the repository **and every sibling sharing its common directory**: fetching a linked
+worktree moves its parent's ahead/behind, measured rather than assumed.
 
 ---
 
@@ -842,19 +878,53 @@ Ahead/behind is measured against the local remote-tracking ref (`refs/remotes/or
 is only as fresh as the last `git fetch`. An app whose selling point is "what haven't I pushed?"
 is misleading if it shows stale numbers silently. So:
 
-- Show a per-repo **"last fetched"** timestamp and visually degrade rows past a threshold.
-- Fetching is explicit, opt-in, and rate-limited — never part of a scan, and never on launch.
-  Fetching 300 repos unprompted is hostile.
+- Show a per-repo **"last fetched"** timestamp and visually degrade rows past a threshold. It is
+  the mtime of `FETCH_HEAD` — of **whichever** of the git directory and the common directory is
+  newer, because git writes it wherever the fetch ran. See the trap in
+  [AGENTS.md](./AGENTS.md); reading only the common directory reports "never fetched" for a
+  linked worktree seconds after fetching it.
+- Fetching is explicit, opt-in, and bounded — never part of a scan, and never on launch. Fetching
+  300 repos unprompted is hostile. Bounding it takes **two** mechanisms and neither subsumes the
+  other: a concurrency cap bounds instantaneous load (four TLS handshakes, not three hundred), and
+  a five-minute per-repository guard bounds _repeated_ load so that pressing the button twice does
+  not fetch everything twice. The guard applies to a **batch only** — one row's button clicked
+  twice is intent — and its clock is `FETCH_HEAD`'s mtime rather than a map, so a failed fetch is
+  retried the moment credentials are fixed and a never-fetched repository is never skipped.
+- **"Fetch all" means what the table is showing.** With a chip active, a button that ignored it and
+  fetched three hundred repositories while the user was looking at twelve would misstate what one
+  click does — and filter-then-fetch is the intended workflow.
 - **Fetch via the `git` CLI.** Fetch is where credential helpers, SSH config (`~/.ssh/config`,
   agents, jump hosts), corporate proxies, and custom transports matter, and where getting it
   wrong means hanging on a credential prompt with no UI. This is also why `keyring` is not
   needed: delegate to the credential helper already installed (Git Credential Manager on
   Windows, Keychain on macOS).
-- **Subprocess hygiene.** `GIT_TERMINAL_PROMPT=0` so a missing credential fails instead of
-  waiting on a terminal that does not exist; `CREATE_NO_WINDOW` (`creation_flags(0x0800_0000)`)
-  on Windows or every fetch flashes a console; a per-process timeout (~60 s) because SSH and
-  proxy stalls are otherwise indefinite; at most ~4 concurrent fetches. `last_fetched_ms` is
-  re-read from `FETCH_HEAD` after each completion and pushed on the session channel.
+- **Subprocess hygiene.** `GIT_TERMINAL_PROMPT=0`, `GCM_INTERACTIVE=never` and
+  `-c credential.interactive=false` so a missing credential fails instead of waiting on a terminal
+  or a popup that nobody is watching; `CREATE_NO_WINDOW` (`creation_flags(0x0800_0000)`) on Windows
+  or every fetch flashes a console; a per-process timeout (~60 s); at most ~4 concurrent fetches;
+  and `-c gc.auto=0 -c maintenance.auto=false`, because `git fetch` runs auto-maintenance exactly
+  as `git commit` does and an unbounded repack would be charged to the deadline. The environment is
+  **inherited whole** — clearing it would destroy the credential helpers and SSH config the CLI was
+  chosen for.
+
+  **None of those variables closes `ssh`'s own prompts**, and overriding `core.sshCommand` to add
+  `-o BatchMode=yes` would stomp a user's jump-host configuration. The timeout is the only
+  universal backstop, which is why it is not optional.
+
+- **After each completion the row is re-read at Tier 1 through `live::refresh_one` and pushed on
+  the session channel.** Not a `last_fetched_ms` patch: a fetch moves `behind`, can move `ahead`,
+  moves the tracking ref's tip, and with `--prune` can remove `upstream` outright — so writing that
+  one field would put a one-second-old age beside four stale numbers, which is this section's own
+  premise inverted.
+
+- **The flags are `--quiet --prune --no-recurse-submodules --all`.** `--prune` is required by the
+  honesty rules rather than optional: without it a deleted remote branch leaves its tracking ref
+  forever and `behind` counts against a ref that no longer exists upstream. Its destructive
+  neighbour `--prune-tags` deletes the user's own local tags and is **never** passed. `--all`
+  because `last_fetched_ms` is a repository-level fact, so fetching one remote of three and
+  stamping the whole row fresh would overstate everything the row does not show.
+
+- **Where a fetch failure goes: nowhere on the row.** See §12 item 8.
 
 ### 8.3 Search
 
@@ -984,9 +1054,18 @@ produces binaries that fail on the stated floor.
 
 ### 10.2 External tools are real but graceful dependencies
 
-Viewing status needs no Git — that is in-process `gix`. Fetch/pull/push do (§8.2). Detect its
-absence at startup and disable those actions with an explanation rather than failing at click
-time; the rest of the app stays fully functional.
+Viewing status needs no Git — that is in-process `gix`. Fetch does (§8.2). Detect its absence at
+startup and disable those actions with an explanation rather than failing at click time; the rest
+of the app stays fully functional.
+
+**Both layers, because the startup probe is an affordance and not the truth.** The same argument
+this section makes below for the editor and the terminal — a `PATH` can change while the app runs
+— applies to `git` no less, so `fetch_repos` resolves it again per invocation and refuses if it
+has gone, and the engine reports `GitMissing` per repository if it disappears mid-pass. The probe
+runs `git --version` rather than only resolving a path, because on a managed machine a `git.exe`
+that exists and a `git.exe` this process may execute are different facts. And the explanation is
+on the page as well as in the button's tooltip: a tooltip is unreachable by keyboard and invisible
+to anyone who does not hover, which is not "with an explanation".
 
 `open_in`'s editor and terminal are the same kind of dependency and degrade differently, on
 purpose. What they run is configured rather than fixed (§6.1), so there is nothing to detect at
@@ -1046,7 +1125,7 @@ the built bundle's `import.meta.env.PROD` flag (§3.3).
 Each phase gets a runbook in `docs/` when it starts, written against the tree as it exists then,
 and is deleted when the phase completes — durable facts move into README.md, AGENTS.md, and the
 phase's own entry below, which is why `docs/` is empty or absent whenever no phase is open.
-No phase is currently open; Phase 7 gets the next one.
+No phase is currently open; Phase 8 gets the next one.
 
 **Phase 0 — Environment and structure.** The Cargo workspace with its root `[profile.release]`
 (§4.1), `pnpm-workspace.yaml` with the catalog and the `vite`→core override, `vite.config.ts`
@@ -1331,8 +1410,78 @@ Also settled, and cheaper than expected: the reverse index needed to map a watch
 making it a list gave the reference counting for free, so a worktree going away cannot release the
 refs its parent is still watching.
 
-**Phase 7 — Fetch.** Opt-in `git fetch` via CLI with the §8.2 subprocess hygiene, rate-limited,
-with visible last-fetched state and a clear failure surface for auth problems.
+**Phase 7 — Fetch.** Opt-in `git fetch` via CLI with the §8.2 subprocess hygiene, bounded by a
+concurrency cap and a repeat guard, with visible last-fetched state and a clear failure surface
+for auth problems. **The point at which ahead/behind can be made true rather than only dated.**
+
+_Verified:_ 186 Rust tests (11 discovery, 20 Tier 0, 12 Tier 1, 14 Tier 2, 9 watch, 14 fetch,
+26 engine unit, 80 in `src-tauri`) and 240 frontend tests across 29 files, with `vp check`,
+`vp run typecheck`, `vp run build` and `vp run verify` clean. `vp run types` adds six generated
+files — `FetchStatus`, `FetchOutcome`, `FetchSummary`, `FetchEvent`, `FetchId`, `GitInfo` — and
+regenerating a second time changes nothing.
+
+The fourteen integration tests run against a real `git` and a real local origin, each building its
+own — a fetch **mutates** the repository it runs in, so the shared `status_tree()` the other tiers
+use would have tests moving each other's ahead/behind under parallel execution. Nothing touches
+the network: the unreachable-remote case is staged as **loopback port 1**, where a connection is
+refused with no DNS lookup, rather than as a `.invalid` hostname that a corporate resolver would
+turn into a multi-second hang.
+
+Fetch timings, from `cargo run --release --example scan -- <tree> --fetch --yes` over a generated
+tree of **40 local clones** of one bare origin, four concurrent:
+
+| Stage       | Result                                      |
+| ----------- | ------------------------------------------- |
+| Discovery   | 19 ms over 41 repositories                  |
+| Tier 0      | 318 ms                                      |
+| Tier 1      | 159 ms                                      |
+| **Fetch**   | **3588 ms wall, ~90 ms per repo attempted** |
+| Slowest one | 416 ms                                      |
+
+**The origin is local, so that figure is process-spawn cost plus local transport and says nothing
+about a network.** A tree of real remotes would be dominated by the slowest one and by the
+concurrency cap, which is exactly why the UI counts a repository as done when it has settled
+rather than when it started. The bare `origin.git` in that tree came back `NoRemote` with no
+process spawned, which is the pre-flight paying for itself outside a test. Engine timings are
+otherwise unchanged: the only edit to the tiered path is the `FETCH_HEAD` read below, and it costs
+a second `stat` on a linked worktree and nothing at all on every other kind.
+
+_Settled by writing it:_ five things — two of them corrections to text that was simply wrong, one
+a gap no section had covered, and two traps worth writing down before someone rediscovers them.
+
+**`FETCH_HEAD` is not always in the common directory, and [AGENTS.md](./AGENTS.md) said it was.**
+Measured on git 2.54.0.windows.1 in both directions: a fetch run _in a linked worktree_ writes it
+into that worktree's **private** directory and not the common one, while the `refs/remotes/*` it
+updates are shared as documented. The old rule is true only of a worktree that has never itself
+been fetched and false the moment one is, so `tier0::fetch_head_ms` now takes both directories and
+returns the newer. Reading one reports "never fetched" for a repository fetched a second ago — in
+the field whose whole job is to say how stale the counts beside it are.
+
+**A fetch triggers the watcher for everything it touches, and no section had joined those two
+sentences.** §7.2 puts the git-dir root and `refs/` in the watch set; §8.2 says a fetch writes
+`FETCH_HEAD` and remote refs. Left alone a 300-repository pass runs 300 redundant Tier 0+1
+refreshes. §7.5 now carries the rule, and the shape of it is the interesting part: the suppression
+is a **deadline** so a fetch that panics cannot silently kill a row's live updates, and it
+**defers** a notice rather than dropping one so that "only the watcher invalidates Tier 2" stays
+true rather than gaining a second exception.
+
+**§8.2 described the post-fetch refresh as a one-field patch**, which is the bug rather than the
+fix — corrected above, along with the fetch flags, auto-maintenance, and the fact that
+`GIT_TERMINAL_PROMPT=0` closes neither a credential helper's GUI nor `ssh`'s prompts.
+
+**A row resurrected by a fetch completing after eviction is permanent**, and the mechanism causing
+it is a documented feature: `merge_tier0` inserts where there was no row so `refresh_repo` can
+retry a §8.1 failure. It is in _Durable failure shapes_ rather than here, because it is silent.
+
+**The fetch progress bar is determinate where the scan's is not**, and a reader copying
+`ScanProgress.vue` will get that backwards. A scan's denominator does not exist until discovery
+ends; a fetch is handed its exact list before the first process starts. The numerator counts
+repositories **settled**, never started, or the bar reads 100% with four still running.
+
+Also settled, and cheaper than expected: `resolve_in` moved into the engine so `git` and the
+configured editor share one `PATH` walk, and the frontend needed no change to `HandleSessionEvent`
+at all — a fetch's rows arrive on the session channel and its existing `EnsureDetail` call already
+does the right thing for both an invalidated drawer and an untouched one.
 
 **Phase 8 — Packaging.** Signing or an allow indicator secured first (§9), then the Windows
 installer, then the CI matrix.
@@ -1346,16 +1495,22 @@ Phases 1–4 are the product. 5–7 make it pleasant. 8 makes it shippable.
 Settle each before the phase that depends on it. Numbering is stable — a settled item keeps its
 number rather than being removed, because §9 and elsewhere cite these by number.
 
-1. **Write actions.** Read-only plus batch fetch is the §1.2 scope. Confirm it stays that way, or
-   accept a much larger surface. _(Blocks Phase 7.)_
+1. ~~**Write actions.**~~ **Settled:** read-only plus batch fetch, as §1.2 has it. No pull, no
+   push, no staging. Fetch is in because ahead/behind is meaningless without it; everything else
+   would turn a reporter into a mutator and bring failure modes — a half-applied pull, a rejected
+   push — that the row model has nowhere to put. _(Delivered in Phase 7.)_
 2. ~~**Nested repos.**~~ **Settled:** stop at the first `.git`, with an opt-in flag to keep
    descending — as §5.1 specifies. With the flag off a submodule is never reached, because the
    parent's `.git` stops the descent above it; with the flag on a submodule gets its own row like
    any other nested checkout. Either way the `submodules` list on the **parent** row is read from
    the parent's config rather than by walking, so the two never disagree — as Tier 2 work, because
    reading it touches the worktree and the index (§5.1). _(Delivered in Phase 1.)_
-3. **Fetch policy.** Manual-only, or opt-in periodic background fetch? Recommend manual plus an
-   explicit "fetch all"; auto-fetch over VPN on 300 repos is a support burden. _(Blocks Phase 7.)_
+3. ~~**Fetch policy.**~~ **Settled:** manual only — a per-row button and an explicit batch button.
+   Nothing fetches on launch, on a scan, or on a timer. What "all" means is the part that needed
+   deciding beyond the original question: it is **what the table is showing**, so filter-to-stale
+   then fetch is one gesture and no click ever starts more network operations than the label
+   says. A five-minute per-repository guard on batches makes a second press cheap. _(Delivered in
+   Phase 7.)_
 4. **`gix` pin policy.** The exact-pin half is done — `Cargo.toml` pins `=0.87.1` and AGENTS.md
    treats upgrades as tasks. What is still open is the cadence: who checks for a `gix` minor bump,
    and how often. _(Affects maintenance, not a phase.)_
@@ -1376,6 +1531,15 @@ number rather than being removed, because §9 and elsewhere cite these by number
    value, so `full_status` reports the failure as `Err` and the frontend keeps it per path, beside
    the drawer that asked for it. `merge_tier2` therefore does not touch `error` at all, which is the
    only place it differs from `merge_tier1`. _(Delivered in Phase 4.)_
+8. ~~**Where a fetch failure goes.**~~ **Settled:** nowhere on the row, and for a sharper reason
+   than item 7's. Tier 0 owns `RepoStatus.error` and **replaces** it — and a fetch's own completion
+   path re-reads Tier 0 — so a failure written there would be erased by this same operation
+   milliseconds later. Appending fails for item 7's reason as well, since a fetch is repeatable per
+   row. It goes in a frontend map keyed by path, cleared by that row's next fetch, which makes four
+   such maps; the rule that keeps them apart is that **each is owned by one operation and cleared
+   by that operation's next attempt**. The four kinds of non-failure — no remote, too soon,
+   cancelled, ok — write nothing at all, because reporting "there is nothing to fetch from" as a
+   failure would put a red row on a repository that is perfectly fine. _(Delivered in Phase 7.)_
 
 ---
 

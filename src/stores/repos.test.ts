@@ -153,6 +153,40 @@ describe('repos store', () => {
   });
 
   /**
+   * **The fetch state is the exception**, and the divergence is the point of the test.
+   *
+   * Every other map `ResetSummaries` clears describes work that has finished. `fetchStates`
+   * describes work still running in Rust, so clearing it on a launch reconcile would claim a fetch
+   * had stopped when it had not — and nothing would ever put the row back.
+   */
+  it('keeps the fetch state when only the session is reset', () => {
+    const store = useReposStore();
+    store.SetFetchState('C:/work/a', 'running');
+    store.SetFetchError('C:/work/b', 'fatal: Authentication failed');
+
+    store.ResetSummaries();
+
+    expect(store.fetchStates.get('C:/work/a')).toBe('running');
+    expect(store.fetchErrors.get('C:/work/b')).toBe('fatal: Authentication failed');
+    expect(store.fetching).toBe(true);
+  });
+
+  /**
+   * Only the fetch's own terminal event knows the pass is over, which is what discharges the claim
+   * `queued` makes. Failures survive it: they are what the user reads afterwards.
+   */
+  it('clears the in-flight rows without clearing the failures', () => {
+    const store = useReposStore();
+    store.SetFetchState('C:/work/a', 'queued');
+    store.SetFetchError('C:/work/b', 'boom');
+
+    store.ClearFetchStates();
+
+    expect(store.fetching).toBe(false);
+    expect(store.fetchErrors.get('C:/work/b')).toBe('boom');
+  });
+
+  /**
    * A launch failure has a map of its own. The row's one `error` slot is owned by the tiers that
    * run during a scan, and the drawer's Tier 2 failures are a third thing again — collapsing any
    * two of them means one cause erases another.
