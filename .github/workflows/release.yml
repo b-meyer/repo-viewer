@@ -17,6 +17,9 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # The prepare script runs `vp config`, which installs git hooks. A runner clones once and
+  # never pushes, so the hooks are pure cost there.
+  VP_GIT_HOOKS: 0
 
 jobs:
   build:
@@ -65,7 +68,7 @@ jobs:
 
       # Both Windows builds emit identical filenames, so the offline pair would silently overwrite
       # the bootstrapper pair. Stage the first set before the second build runs, then suffix the
-      # second — the two installers are indistinguishable by name otherwise, and the 254 MB one is
+      # second — the two installers are indistinguishable by name otherwise, and the ~210 MB one is
       # not what a normal user should be handed.
       - name: Stage bootstrapper installers
         if: matrix.label == 'windows'
@@ -149,7 +152,7 @@ jobs:
 
             Windows gets two installers. Take `*-setup.exe` unless the machine cannot reach the
             internet during installation, in which case take `*-setup-offline.exe`, which carries
-            the WebView2 runtime with it and is around 250 MB larger.
+            the WebView2 runtime with it and is roughly 200 MB larger.
 
             ## These builds are not signed
 

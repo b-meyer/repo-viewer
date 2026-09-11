@@ -6,6 +6,9 @@
   "license": "MIT",
   "author": "Blake Meyer",
   "type": "module",
+  "scripts": {
+    "prepare": "vp config --no-agent"
+  },
   "dependencies": {
     "@tauri-apps/api": "catalog:",
     "@vue/devtools-api": "catalog:",

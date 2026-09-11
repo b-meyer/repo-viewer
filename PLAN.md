@@ -1081,9 +1081,11 @@ binary reads the `pv (REG_SZ)` value for the WebView2 Runtime under **both**
 produces a native message box naming the fix rather than a blank exit — and it reads the HKLM value
 through `WOW6432Node`, without which it finds nothing on a machine that has the runtime. Keep
 `downloadBootstrapper` for general distribution and build a second `offlineInstaller` artifact for
-locked-down environments. **That artifact is ~254 MB against the bootstrapper's ~4 MB**, measured on
-this toolchain; Tauri documents the difference as ~127 MB and it is roughly double that, which
-matters when the number is going in front of a user deciding which link to click.
+locked-down environments. **That artifact is ~210 MB against the bootstrapper's ~4 MB**; Tauri
+documents the difference as ~127 MB, and it is well over that. The exact size tracks the WebView2
+runtime version the build downloads, so treat it as a band rather than a constant — a local build a
+day earlier came out at 254 MB. The number matters because it goes in front of a user choosing which
+link to click.
 
 **Linux is version-gated, not just dependency-managed.** A Tauri v2 `.deb` declares
 `libwebkit2gtk-4.1-0` and `libgtk-3-0`, so `apt` pulls them — but 4.1 exists in jammy 22.04,
@@ -1183,10 +1185,7 @@ filenames**, so the first pair is staged before the second build runs and the se
 Each phase gets a runbook in `docs/` when it starts, written against the tree as it exists then,
 and is deleted when the phase completes — durable facts move into README.md, AGENTS.md, and the
 phase's own entry below, which is why `docs/` is empty or absent whenever no phase is open.
-**Phase 8 is open.** Everything in it is built and verified locally; what is left is the one thing
-that cannot be checked from a working copy — the workflows in `.github/` have never run, because
-running them requires a push. Delete `docs/phase-8.md` once CI is green on a branch and a tag has
-produced a Release.
+No phase is currently open, and every phase below is delivered.
 
 **Phase 0 — Environment and structure.** The Cargo workspace with its root `[profile.release]`
 (§4.1), `pnpm-workspace.yaml` with the catalog and the `vite`→core override, `vite.config.ts`
@@ -1546,7 +1545,8 @@ does the right thing for both an invalidated drawer and an untouched one.
 
 **Phase 8 — Packaging.** Real icons, a WebView2 runtime probe, upgrade-safe installer
 configuration, a version-consistency guard, a launch smoke test, and GitHub Actions for both CI and
-releases. **The point at which someone who will not build it can have it.**
+releases, and an MIT licence. **The point at which someone who will not build it can have it** — v0.1.0
+is published, with seven installers across Windows, macOS and Linux.
 
 _Verified:_ 192 Rust tests (11 discovery, 20 Tier 0, 12 Tier 1, 14 Tier 2, 9 watch, 14 fetch, 26
 engine unit, 86 in `src-tauri`) and 240 frontend tests across 29 files, with `vp check`,
@@ -1561,6 +1561,12 @@ and `settings.json` in `%APPDATA%` is byte-identical to before. No manual uninst
 MSI's `UpgradeCode` is the configured GUID in both the 0.1.0 and 0.1.1 builds, sitting in the Property
 table beside `ProductVersion` — the MSI install-and-upgrade cycle itself was **not** run end to end,
 because a per-machine MSI needs elevation and the installed binary is blocked anyway (below).
+
+**CI and the release ran, which is the half a working copy cannot prove.** Four jobs green on every
+commit — checks plus a build on `windows-latest`, `macos-latest` and `ubuntu-22.04` — and the tag
+workflow published v0.1.0 with seven assets: both Windows installer pairs (bootstrapper and
+offline), a `.deb`, an `.AppImage`, and a `.dmg`. The macOS artifact is **aarch64**, not universal,
+because `macos-latest` is Apple Silicon; an Intel Mac is not covered and nothing has asked for one.
 
 _Settled by writing it:_ four things, two of them corrections to this document.
 
@@ -1585,8 +1591,9 @@ here: the `pv` value exists only under `HKLM\SOFTWARE\WOW6432Node\...`, and the 
 returns nothing on a machine carrying runtime 152.0.4191.66. See _Durable failure shapes_ in
 [AGENTS.md](./AGENTS.md).
 
-Also settled, and more expensive than documented: **the offline installer is ~254 MB, not the
-~127 MB Tauri's guide states** — 60x the bootstrapper rather than 30x. And the two Windows builds
+Also settled, and more expensive than documented: **the offline installer runs 210–255 MB against
+the ~127 MB Tauri's guide states** — around 50x the bootstrapper rather than 30x, and it moves with
+the WebView2 runtime version each build downloads. And the two Windows builds
 really do collide: running the offline build after the bootstrapper one overwrote both artifacts in
 place, which is why the release workflow stages the first pair before the second build starts rather
 than after it.

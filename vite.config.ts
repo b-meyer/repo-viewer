@@ -12,6 +12,7 @@ const IGNORE_PATTERNS = [
   '**/dist/**',
   '**/node_modules/**',
   '**/target/**',
+  '**/coverage/**',
   'src-tauri/gen/**',
   // ts-rs writes this; a formatter rewriting it makes every regeneration produce a diff that
   // reflects nothing, and CI's "regenerate and fail on a diff" check stops meaning anything.
@@ -62,8 +63,16 @@ export default defineConfig({
 
   test: {
     environment: 'jsdom',
+    // Threads, not the default forks: measured at half the wall clock on this suite (10s against
+    // 20s), and nothing here needs process isolation.
+    pool: 'threads',
     include: ['src/**/*.{test,spec}.{ts,vue}'],
     setupFiles: ['src/tests/setup.ts'],
+    // Reset mock state between tests here rather than in each file. `ipc.ts` is stateless by
+    // design so that `clearMocks` alone is enough to isolate a test — this is the config half of
+    // that bargain, and without it isolation depends on every file remembering to do it.
+    clearMocks: true,
+    restoreMocks: true,
   },
 
   lint: {
@@ -170,6 +179,10 @@ export default defineConfig({
     },
     ignorePatterns: IGNORE_PATTERNS,
   },
+
+  // Formats and lints whatever is being committed. The pre-push hook in .vite-hooks/ is the
+  // cold gate on top of this; both are installed by `vp config`, run from the `prepare` script.
+  staged: { '*': 'vp check --fix' },
 
   run: {
     tasks: {

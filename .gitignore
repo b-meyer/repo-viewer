@@ -24,8 +24,11 @@ dist-ssr/
 *.local
 
 # Editors and OS
+# Shared editor configuration is committed; everything else under .vscode/ is personal state
+# (launch targets, per-user tasks, extension scratch) and is not.
 .vscode/*
 !.vscode/extensions.json
+!.vscode/settings.json
 .idea/
 .DS_Store
 *.suo

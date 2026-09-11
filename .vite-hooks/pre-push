@@ -1,0 +1,19 @@
+#!/usr/bin/env sh
+# The cold gate. Runs before every `git push`; installed by `vp config` via the `prepare` script.
+#
+# `vp run` caches tasks *and* scripts, and on a hit it replays the captured stdout without executing
+# anything. So a warm green `vp run` can report success against code it never re-ran, while CI runs
+# cold and catches what the replay hid. Everything below is therefore either the `vp check` builtin
+# (never cached) or explicitly `--no-cache`.
+#
+# This mirrors CI's Checks job step for step. Anything that fails here would have failed CI one
+# round trip later, which is the whole point: the feedback is worth the couple of minutes.
+#
+# `git push --no-verify` skips it. That is for an emergency, not for being in a hurry.
+set -e
+
+vp check
+vp run --no-cache typecheck
+vp test run
+vp run versions
+vp run rust

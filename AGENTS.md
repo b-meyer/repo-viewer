@@ -43,6 +43,45 @@ because `vp` is not global on a GitHub Actions runner — a pipeline detail, not
 Imports: configs from `vite-plus`, tests from `vite-plus/test`. **Never `vite` / `vitest`
 direct** — `vite-plus/oxlint-plugin` enforces this.
 
+### Git hooks, and the cold gate
+
+`prepare` runs `vp config --no-agent` on install, which points `core.hooksPath` at
+`.vite-hooks/_` — a dispatcher that ignores itself, so only hooks written by hand are committed.
+`--no-agent` because that flag's other job is rewriting agent instructions, and this file is
+hand-maintained.
+
+Two hooks. **Pre-commit** is `staged: { '*': 'vp check --fix' }` in `vite.config.ts`, so whatever
+is being committed is formatted and linted first. **Pre-push** is `.vite-hooks/pre-push`, which
+mirrors CI's Checks job: `vp check`, a `--no-cache` typecheck, `vp test run`, `vp run versions`,
+`vp run rust`.
+
+**Everything in that gate is cold on purpose.** `vp run` caches tasks _and_ scripts, and on a hit
+it replays captured stdout without executing anything — so a warm green `vp run` can report success
+against code it never re-ran, while CI runs cold and catches what the replay hid. `typecheck` is
+the one cached task here, which is why the hook passes `--no-cache` to it specifically. Never report
+"passes" from a cached `vp run`.
+
+CI sets `VP_GIT_HOOKS=0`: a runner clones once and never pushes, so installing hooks there is pure
+cost. `git push --no-verify` skips the gate locally — for an emergency, not for a hurry.
+
+### Editor settings
+
+`.vscode/settings.json` and `extensions.json` are committed, as they are in the sibling repos, and
+carry the same house block: oxc as the default formatter, format-on-save, `source.fixAll.oxc`,
+`npm.scriptRunner: vp`, `oxc.fmt.configPath` pointed at `vite.config.ts`, file nesting, and the
+Tailwind bindings. Three deliberate deviations, all because this repo is not a pure frontend:
+
+- **`target/` and `dist/` are excluded from the file watcher and search.** No sibling repo needs
+  this. Measured here: `target/` is **19 GB across 29,020 files**, against 297 MB for
+  `node_modules`, so letting the editor watch and index it is a real cost rather than a tidiness
+  preference.
+- **Rust gets its own formatter binding and `rust-analyzer.check.command: "clippy"`** with
+  `--all-targets`, so the editor reports exactly what `vp run rust` and CI report. Left on the
+  default `cargo check`, clippy failures would appear for the first time in the pre-push gate.
+- **`*.md` is not nested under `vite.config.*`.** The house pattern hides it there, which is fine
+  where the markdown is incidental. Here PLAN.md is the specification and AGENTS.md is this file;
+  burying them under a build config is the wrong default.
+
 ## Architecture invariants
 
 Break any of these and the design stops working. They are not style preferences.
@@ -813,9 +852,9 @@ build leg so a platform emitting nothing fails at once.
 **The two Windows installers have identical filenames.** `tauri build` and
 `tauri build --config src-tauri/tauri.offline.conf.json` differ only in `webviewInstallMode`, and
 both write `Repo Viewer_<version>_x64-setup.exe` and `..._x64_en-US.msi` — so running them in
-sequence silently overwrites the first pair with the ~254 MB offline one. Stage the first pair
+sequence silently overwrites the first pair with the offline one, which is ~50x larger. Stage the first pair
 before the second build runs. Handing a user the offline installer by accident is not a broken
-release, but it is a 254 MB download nobody asked for.
+release, but it is a ~210 MB download nobody asked for.
 
 **Git writes `.git/index` three times per operation.** It writes `index.lock`, writes, then
 renames, so one `git add` produces a create/modify/remove burst. Debouncing

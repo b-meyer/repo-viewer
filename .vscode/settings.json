@@ -1,0 +1,43 @@
+{
+  "editor.tabSize": 2,
+  "editor.detectIndentation": false,
+  "editor.defaultFormatter": "oxc.oxc-vscode",
+  "editor.formatOnSave": true,
+  "editor.formatOnSaveMode": "file",
+  "editor.codeActionsOnSave": {
+    "source.fixAll.oxc": "explicit"
+  },
+  "npm.scriptRunner": "vp",
+  "oxc.fmt.configPath": "./vite.config.ts",
+  "[javascript]": { "editor.defaultFormatter": "oxc.oxc-vscode" },
+  "[typescript]": { "editor.defaultFormatter": "oxc.oxc-vscode" },
+  "[vue]": { "editor.defaultFormatter": "oxc.oxc-vscode" },
+  "[rust]": { "editor.defaultFormatter": "rust-lang.rust-analyzer" },
+  "rust-analyzer.check.command": "clippy",
+  "rust-analyzer.check.extraArgs": ["--all-targets"],
+  "explorer.fileNesting.enabled": true,
+  "explorer.fileNesting.expand": false,
+  "explorer.fileNesting.patterns": {
+    ".gitignore": ".gitattributes",
+    "package.json": "pnpm*.yaml, .npmrc, .node-version",
+    "Cargo.toml": "Cargo.lock",
+    "tauri.conf.json": "tauri.*.conf.json",
+    "vite.config.*": "index.html, tsconfig*, *.yml, LICENSE",
+    "*.vue": "${capture}.*.ts",
+    "*.ts": "${capture}.*.ts"
+  },
+  "explorer.sortOrder": "type",
+  "files.associations": { "*.css": "tailwindcss" },
+  "tailwindCSS.lint.cssConflict": "ignore",
+  "[tailwindcss]": { "editor.defaultFormatter": "bradlc.vscode-tailwindcss" },
+  "files.watcherExclude": {
+    "**/target/**": true,
+    "**/dist/**": true,
+    "**/node_modules/**": true
+  },
+  "search.exclude": {
+    "**/target/**": true,
+    "**/dist/**": true,
+    "**/pnpm-lock.yaml": true
+  }
+}

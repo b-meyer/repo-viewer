@@ -106,8 +106,9 @@ each version tag, built by CI on all three platforms. Download one and run it.
 detects the version you have, replaces it, and leaves `settings.json` and the row cache alone.
 
 Windows gets two installers. Take `*-setup.exe`; take `*-setup-offline.exe` only if the machine
-cannot reach the internet while installing, since it carries the WebView2 runtime with it and is
-around 250 MB larger.
+cannot reach the internet while installing, since it carries the WebView2 runtime with it. That
+makes it roughly 200 MB larger, and the exact figure tracks whichever runtime version the build
+downloaded.
 
 ### The builds are not signed
 
@@ -164,7 +165,7 @@ cargo new --bin /tmp/linkcheck && cd /tmp/linkcheck && cargo build
 
 `@tauri-apps/cli` is a project dependency, not a global install. The Tauri bundler downloads WiX
 and NSIS on the first `tauri build`, so that build needs network access — and the offline-installer
-build downloads the WebView2 runtime itself every time, which is where its ~250 MB comes from.
+build downloads the WebView2 runtime itself every time, which is where its bulk comes from.
 
 ---
 

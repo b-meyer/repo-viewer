@@ -21,6 +21,9 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # The prepare script runs `vp config`, which installs git hooks. A runner clones once and
+  # never pushes, so the hooks are pure cost there.
+  VP_GIT_HOOKS: 0
 
 jobs:
   checks:
