@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <!--
+    Source for every file in this directory. Regenerate the set with:
+
+        pnpm exec tauri icon src-tauri/icons/source.svg
+
+    The subject is what the app is: a list of repositories, each carrying a status. Three rows and
+    three dots survive being drawn at 32px, which is the size that decides an icon; a branch-and-
+    commit graph does not, and is what every other Git tool uses anyway.
+
+    Colours are the app's own, from src/styles/theme.css: navy `color-primary-650` to
+    `color-primary-850` for the tile, `color-primary-200` for the rows, and the 400-weight green,
+    orange and teal the table itself uses for clean, dirty and behind. Hex rather than hsl() so no
+    rasteriser has to agree with us about colour syntax.
+
+    Note for anyone editing this comment: XML forbids a double hyphen inside one, so the custom
+    properties are named here without their leading dashes. Restoring them makes the file
+    unparseable, and `tauri icon` reports it as a panic rather than as a syntax error.
+  -->
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#34537F" />
+      <stop offset="1" stop-color="#162436" />
+    </linearGradient>
+  </defs>
+
+  <rect x="64" y="64" width="896" height="896" rx="200" fill="url(#tile)" />
+
+  <g fill="#B7C8E1">
+    <rect x="404" y="306" width="330" height="68" rx="34" />
+    <rect x="404" y="478" width="264" height="68" rx="34" />
+    <rect x="404" y="650" width="304" height="68" rx="34" />
+  </g>
+
+  <circle cx="292" cy="340" r="54" fill="#57DB83" />
+  <circle cx="292" cy="512" r="54" fill="#DB8357" />
+  <circle cx="292" cy="684" r="54" fill="#57DBDB" />
+</svg>

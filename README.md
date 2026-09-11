@@ -22,8 +22,12 @@ one-minute poll and a refresh-on-focus underneath in case the filesystem watcher
 And the ahead/behind counts can be **made** current rather than only dated — a button per row and
 one in the toolbar run `git fetch`, four at a time, against whatever credential helper and SSH
 config you already have. Scans and fetches are cancellable and roots are managed in-app. The engine
-also still works without a GUI, through the `scan` example. Each phase gets its own runbook in
-`docs/` while it is being worked on.
+also still works without a GUI, through the `scan` example.
+
+It is also **shippable**: CI builds installers for Windows, macOS and Linux and attaches them to a
+GitHub Release per tag, and installing a new version over an old one keeps your settings. The one
+thing still outstanding is code signing — see below. Each phase gets its own runbook in `docs/`
+while it is being worked on.
 
 ---
 
@@ -93,6 +97,31 @@ flowchart TB
 
 ---
 
+## Getting a build
+
+Installers are attached to a [GitHub Release](https://github.com/b-meyer/repo-viewer/releases) for
+each version tag, built by CI on all three platforms. Download one and run it.
+
+**Installing over an existing version works.** You do not need to uninstall first — the installer
+detects the version you have, replaces it, and leaves `settings.json` and the row cache alone.
+
+Windows gets two installers. Take `*-setup.exe`; take `*-setup-offline.exe` only if the machine
+cannot reach the internet while installing, since it carries the WebView2 runtime with it and is
+around 250 MB larger.
+
+### The builds are not signed
+
+Windows SmartScreen warns about them. More importantly, a machine running application allowlisting —
+as corporate-managed fleets commonly do — can refuse to run the installed app with an access-denied
+error even though the installer completed. That is enforcement, not a corrupt download, and no amount of
+retrying moves it; it needs a rule from IT. Signing is tracked as separate work — see
+[PLAN.md §9](./PLAN.md).
+
+On such a machine, running from a build tree may work where an installed copy does not, because the
+allowlist is by path.
+
+---
+
 ## Requirements
 
 ### To run it
@@ -134,7 +163,8 @@ cargo new --bin /tmp/linkcheck && cd /tmp/linkcheck && cargo build
 ```
 
 `@tauri-apps/cli` is a project dependency, not a global install. The Tauri bundler downloads WiX
-and NSIS on the first `tauri build`, so that build needs network access.
+and NSIS on the first `tauri build`, so that build needs network access — and the offline-installer
+build downloads the WebView2 runtime itself every time, which is where its ~250 MB comes from.
 
 ---
 
@@ -160,6 +190,9 @@ to `allowBuilds:` in `pnpm-workspace.yaml`.
 | Vue SFC + config type-check           | `vp run typecheck`                                                        |
 | Unit tests                            | `vp test run`                                                             |
 | Production build + installer          | `vp run build`, then `vp run verify`                                      |
+| Launch the built binary as a check    | `vp run smoke`                                                            |
+| Check the build emitted installers    | `vp run bundles`                                                          |
+| Check the three version fields agree  | `vp run versions`                                                         |
 | Regenerate the TypeScript types       | `vp run types`                                                            |
 | Rust checks                           | `vp run rust`                                                             |
 | Scan a tree without the GUI           | `cargo run --release --example scan -- C:/Working --rows --tier2 --watch` |
@@ -269,8 +302,8 @@ because it is looked for again on every fetch, installing it does not need a res
 
 ## Layout
 
-The target shape. Entries marked with a phase do not exist yet — see the
-[roadmap](./PLAN.md#11-roadmap). Everything unmarked is in the repo now.
+Everything below is in the repo now. A `docs/` directory appears beside these while a phase is being
+worked on and is deleted when it closes — see the [roadmap](./PLAN.md#11-roadmap).
 
 ```
 repo-viewer/
@@ -284,8 +317,8 @@ repo-viewer/
 ├── vite.config.ts                # vp config: vite + test + lint + fmt + run.tasks
 ├── tsconfig.json                 # the app; vue-tsc runs on this
 ├── tsconfig.node.json            # node types for vite.config.ts; tsgolint discovers it
-├── tools/scripts/                # build-frontend.mjs, verify-prod-bundle.mjs
-├── azure-pipelines.yml           # ← Phase 8
+├── tools/scripts/                # build-frontend.mjs, verify-prod-bundle.mjs, check-versions.mjs, smoke.mjs
+├── .github/workflows/            # ci.yml — checks + a build per platform; release.yml — tag → installers on a Release
 │
 ├── src/                          # ── Vue frontend
 │   ├── layout/                   # App.vue shell, Header.vue
@@ -317,11 +350,13 @@ repo-viewer/
 └── src-tauri/                    # ── THIN shell. Tauri glue only.
     ├── build.rs
     ├── tauri.conf.json
+    ├── tauri.offline.conf.json   # the one override that makes the second, offline Windows installer
     ├── capabilities/             # core:default only — plugins are called from Rust
-    ├── icons/                    # placeholder set; replaced in Phase 8
+    ├── icons/                    # source.svg is the one to edit; the rest are generated from it
     └── src/
         ├── main.rs               # calls run(); windows_subsystem = "windows" in release
         ├── lib.rs                # run(): builder, plugins, invoke_handler
+        ├── webview2.rs           # is there a runtime to draw into? asked before the builder
         ├── state.rs              # canonical HashMap<PathBuf, RepoStatus>, tier merge
         ├── stream.rs             # batching for tauri::ipc::Channel sends
         ├── pipeline.rs           # the scan driver: discovery → batch → Tier 0 → merge
@@ -341,4 +376,9 @@ rust-analyzer, or RustRover.
 
 ## Licence
 
-Internal to CIT Solutions.
+MIT — see [LICENSE](./LICENSE).
+
+Every dependency is permissively licensed; there is no GPL or AGPL anywhere in the tree. Six crates
+reached through Tauri and `dirs` are **MPL-2.0** (`cssparser`, `cssparser-macros`, `selectors`,
+`uluru`, `dtoa-short`, `option-ext`). MPL-2.0 is file-level weak copyleft: the binary ships under
+MIT, those files stay under MPL, and their source is obtainable unmodified from crates.io.

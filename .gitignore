@@ -5,6 +5,12 @@
 # Tauri generates capability schemas on build.
 /src-tauri/gen/schemas/
 
+# `tauri icon` writes iOS and Android sets beside the desktop ones whether or not they are wanted,
+# and this app ships neither platform. Ignored rather than deleted-and-forgotten, so regenerating
+# the icons from source.svg does not put fifty mobile PNGs into a review.
+/src-tauri/icons/android/
+/src-tauri/icons/ios/
+
 # Node
 node_modules/
 .pnpm-store/

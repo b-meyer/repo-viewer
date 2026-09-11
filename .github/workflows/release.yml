@@ -1,0 +1,159 @@
+# Builds every platform's installer for a version tag and attaches them to a GitHub Release.
+#
+# Distribution is the Release page: a user downloads the installer and runs it over the top of the
+# version they have. There is no in-app updater, so nothing here signs an update manifest and nothing
+# in the app phones home.
+#
+# The builds are **unsigned**. On a managed Windows machine that is not a cosmetic difference — see
+# the release body below, and PLAN §9.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build (${{ matrix.label }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows-latest, label: windows }
+          - { os: macos-latest, label: macos }
+          - { os: ubuntu-22.04, label: linux }
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .node-version
+
+      - name: Install pnpm
+        run: npm i -g pnpm@12.3.4
+
+      - run: pnpm install --frozen-lockfile
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # Refuses to build a tag whose version does not match the tree. Without it, tagging v0.1.1
+      # against a tree that still says 0.1.0 publishes a release whose every asset is misnamed.
+      - name: Tag matches the declared version
+        run: pnpm exec vp run versions
+
+      - name: Linux build dependencies
+        if: matrix.label == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential libssl-dev \
+            librsvg2-dev libxdo-dev
+
+      - run: pnpm exec vp run build
+      - run: pnpm exec vp run verify
+
+      # A `tauri build` asked for targets the host cannot produce exits zero having bundled
+      # nothing — this is the only step that would notice.
+      - run: pnpm exec vp run bundles
+
+      # Both Windows builds emit identical filenames, so the offline pair would silently overwrite
+      # the bootstrapper pair. Stage the first set before the second build runs, then suffix the
+      # second — the two installers are indistinguishable by name otherwise, and the 254 MB one is
+      # not what a normal user should be handed.
+      - name: Stage bootstrapper installers
+        if: matrix.label == 'windows'
+        shell: bash
+        run: |
+          mkdir -p artifacts
+          cp target/release/bundle/nsis/*-setup.exe artifacts/
+          cp target/release/bundle/msi/*.msi artifacts/
+
+      - name: Build offline installer
+        if: matrix.label == 'windows'
+        run: pnpm exec tauri build --config src-tauri/tauri.offline.conf.json
+
+      - name: Stage offline installers
+        if: matrix.label == 'windows'
+        shell: bash
+        run: |
+          for file in target/release/bundle/nsis/*-setup.exe; do
+            cp "$file" "artifacts/$(basename "${file%-setup.exe}")-setup-offline.exe"
+          done
+          for file in target/release/bundle/msi/*.msi; do
+            cp "$file" "artifacts/$(basename "${file%.msi}")-offline.msi"
+          done
+
+      - name: Stage macOS installers
+        if: matrix.label == 'macos'
+        shell: bash
+        run: |
+          mkdir -p artifacts
+          cp target/release/bundle/dmg/*.dmg artifacts/
+
+      - name: Stage Linux installers
+        if: matrix.label == 'linux'
+        shell: bash
+        run: |
+          mkdir -p artifacts
+          cp target/release/bundle/deb/*.deb artifacts/
+          # AppImage is best-effort per PLAN §9 — it has recurring packaging bugs, so its absence is
+          # not a failed release.
+          cp target/release/bundle/appimage/*.AppImage artifacts/ || true
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: installers-${{ matrix.label }}
+          path: artifacts/*
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    # The Windows leg is the one that matters. A failed macOS or Linux build must not withhold a
+    # Windows release, so this publishes whatever built.
+    if: always() && needs.build.result != 'cancelled'
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      # `if: always()` above is what lets a failed macOS or Linux leg still ship Windows. Taken
+      # alone it would also publish an empty release when every leg failed, which looks like a
+      # successful release until someone tries to download one.
+      - name: Something was actually built
+        run: |
+          count=$(find artifacts -type f | wc -l)
+          echo "$count artifact(s) downloaded"
+          test "$count" -gt 0
+
+      - uses: softprops/action-gh-release@v3
+        with:
+          files: artifacts/*
+          draft: false
+          generate_release_notes: true
+          body: |
+            ## Installing
+
+            Download the installer for your platform and run it. **You do not need to uninstall an
+            earlier version first** — the installer detects one and replaces it, keeping your
+            settings and cached rows.
+
+            Windows gets two installers. Take `*-setup.exe` unless the machine cannot reach the
+            internet during installation, in which case take `*-setup-offline.exe`, which carries
+            the WebView2 runtime with it and is around 250 MB larger.
+
+            ## These builds are not signed
+
+            Windows SmartScreen will warn. On a machine running application allowlisting the
+            installer may well succeed and the installed app then refuse to start, with an
+            access-denied error. That is enforcement, not a corrupt download, and retrying does not
+            move it — it needs a rule from IT. Signing is tracked as a separate piece of work.

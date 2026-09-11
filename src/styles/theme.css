@@ -1,6 +1,6 @@
 /* Tailwind v4 CSS-first theme. No tailwind.config.js.
  *
- * Carried over from WPT.Dashboard unchanged, so lessons about it transfer between the two repos.
+ * Carried over from the sibling dashboard app unchanged, so lessons about it transfer between the two repos.
  * Three conventions here are load-bearing, not stylistic:
  *
  *   1. `--color-*: initial` BLANKS every stock Tailwind hue. `bg-slate-500` does not fall back to a

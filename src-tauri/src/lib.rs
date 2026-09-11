@@ -25,6 +25,7 @@ mod persist;
 mod pipeline;
 mod state;
 mod stream;
+mod webview2;
 
 use std::sync::Arc;
 
@@ -38,6 +39,10 @@ use state::AppState;
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     init_tracing();
+    // Before the builder, not in `setup`: windows declared in `tauri.conf.json` are created during
+    // `build()`, so by the time `setup` runs a missing webview has already produced the blank exit
+    // this replaces with an explanation.
+    webview2::ensure();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())

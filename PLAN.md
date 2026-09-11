@@ -19,13 +19,13 @@ make it pleasant: filters and search, watching, fetch.
 
 ### 1.1 Two goals
 
-1. **The tool.** A multi-repo Git dashboard for personal use, shared with colleagues at CIT who
+1. **The tool.** A multi-repo Git dashboard for personal use, shared with colleagues who
    want it.
 2. **A delivery pattern.** Establish whether Vue/web skill transfers to shipping a desktop app to
    a smaller client — a site that cannot run a web server, or has connectivity too poor to rely
    on, but needs an intranet-style app against a **local SQL database**.
 
-Goal 2 drives most of what follows. It is why the frontend stack matches WPT.Dashboard rather
+Goal 2 drives most of what follows. It is why the frontend stack matches the sibling dashboard app rather
 than being chosen fresh, and why the code is split so the Tauri-specific parts stay thin. It is
 also why repo-viewer is a good first subject: it exercises the whole Tauri↔Vue boundary while
 having no database, isolating the mechanics from data-access concerns. The appendix records what
@@ -195,7 +195,7 @@ the path check in `open_in` (§6.1) is the real guard, not a capability scope.
 
 ### 3.2 Frontend (`src/`)
 
-The WPT.Dashboard stack at latest versions. Greenfield has no migration cost, so this repo runs
+The sibling dashboard app stack at latest versions. Greenfield has no migration cost, so this repo runs
 ahead of that catalog and serves as the proving ground for bumps later applied there.
 
 | Package                                | Version                                  | Notes                                                                          |
@@ -413,9 +413,9 @@ them wants subcommands and flags.
   user's own repositories is not. It disables git's auto-maintenance for the reason recorded in
   [AGENTS.md](./AGENTS.md), and refuses to write into a directory that already exists.
 
-### 4.5 How this maps onto WPT.Dashboard
+### 4.5 How this maps onto the sibling dashboard app
 
-| WPT.Dashboard                                               | repo-viewer                                     |
+| Sibling dashboard app                                       | repo-viewer                                     |
 | ----------------------------------------------------------- | ----------------------------------------------- |
 | `apps/ui` — Vue SPA                                         | `src/` — same stack, same conventions           |
 | OData over HTTP, `credentials: 'include'`                   | `invoke()` + `Channel<T>` (§6)                  |
@@ -928,10 +928,10 @@ is misleading if it shows stale numbers silently. So:
 
 ### 8.3 Search
 
-`minisearch` 7.2.0. CIT Quickwire's `qdocs` runs it in production
+`minisearch` 7.2.0. A sibling docs site runs it in production
 (`src/composables/useSearch.ts`); the tuning below is borrowed from there. At a few hundred
 short strings a `String.includes` filter in a `computed` would also do; MiniSearch is here for
-parity with the qdocs pattern, not because the corpus needs it.
+parity with its pattern, not because the corpus needs it.
 
 1. **`shallowRef`, never `ref`, for the instance.** The index is a large nested structure; deep
    reactivity over it is a performance disaster. The corollary is that mutating it notifies
@@ -953,7 +953,7 @@ parity with the qdocs pattern, not because the corpus needs it.
 Also carry `boost` for field weighting (repo name over its path), `MIN_QUERY_LENGTH = 2`, and
 `results` as a `computed` over `query`.
 
-**The corpus is live, not static.** qdocs fetches a prebuilt index once; here the corpus _is_ the
+**The corpus is live, not static.** That site fetches a prebuilt index once; here the corpus _is_ the
 repo set, streaming in tier by tier and mutating on watcher events. So there is no `fetch` and no
 build-time artifact: the index is fed from `scan.ts`, which is already the one file that turns
 events into store writes, so the mirror and the index are updated from the same place and cannot
@@ -969,7 +969,7 @@ Index only stable, cheap fields — repo name, path, branch, upstream. Never Tie
 are lazy and mostly unknown, so indexing them means reindexing on every tier completion for no
 search value.
 
-Do not add an `optimizeDeps.include` entry for it. qdocs needs one because `minisearch` is
+Do not add an `optimizeDeps.include` entry for it. That site needs one because `minisearch` is
 reached _through_ a library excluded from pre-bundling; here it is a direct dependency imported
 from `src/`, so Vite's initial scan pre-bundles it with no configuration.
 
@@ -977,10 +977,18 @@ from `src/`, so Vite's initial scan pre-bundles it with no configuration.
 
 ## 9. Packaging
 
-Targets: NSIS `.exe` and WiX `.msi` on Windows (MSI is Windows-build-only); `.dmg`/`.app` on
-macOS; `.deb` and `.AppImage` on Linux. ARM64 Windows needs
-`rustup target add aarch64-pc-windows-msvc` plus the VS "C++ ARM64 build tools" component; macOS
-universal builds use `universal-apple-darwin`.
+Targets built: NSIS `.exe` and WiX `.msi` on Windows x64 (MSI is Windows-build-only); `.dmg` on
+macOS; `.deb` and `.AppImage` on Linux. Windows produces **two** of each — a `downloadBootstrapper`
+pair and an `offlineInstaller` pair.
+
+`bundle.targets` is **"all"**, which selects the applicable targets per platform. An explicit
+list is the trap: a Windows-only one silently produced no macOS or Linux installer at all, because
+`tauri build` skips a target the host cannot make and still exits zero.
+
+Not built, and what they would cost: ARM64 Windows needs
+`rustup target add aarch64-pc-windows-msvc` plus the VS "C++ ARM64 build tools" component, and the
+NSIS installer itself still runs x86 under emulation there even though the app would be native;
+macOS universal builds use `universal-apple-darwin`. Neither has a known machine in the audience.
 
 `.deb` is the primary Linux artifact and AppImage is best-effort — AppImage bundles its
 dependencies but has recurring packaging bugs, e.g. a missing `libwebkit2gtkinjectedbundle.so` on
@@ -998,8 +1006,11 @@ Config that must be set rather than left on defaults:
 "bundle": {
   "macOS": { "minimumSystemVersion": "10.15" },   // config default is 10.13; real floor is Catalina
   "windows": {
-    "webviewInstallMode": { "type": "downloadBootstrapper", "silent": true }
-    // switch to "offlineInstaller" for air-gapped or egress-blocked fleets
+    "webviewInstallMode": { "type": "downloadBootstrapper", "silent": true },
+    // tauri.offline.conf.json overrides only this, for egress-blocked fleets. Both builds emit
+    // the SAME filenames, so the second overwrites the first unless the first is staged away.
+    "wix": { "upgradeCode": "…" },   // else derived from productName, and a rename breaks upgrades
+    "nsis": { "installMode": "currentUser" }  // recorded and matched on when upgrading
   },
   "linux": { "deb": { "depends": ["libwebkit2gtk-4.1-0", "libgtk-3-0"] } }
 }
@@ -1008,14 +1019,40 @@ Config that must be set rather than left on defaults:
 No system tray is planned, which drops `libappindicator3-1` — one fewer Linux dependency. Keep it
 that way unless a tray is wanted.
 
-**Signing is a Phase 8 prerequisite for goal 1, not a nicety.** CIT-managed Windows machines run
-Defender for Endpoint with tamper protection; it denies _execution_ of freshly downloaded,
-low-prevalence executables outright (`os error 5` with correct ACLs), independent of SmartScreen.
-An unsigned installer handed to a colleague does not get a click-through, it gets blocked. The
-two workable paths are an Authenticode certificate trusted by the tenant, or an IT-issued allow
-indicator by publisher or hash — either is an IT request with lead time, so it is filed before
-Phase 8 starts. macOS Gatekeeper and notarization matter only if a Mac build ships. How
-colleagues receive updates is open decision 5.
+**Signing is what goal 1 still waits on, and it is measured rather than predicted.** Corporate-managed
+Windows machines run application allowlisting — **ThreatLocker** is the lever, with Defender for
+Endpoint and tamper protection resident beside it — and it denies _execution_ of
+freshly written, low-prevalence executables outright (`os error 5` with correct ACLs), independent
+of SmartScreen. On this machine the split is exact and reproducible: the binary under
+`target/release/` runs, because that tree is allowlisted by path, and the identical binary installed
+to `%LOCALAPPDATA%\Repo Viewer\` is denied. The installer completes; the app it installs will not
+start.
+
+So an unsigned installer handed to a colleague does not get a click-through, it gets blocked — and
+the installer is not the only thing that has to clear. Tauri's NSIS installer extracts
+`nsis_tauri_utils.dll` to `%TEMP%` and loads it for the `SemverCompare` its upgrade detection needs,
+and that DLL is blocked on its own account.
+
+The two workable paths are an Authenticode certificate trusted by the tenant, or an IT-issued allow
+indicator by publisher or hash. Either is an IT request with lead time. **File it naming a
+publisher rule, not just the certificate**: ThreatLocker allowlists by publisher, hash or path, so
+a signed build nobody wrote a rule for is still blocked, and a hash rule has to be repeated per
+build. macOS Gatekeeper and notarization matter only if a Mac build ships.
+
+Signing is not configured in this repo. When the certificate lands the change is
+`bundle.windows.certificateThumbprint`, `digestAlgorithm: "sha256"` and a `timestampUrl`, plus
+wherever the key is allowed to live — which is its own question while the repository is public and
+on a personal account. How colleagues receive versions is open decision 5.
+
+**Installing a new version over an old one works, and two settings keep it working.** NSIS reads
+`DisplayVersion` from `…\CurrentVersion\Uninstall\<ProductName>`, compares it against the incoming
+build, and offers to remove the old version first — automatically under `/P`. `bundle.windows.wix.upgradeCode`
+is pinned to a fixed GUID because Tauri otherwise derives it from `productName`, and MSI performs a
+major upgrade only when that code is stable and the version increments: a later rename would
+silently turn every upgrade into a second side-by-side install. `bundle.windows.nsis.installMode`
+is set to `currentUser` explicitly for the same class of reason — the template records the mode and
+matches on it, so a default that moves in a future Tauri release would break detection on machines
+that already have the app.
 
 ---
 
@@ -1041,9 +1078,12 @@ has a hard version floor.
 The installer's bootstrapper is the mechanism that closes that gap. As a diagnostic only, the
 binary reads the `pv (REG_SZ)` value for the WebView2 Runtime under **both**
 `HKEY_LOCAL_MACHINE` and `HKEY_CURRENT_USER` before creating the window, so a missing runtime
-produces a native message box naming the fix rather than a blank exit. Keep
-`downloadBootstrapper` for general distribution and build a second `offlineInstaller` artifact
-(~127 MB) for locked-down environments.
+produces a native message box naming the fix rather than a blank exit — and it reads the HKLM value
+through `WOW6432Node`, without which it finds nothing on a machine that has the runtime. Keep
+`downloadBootstrapper` for general distribution and build a second `offlineInstaller` artifact for
+locked-down environments. **That artifact is ~254 MB against the bootstrapper's ~4 MB**, measured on
+this toolchain; Tauri documents the difference as ~127 MB and it is roughly double that, which
+matters when the number is going in front of a user deciding which link to click.
 
 **Linux is version-gated, not just dependency-managed.** A Tauri v2 `.deb` declares
 `libwebkit2gtk-4.1-0` and `libgtk-3-0`, so `apt` pulls them — but 4.1 exists in jammy 22.04,
@@ -1094,29 +1134,47 @@ main portability payoff:
 
 ### 10.4 CI
 
-**Azure DevOps** (`azure-pipelines.yml`), per house convention.
+**GitHub Actions**, because that is where the repository is — `github.com/b-meyer/repo-viewer`.
+Azure DevOps is the house convention elsewhere and would work through a service connection and the
+`GitHubRelease@1` task, but it puts the pipeline somewhere other than the code and buys nothing
+here.
 
-| Pool / container         | Builds                               | Notes                                                  |
-| ------------------------ | ------------------------------------ | ------------------------------------------------------ |
-| `windows-latest`         | NSIS `.exe`, WiX `.msi`, x64 + arm64 | MSI cannot be cross-built; the leg that matters for v1 |
-| `macos-latest`           | `.dmg`, `universal-apple-darwin`     | set `minimumSystemVersion: 10.15`                      |
-| `ubuntu-22.04` container | `.deb`, `.AppImage`                  | **must be 22.04, not `ubuntu-latest`** — glibc floor   |
+Two workflows. `.github/workflows/ci.yml` on push and PR to `main`; `.github/workflows/release.yml`
+on a `v*` tag, with `permissions: contents: write`.
 
-Given the audience — a single developer plus colleagues at CIT — treat the Windows leg as the pipeline
-and the other two as opt-in proof of portability. Do not build a three-platform release before
-the Windows one is used in anger.
+| Runner           | Builds                          | Notes                                           |
+| ---------------- | ------------------------------- | ----------------------------------------------- |
+| `windows-latest` | NSIS `.exe`, WiX `.msi`, x64    | MSI cannot be cross-built; the leg that matters |
+| `macos-latest`   | `.dmg`                          | `minimumSystemVersion: 10.15` is set            |
+| `ubuntu-22.04`   | `.deb`, `.AppImage` best-effort | **22.04, never `ubuntu-latest`** — glibc floor  |
 
-CI invokes the toolchain as `pnpm exec vp …` because `vp` is not global on an ADO agent — a
-pipeline detail, not a local pattern. Agents use Node 24 (the Active LTS line) via
-`NodeTool@0` reading `.node-version`, and install pnpm with `npm i -g pnpm@<pinned>`; pnpm then
-enforces the `packageManager` field itself. Rust legs run `cargo fmt --check`,
-`cargo clippy --all-targets -- -D warnings`, and `cargo test` alongside the frontend's
-`vp check`. They also run `vp run types` and fail on a diff, which is what actually prevents the
-committed bindings in `src/scripts/generated/` from drifting from `model.rs` (§4.2).
+Given the audience — a single developer plus a handful of colleagues — the Windows leg is the pipeline and
+the other two are proof of portability. `fail-fast: false` is what keeps that distinction real: a
+red Linux leg must not cancel the Windows one, and must not withhold a Windows release.
 
-Add a per-platform smoke test that launches the binary headless and asserts the webview
-initializes, so a missing-runtime regression is caught in CI rather than by a user. Also assert
-the built bundle's `import.meta.env.PROD` flag (§3.3).
+CI invokes the toolchain as `pnpm exec vp …` because `vp` is not global on a runner. That is more
+load-bearing than it looks — `pnpm exec` is what puts `node_modules/.bin` on `PATH` for `vp` **and
+everything it spawns**, and `tauri build`'s `beforeBuildCommand` shells out to `vp` again from
+inside. Node comes from `actions/setup-node` with `node-version-file: '.node-version'`; pnpm from
+`npm i -g pnpm@<pinned>`, after which pnpm enforces the `packageManager` field itself. Rust legs run
+`cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and `cargo test` through
+`vp run rust`, alongside the frontend's `vp check`. They also run `vp run types` and fail on a diff,
+which is what actually prevents the committed bindings in `src/scripts/generated/` from drifting
+from `model.rs` (§4.2), and `vp run versions`, which is what prevents a tag from publishing assets
+that disagree with the version inside them.
+
+`vp run smoke` is the per-platform launch check: it starts the built binary, requires it to still be
+alive five seconds later, then stops it and requires it to go away. That is the honest ceiling for a
+GUI binary observed from outside — a missing runtime, a bundle that did not build, a panic in
+`run()` or a plugin that fails to register all kill the process inside that window. Linux runners
+have no display, so the workflow puts `xvfb-run` in front of it. `vp run verify` asserts the built
+bundle's `import.meta.env.PROD` flag (§3.3).
+
+Releases are the distribution channel: the tag workflow attaches every installer to a GitHub Release
+and a user downloads and runs it. Windows builds twice — the `downloadBootstrapper` pair, then the
+`offlineInstaller` pair via `--config src-tauri/tauri.offline.conf.json`. **Both emit identical
+filenames**, so the first pair is staged before the second build runs and the second is suffixed
+`-offline`.
 
 ---
 
@@ -1125,7 +1183,10 @@ the built bundle's `import.meta.env.PROD` flag (§3.3).
 Each phase gets a runbook in `docs/` when it starts, written against the tree as it exists then,
 and is deleted when the phase completes — durable facts move into README.md, AGENTS.md, and the
 phase's own entry below, which is why `docs/` is empty or absent whenever no phase is open.
-No phase is currently open; Phase 8 gets the next one.
+**Phase 8 is open.** Everything in it is built and verified locally; what is left is the one thing
+that cannot be checked from a working copy — the workflows in `.github/` have never run, because
+running them requires a push. Delete `docs/phase-8.md` once CI is green on a branch and a tag has
+produced a Release.
 
 **Phase 0 — Environment and structure.** The Cargo workspace with its root `[profile.release]`
 (§4.1), `pnpm-workspace.yaml` with the catalog and the `vite`→core override, `vite.config.ts`
@@ -1483,8 +1544,52 @@ configured editor share one `PATH` walk, and the frontend needed no change to `H
 at all — a fetch's rows arrive on the session channel and its existing `EnsureDetail` call already
 does the right thing for both an invalidated drawer and an untouched one.
 
-**Phase 8 — Packaging.** Signing or an allow indicator secured first (§9), then the Windows
-installer, then the CI matrix.
+**Phase 8 — Packaging.** Real icons, a WebView2 runtime probe, upgrade-safe installer
+configuration, a version-consistency guard, a launch smoke test, and GitHub Actions for both CI and
+releases. **The point at which someone who will not build it can have it.**
+
+_Verified:_ 192 Rust tests (11 discovery, 20 Tier 0, 12 Tier 1, 14 Tier 2, 9 watch, 14 fetch, 26
+engine unit, 86 in `src-tauri`) and 240 frontend tests across 29 files, with `vp check`,
+`vp run typecheck`, `vp run rust`, `vp run versions`, `vp run build`, `vp run verify` and
+`vp run smoke` clean, and `vp run types` producing no diff. Six of the `src-tauri` tests are new and
+all belong to `webview2.rs`; nothing crossing the wire changed, so nothing new is generated.
+
+**The upgrade path was exercised for real, not reasoned about.** 0.1.0 installed silently, registered
+at `HKCU\…\Uninstall\Repo Viewer`; 0.1.1 built and installed over it with `/P`. Afterwards there is
+**one** registry entry, not two, its `DisplayVersion` is `0.1.1`, the install location is unchanged,
+and `settings.json` in `%APPDATA%` is byte-identical to before. No manual uninstall at any point. The
+MSI's `UpgradeCode` is the configured GUID in both the 0.1.0 and 0.1.1 builds, sitting in the Property
+table beside `ProductVersion` — the MSI install-and-upgrade cycle itself was **not** run end to end,
+because a per-machine MSI needs elevation and the installed binary is blocked anyway (below).
+
+_Settled by writing it:_ four things, two of them corrections to this document.
+
+**§10.4 named the wrong CI host.** It specifies Azure DevOps per house convention; the repository is
+on GitHub. Corrected above — ADO would have meant a service connection and a PAT to reach the place
+the code already lives.
+
+**The updater was the expensive half of this phase and it is not wanted.** Open decision 5 records
+why. What survives from it is the part that always mattered: a place to get the app, and an install
+that does not require uninstalling first.
+
+**Signing's premise is now measured, and it is worse than §9 stated.** The enforcement is
+ThreatLocker rather than Defender, the split is by path, and it is exact: the binary under
+`target/release/` runs while the byte-identical copy the installer places in `%LOCALAPPDATA%` is
+denied with `os error 5`. The installer succeeds and the app it installs will not start. Tauri's
+NSIS installer also extracts `nsis_tauri_utils.dll` to `%TEMP%` and loads it — that DLL is blocked
+separately, so allowlisting the installer is not sufficient on its own.
+
+**A 64-bit process cannot see the WebView2 registration through the obvious registry path**, which
+would have made the new probe refuse to start on every machine it was written to protect. Measured
+here: the `pv` value exists only under `HKLM\SOFTWARE\WOW6432Node\...`, and the non-redirected path
+returns nothing on a machine carrying runtime 152.0.4191.66. See _Durable failure shapes_ in
+[AGENTS.md](./AGENTS.md).
+
+Also settled, and more expensive than documented: **the offline installer is ~254 MB, not the
+~127 MB Tauri's guide states** — 60x the bootstrapper rather than 30x. And the two Windows builds
+really do collide: running the offline build after the bootstrapper one overwrote both artifacts in
+place, which is why the release workflow stages the first pair before the second build starts rather
+than after it.
 
 Phases 1–4 are the product. 5–7 make it pleasant. 8 makes it shippable.
 
@@ -1514,10 +1619,21 @@ number rather than being removed, because §9 and elsewhere cite these by number
 4. **`gix` pin policy.** The exact-pin half is done — `Cargo.toml` pins `=0.87.1` and AGENTS.md
    treats upgrades as tasks. What is still open is the cadence: who checks for a `gix` minor bump,
    and how often. _(Affects maintenance, not a phase.)_
-5. **Signing and update delivery.** Which of the two §9 paths — Authenticode certificate or an
-   IT allow indicator — and how colleagues get new versions: a share path with a version check
-   in-app, or `tauri-plugin-updater` against an ADO artifact feed. Recommend the certificate plus
-   the updater; the allow-indicator route has to be repeated per build hash. _(Blocks Phase 8.)_
+5. **Signing and update delivery.** Two halves that turned out to be independent, and only one is
+   settled. **Delivery: settled.** A **GitHub Release per `v*` tag** — the workflow builds every platform
+   and attaches the installers, and a user downloads one and runs it over the version they have.
+   There is no in-app updater. `tauri-plugin-updater` was the alternative and it loses on lock-in
+   rather than on effort — the endpoint URL and the minisign public key are compiled into every
+   build, so the first release fixes both permanently, and an ADO artifact feed cannot be read by an
+   unattended app without a token baked into the binary. Manual install costs a user one download
+   and one dialog, which is the whole of what the updater was buying.
+
+   **Signing: outstanding.** It does not block delivery — it blocks the delivery being _usable_ on
+   a managed machine, which §9 records as measured rather than predicted. The
+   route is an Authenticode certificate plus a ThreatLocker publisher rule; where the key lives is
+   open while this repository is public and on a personal account. _(Delivered in Phase 8, minus
+   signing.)_
+
 6. ~~**`RepoStatus.error` has one slot and two writers.**~~ **Settled:** Tier 0 owns the slot and
    replaces it; Tier 1 **appends** to whatever is already there. The two tiers describe different
    halves of the row and fail independently, so a Tier 1 failure must not erase the reason a Tier 0
@@ -1572,4 +1688,4 @@ stays relevant only for a future app wanting an embedded local store.
 - Linux floor: [Ubuntu archive: `libwebkit2gtk-4.1-0`](https://packages.ubuntu.com/search?keywords=libwebkit2gtk-4.1-0&searchon=names&suite=all&section=all) · [tauri#12463](https://github.com/tauri-apps/tauri/issues/12463)
 - Toolchain: [Vite 8 / Rolldown](https://vite.dev/blog/announcing-vite8-beta) · [what changed](https://certificates.dev/blog/rolldown-and-vite-8-what-changed) · [Vite `build.minify`](https://vite.dev/config/build-options) · [TypeScript 7.0 RC announcement](https://devblogs.microsoft.com/typescript/announcing-typescript-7-0-rc/) · [vuejs/language-tools#5381 (TS 7)](https://github.com/vuejs/language-tools/issues/5381) · [vue-tsgo](https://github.com/NikhilVerma/vue-tsgo) · [Node.js release schedule](https://endoflife.date/nodejs) · [Corepack is not distributed with Node 25+](https://socket.dev/blog/node-js-tsc-votes-to-stop-distributing-corepack) · [cargo#8519](https://github.com/rust-lang/cargo/issues/8519) · [Rust: automatic verbatim paths on Windows](https://github.com/rust-lang/rust/pull/89174) · [`dunce`](https://docs.rs/dunce) · [Tauri JS mocks](https://v2.tauri.app/develop/tests/mocking/)
 - Prior art: [gitpane](https://github.com/affromero/gitpane) · [RepoZ](https://github.com/awaescher/RepoZ) · [mu-repo](https://github.com/fabioz/mu-repo) · [gr](https://github.com/mixu/gr)
-- Sibling repos: `WPT.Dashboard` (frontend stack and conventions) · `CIT Quickwire/qdocs` (`src/composables/useSearch.ts`, the MiniSearch pattern)
+- Sibling in-house repos, not public: a dashboard app (frontend stack and conventions) · a docs site (`src/composables/useSearch.ts`, the MiniSearch pattern)

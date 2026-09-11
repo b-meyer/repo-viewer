@@ -8,7 +8,7 @@ that phase has a runbook in `docs/`. Between phases §11 says no phase is open a
 — or absent, since git does not track an empty directory. A missing runbook is not a missing file.
 
 This app also exists to prove Tauri + Vue as a delivery pattern for offline client apps against a
-local SQL database. That is why the frontend stack matches `WPT.Dashboard` and why `src-tauri/`
+local SQL database. That is why the frontend stack matches the sibling dashboard app and why `src-tauri/`
 stays thin: both must transfer.
 
 ## Commands
@@ -16,24 +16,29 @@ stays thin: both must transfer.
 `vp` fronts everything — deps, scripts, tasks. **Never run `pnpm` / `npm` / `yarn` scripts
 directly**; `vp install` / `vp add` / `vp remove` / `vp run` delegate through the pinned package
 manager and preserve catalog overrides that ad-hoc calls corrupt. (CI uses `pnpm exec vp …` only
-because `vp` is not global on an ADO agent — a pipeline detail, not a pattern to copy.)
+because `vp` is not global on a GitHub Actions runner — a pipeline detail, not a pattern to copy.)
 
-| Need                                      | Command                                                                                         |
-| ----------------------------------------- | ----------------------------------------------------------------------------------------------- |
-| Dev, full app                             | `vp run dev`                                                                                    |
-| Dev, frontend only                        | `vp dev`                                                                                        |
-| Check everything (fmt, lint, `.ts` types) | `vp check`                                                                                      |
-| Auto-fix                                  | `vp check --fix`                                                                                |
-| Vue SFC type-check                        | `vp run typecheck` — `vue-tsc` over `src/`; plain `.ts` is covered by `vp check`                |
-| Tests                                     | `vp test run`                                                                                   |
-| Build + installer                         | `vp run build`, then `vp run verify` asserts the bundle is a production build                   |
-| Regenerate TS types                       | `vp run types` — wraps `cargo test -p repo-scan --features typescript`                          |
-| Add a dependency                          | `vp add <pkg>` then pin it exact in the catalog                                                 |
-| Bump a dependency                         | `vp update -L <pkg>`                                                                            |
-| Rust checks                               | `vp run rust` — `cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test`  |
-| Engine without the GUI                    | `cargo run --release --example scan -- <path>` (`--rows`, `--tier2`, `--watch`)                 |
-| Time a fetch (**writes** — needs `--yes`) | `cargo run --release --example scan -- <path> --fetch --yes`                                    |
-| A tree to time against                    | `cargo run --release --example synth -- <dir> [count] [depth]` — generated, so safe to write to |
+| Need                                       | Command                                                                                                             |
+| ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------- |
+| Dev, full app                              | `vp run dev`                                                                                                        |
+| Dev, frontend only                         | `vp dev`                                                                                                            |
+| Check everything (fmt, lint, `.ts` types)  | `vp check`                                                                                                          |
+| Auto-fix                                   | `vp check --fix`                                                                                                    |
+| Vue SFC type-check                         | `vp run typecheck` — `vue-tsc` over `src/`; plain `.ts` is covered by `vp check`                                    |
+| Tests                                      | `vp test run`                                                                                                       |
+| Build + installer                          | `vp run build`, then `vp run verify` asserts the bundle is a production build                                       |
+| Offline installer (second Windows pair)    | `pnpm exec tauri build --config src-tauri/tauri.offline.conf.json` — **same filenames**, stage the first pair first |
+| Launch the built binary and check it lives | `vp run smoke` — Linux needs `xvfb-run` in front                                                                    |
+| The build actually emitted installers      | `vp run bundles` — the only thing that notices a build that bundled nothing                                         |
+| Versions agree across the three files      | `vp run versions`                                                                                                   |
+| Regenerate the app icons                   | `pnpm exec tauri icon src-tauri/icons/source.svg`                                                                   |
+| Regenerate TS types                        | `vp run types` — wraps `cargo test -p repo-scan --features typescript`                                              |
+| Add a dependency                           | `vp add <pkg>` then pin it exact in the catalog                                                                     |
+| Bump a dependency                          | `vp update -L <pkg>`                                                                                                |
+| Rust checks                                | `vp run rust` — `cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test`                      |
+| Engine without the GUI                     | `cargo run --release --example scan -- <path>` (`--rows`, `--tier2`, `--watch`)                                     |
+| Time a fetch (**writes** — needs `--yes`)  | `cargo run --release --example scan -- <path> --fetch --yes`                                                        |
+| A tree to time against                     | `cargo run --release --example synth -- <dir> [count] [depth]` — generated, so safe to write to                     |
 
 Imports: configs from `vite-plus`, tests from `vite-plus/test`. **Never `vite` / `vitest`
 direct** — `vite-plus/oxlint-plugin` enforces this.
@@ -369,7 +374,7 @@ made while the fetch ran.
 
 ## Code conventions
 
-Carried over from `WPT.Dashboard` — keep them identical so lessons transfer.
+Carried over from the sibling dashboard app — keep them identical so lessons transfer.
 
 - `function foo()` declarations, not `const foo = () =>`.
 - JSDoc every export. (oxfmt's `jsdoc` plugin handles formatting; just write the description.)
@@ -405,7 +410,8 @@ entry and die with `Cannot find module …\pnpm\12.3.4\bin\pnpm.cjs` — which r
 download rather than a version mismatch, because the tarball did extract correctly. Two on this
 machine were too old: **corepack 0.34.0** (bundled with Node 22) and **`vp` 0.2.2**. `vp upgrade`
 to 0.3.1+ fixes it. Corepack is not part of this setup at all — if a `pnpm` on `PATH` turns out to
-be a corepack shim, that is the bug. Relevant to the Phase 8 CI leg, which installs pnpm itself.
+be a corepack shim, that is the bug. It applies to CI too, where both workflows install pnpm
+themselves with `npm i -g pnpm@12.3.4` for exactly this reason.
 
 **Tauri's Vite guide has two wrong values.** They fail identically on plain Vite 8 and on
 `vite-plus`, since vite-plus-core 0.3.0 _is_ Vite 8.2.2:
@@ -420,8 +426,28 @@ be a corepack shim, that is the bug. Relevant to the Phase 8 CI leg, which insta
 **A production build needs `NODE_ENV=production` _and_ `--mode production`.** The `vp` task runner
 sets `NODE_ENV`, and Vite derives `isProduction` from it, overriding `--mode`. A bundle built via
 `vp run build` has `import.meta.env.DEV` **true** and `PROD` **false**, inverting every env guard
-silently. Tauri's `beforeBuildCommand` invokes commands directly rather than through `vp run`, so
-specify `vp build --mode production` there — and assert the built bundle's `PROD` flag in a test.
+silently. Tauri's `beforeBuildCommand` therefore points at `node tools/scripts/build-frontend.mjs`,
+which sets the variable and then runs `vp build --mode production` — setting it inline in the
+command string is not portable, because Tauri spawns that command through `cmd.exe` on Windows.
+`vp run verify` asserts the built bundle's `PROD` flag, and is the only thing that catches this.
+
+**A Windows checkout produces CRLF, oxfmt formats to LF, and the machine that made the commit is
+the last place that shows.** Git for Windows defaults to `core.autocrlf=true`, so without
+`.gitattributes` a checkout rewrites every text file to CRLF — and `vp check` then fails **every
+file in the repository at once**, which reads as a broken formatter rather than as a checkout
+difference. Measured: 93 of 93 files, including `Cargo.toml` and `.vscode/extensions.json`, on the
+first CI run.
+
+What hides it locally is that the failure is self-erasing. `vp check --fix` rewrites those files to
+LF in place; Git compares them normalised, so `git status` stays clean while the bytes on disk no
+longer match what a fresh checkout would produce. The committing machine passes forever and a
+runner or a new clone fails immediately. `* text=auto eol=lf` in `.gitattributes` is the fix, and it
+belongs there rather than in an oxfmt setting or a CI `git config` step — those would fix one
+consumer and leave the next clone broken.
+
+The tell, before CI ever runs: `git` printing "LF will be replaced by CRLF the next time Git touches
+it" against files nobody deliberately changed. Do not read that as noise. It is the whole bug,
+announced in advance.
 
 **`ts-rs` generates `u64` as `bigint`, not `number`.** Every time in `model.rs` is `u64` epoch-ms,
 `serde_json` writes it as a JSON number, and `JSON.parse` hands the frontend a `number` — so the
@@ -725,10 +751,71 @@ to keep the `env-filter` feature and its regex engine out of the tree.
 `creation_flags(CREATE_NO_WINDOW)` and `GIT_TERMINAL_PROMPT=0`, and has a timeout — a credential
 or SSH prompt with no terminal otherwise hangs the process forever.
 
-**Defender for Endpoint on CIT-managed machines blocks unsigned executables.** It denies
-execution of freshly downloaded, low-prevalence binaries with `os error 5` even when ACLs are
-correct, before SmartScreen is ever involved. An unsigned installer cannot be clicked through;
-signing or an IT allow indicator is a prerequisite for distributing to colleagues.
+**Application allowlisting on corporate-managed Windows machines blocks unsigned executables, and the block is by
+path.** **ThreatLocker** is the lever — Defender for Endpoint is resident too, with tamper
+protection, but it is not what denies these. Execution of freshly written, low-prevalence binaries
+fails with `os error 5` even when ACLs are correct, before SmartScreen is ever involved.
+
+The split is exact and reproducible: the binary under `target/release/` runs, because that tree is
+allowlisted by path, and the byte-identical copy the installer places in
+`%LOCALAPPDATA%\Repo Viewer\` is denied. **The installer succeeds and the app it installs will not
+start**, which reads as a broken build rather than as an enforcement decision — `vp run smoke`
+passing tells you nothing about whether an installed copy will run.
+
+**The installer is not the only thing that has to clear.** Tauri's NSIS installer extracts
+`nsis_tauri_utils.dll` to `%TEMP%` and loads it for the `SemverCompare` its upgrade detection needs.
+That DLL is blocked on its own account, and approving the installer does not approve it.
+
+So an unsigned installer cannot be clicked through, and a signed one still needs a rule: ThreatLocker
+allowlists by publisher, hash or path, so file the IT request naming a **publisher** rule — a hash
+rule has to be repeated per build.
+
+**A `pv` value under the obvious WebView2 registry path is absent on a machine that has the
+runtime.** The Edge updater registers 32-bit, so a 64-bit process reading
+`HKLM\SOFTWARE\Microsoft\EdgeUpdate\Clients\{F3017226-…}` finds nothing while
+`HKLM\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-…}` holds the version — measured
+here against runtime 152.0.4191.66, where the non-redirected path returns "key not found". A probe
+built on the obvious path refuses to start on every machine it was written to protect.
+`src-tauri/src/webview2.rs` reads `WOW6432Node` first and falls back, and HKCU (never redirected)
+beside it. Two further halves of the same contract: a **present key is not a present runtime** —
+absent, empty and `0.0.0.0` all mean not installed — and anything unparseable is treated as
+installed on purpose, because refusing to start an app that would have worked is the worse of the
+two mistakes. Checking the key by hand under MSYS needs `reg query … //v pv`; `/v` gets rewritten
+into a path and the failure reads as "key not found".
+
+**WiX derives the MSI `UpgradeCode` from `productName`, so renaming the app silently breaks every
+upgrade.** MSI performs a major upgrade only when the UpgradeCode is stable and the version
+increments; a derived one that moves turns the next install into a second side-by-side entry rather
+than a replacement, with no error anywhere. `bundle.windows.wix.upgradeCode` is pinned to a fixed
+GUID for that reason, and must never change. `bundle.windows.nsis.installMode` is set to
+`currentUser` explicitly for the neighbouring reason — the NSIS template records the mode and
+matches on it when deciding whether an existing install is upgradable.
+
+Upgrading itself needs no work: NSIS reads `DisplayVersion` from
+`…\CurrentVersion\Uninstall\<ProductName>`, semver-compares, and offers to remove the old version
+first — automatically under `/P`. Measured: installing 0.1.1 over 0.1.0 leaves one registry entry at
+the new version, the install location unchanged, and `settings.json` byte-identical.
+
+**`tauri build` asked for a target the host cannot produce emits nothing and exits zero.** Ask for
+`nsis` on Linux and it compiles the binary, skips bundling, prints no warning and succeeds. So
+`bundle.targets` set to `["nsis", "msi"]` — Windows-only types — meant every macOS and Linux build
+produced **no installer at all**, indistinguishable from a healthy build. `"all"` is the default and
+selects the applicable targets per platform; prefer it to a hand-written cross-platform array, since
+only the skip-on-Linux direction is demonstrated here and the reverse is not.
+
+Nothing in the ordinary pipeline notices. `vp run verify` inspects `dist/`, the frontend bundle,
+which is produced either way; `vp run smoke` runs the bare executable, also produced either way.
+Only the release workflow ever looked in `target/release/bundle/`, so the first symptom was a
+release failing to find its own artifacts — long after the config went wrong, and on the one run
+where it is most expensive. `vp run bundles` is the check that closes it, and it runs on every CI
+build leg so a platform emitting nothing fails at once.
+
+**The two Windows installers have identical filenames.** `tauri build` and
+`tauri build --config src-tauri/tauri.offline.conf.json` differ only in `webviewInstallMode`, and
+both write `Repo Viewer_<version>_x64-setup.exe` and `..._x64_en-US.msi` — so running them in
+sequence silently overwrites the first pair with the ~254 MB offline one. Stage the first pair
+before the second build runs. Handing a user the offline installer by accident is not a broken
+release, but it is a 254 MB download nobody asked for.
 
 **Git writes `.git/index` three times per operation.** It writes `index.lock`, writes, then
 renames, so one `git add` produces a create/modify/remove burst. Debouncing

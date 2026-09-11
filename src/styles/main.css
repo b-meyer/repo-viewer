@@ -2,7 +2,7 @@
 @import './theme.css';
 @import 'bootstrap-icons/font/bootstrap-icons.css';
 
-/* Utilities carried over from WPT.Dashboard. Every number below is a pixel value — `--spacing` is
+/* Utilities carried over from the sibling dashboard app. Every number below is a pixel value — `--spacing` is
  * 1px, so `h-32` is 32px and `text-14` is 14px. See theme.css. */
 
 @utility scrollbar {

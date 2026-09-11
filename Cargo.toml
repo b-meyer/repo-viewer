@@ -8,6 +8,7 @@ members = ["crates/repo-scan", "src-tauri"]
 edition = "2024"
 rust-version = "1.85" # set by gix 0.87, which is itself edition 2024
 publish = false
+license = "MIT"
 
 # Every version is exact and declared once. Bump deliberately; never widen a range.
 # gix is pre-1.0 and breaks on minor bumps, so treat its upgrades as tasks.
@@ -33,6 +34,13 @@ tauri-plugin-dialog = "=2.7.3"
 tauri-plugin-store = "=2.4.4"
 tauri-plugin-opener = "=2.5.5"
 tauri-plugin-window-state = "=2.4.1"
+
+# Windows-only, and used by exactly one module: src-tauri/src/webview2.rs, which has to know whether
+# a WebView2 runtime exists before Tauri tries to draw into one. Both versions are already in
+# Cargo.lock transitively — matching them matters, because the tree carries four `windows-sys`
+# majors already and a fifth would be pure cost.
+winreg = "=0.55.0"
+windows-sys = { version = "=0.61.2", features = ["Win32_UI_WindowsAndMessaging"] }
 
 # Lives at the workspace root deliberately. Cargo ignores a `[profile.*]` section in a member crate
 # with only a warning, so the same block under src-tauri/ would silently ship an unoptimized binary.

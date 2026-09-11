@@ -1,0 +1,44 @@
+# Line endings are LF in the working tree on every platform, not merely in the index.
+#
+# Git for Windows defaults to `core.autocrlf=true`, so without this a Windows checkout writes CRLF
+# — and oxfmt formats to LF, so `vp check` then reports every text file in the repository as
+# misformatted. Measured here: 93 of 93 files on the first CI run, including `Cargo.toml` and
+# `.vscode/extensions.json`.
+#
+# The failure hides on the machine that made the commit, because `vp check --fix` rewrites those
+# files to LF in place and git compares them normalised: `git status` stays clean while the bytes on
+# disk no longer match what a fresh checkout would produce. It therefore surfaces first on a CI
+# runner or a new clone. The tell, if this line is ever removed: git printing "LF will be replaced
+# by CRLF the next time Git touches it" against files nobody deliberately changed.
+* text=auto eol=lf
+
+# The lockfile is generated and enormous; a diff of it helps nobody.
+pnpm-lock.yaml -diff
+
+# Binary assets must be exempt from eol normalization. `text=auto` above misdetects some of these as
+# text, and git then strips `\r` bytes on checkout, corrupting them in the working tree while the
+# stored blobs stay intact. In a sibling repo that broke 10 of 16 binary files and failed the
+# build outright with "Input file contains unsupported image format".
+#
+# It misdetects only *some* binaries, so a repo with no exemptions and no visibly broken files has
+# live risk rather than live damage — none of this repository's 17 tracked binaries is currently
+# affected, which is not evidence the rules are unnecessary. The list is copied whole rather than
+# extended one extension at a time, because the first uncovered type to be committed is the one that
+# arrives corrupted.
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.ico  binary
+*.icns binary
+*.avif binary
+*.webp binary
+*.pdf  binary
+*.woff binary
+*.woff2 binary
+*.ttf  binary
+*.otf  binary
+*.eot  binary
+*.mp4  binary
+*.webm binary
+*.zip  binary

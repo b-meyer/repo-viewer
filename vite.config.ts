@@ -181,6 +181,15 @@ export default defineConfig({
       typecheck: { command: 'vue-tsc --noEmit -p tsconfig.json' },
       build: { command: 'tauri build', cache: false, dependsOn: ['typecheck'] },
       verify: { command: 'node tools/scripts/verify-prod-bundle.mjs', cache: false },
+      // Reads GITHUB_REF_NAME when there is one, and the answer depends on files a cache key would
+      // not cover if it did not, so this is never cached.
+      versions: { command: 'node tools/scripts/check-versions.mjs', cache: false },
+      // Reads target/, which is gitignored and outside any cache key, so a hit would report on a
+      // build it never looked at.
+      bundles: { command: 'node tools/scripts/check-bundles.mjs', cache: false },
+      // Launches the built binary. cache:false for the same reason `dev` is: the point is the side
+      // effect, and a replayed stdout would report a launch that never happened.
+      smoke: { command: 'node tools/scripts/smoke.mjs', cache: false },
       types: { command: 'cargo test -p repo-scan --features typescript', cache: false },
       rust: {
         command: 'cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test',

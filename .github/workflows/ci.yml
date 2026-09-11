@@ -1,0 +1,116 @@
+# Checks and per-platform builds.
+#
+# The Windows leg is the pipeline; macOS and Linux are proof that the portability claim in PLAN §10.3
+# is real. `fail-fast: false` is what keeps that distinction honest — a red Linux leg must not cancel
+# the Windows one, because it is not a reason to hold a Windows release.
+#
+# Everything runs through `pnpm exec vp …`. `vp` is not global on a runner, and `pnpm exec` is what
+# puts `node_modules/.bin` on PATH for it and for everything it spawns — which matters more than it
+# looks, because `tauri build`'s `beforeBuildCommand` shells out to `vp` again from inside.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  checks:
+    name: Checks
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .node-version
+
+      # pnpm enforces the `packageManager` field itself once it is running; corepack is not part of
+      # this setup and is not distributed with Node 25+.
+      - name: Install pnpm
+        run: npm i -g pnpm@12.3.4
+
+      - run: pnpm install --frozen-lockfile
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - run: pnpm exec vp check
+      - run: pnpm exec vp run typecheck
+      - run: pnpm exec vp test run
+      - run: pnpm exec vp run versions
+
+      # fmt, clippy at -D warnings, and the whole Rust test suite.
+      - run: pnpm exec vp run rust
+
+      # Regenerating must be a no-op. This is the only thing standing between the committed bindings
+      # in src/scripts/generated/ and model.rs drifting apart (PLAN §4.2).
+      - name: Generated types are current
+        run: |
+          pnpm exec vp run types
+          git diff --exit-code -- src/scripts/generated/
+
+  build:
+    name: Build (${{ matrix.label }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows-latest, label: windows }
+          - { os: macos-latest, label: macos }
+          # 22.04 exactly, never `ubuntu-latest`: glibc compatibility is forward-only, so building on
+          # a newer image raises the minimum glibc and produces binaries that fail on the floor
+          # PLAN §10.1 declares.
+          - { os: ubuntu-22.04, label: linux }
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .node-version
+
+      - name: Install pnpm
+        run: npm i -g pnpm@12.3.4
+
+      - run: pnpm install --frozen-lockfile
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Linux build dependencies
+        if: matrix.label == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential libssl-dev \
+            librsvg2-dev libxdo-dev xvfb
+
+      - run: pnpm exec vp run build
+
+      # A bundle can be a debug build wearing a production filename; nothing else notices.
+      - run: pnpm exec vp run verify
+
+      # And a `tauri build` asked for targets the host cannot produce exits zero having bundled
+      # nothing. Nothing else in the pipeline looks in target/release/bundle/ until a release does.
+      - run: pnpm exec vp run bundles
+
+      # Linux runners have no display, so the app would exit instantly without one. That is a
+      # property of the runner, not of the app, which is why xvfb goes here rather than in the script.
+      - name: Launch check
+        run: pnpm exec vp run smoke
+        if: matrix.label != 'linux'
+
+      - name: Launch check (xvfb)
+        run: xvfb-run --auto-servernum pnpm exec vp run smoke
+        if: matrix.label == 'linux'

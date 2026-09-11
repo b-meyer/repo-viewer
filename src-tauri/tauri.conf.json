@@ -30,9 +30,9 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["nsis", "msi"],
-    "publisher": "CIT Solutions",
-    "copyright": "Internal to CIT Solutions.",
+    "targets": "all",
+    "publisher": "Blake Meyer",
+    "copyright": "Copyright (c) 2026 Blake Meyer. MIT licensed.",
     "category": "DeveloperTool",
     "shortDescription": "A live dashboard of every Git repository beneath a folder.",
     "longDescription": "Point it at a folder and get a live dashboard of every Git repository beneath it — branch, ahead/behind, dirty state, file counts — without opening each one in an IDE.",
@@ -47,6 +47,12 @@
       "webviewInstallMode": {
         "type": "downloadBootstrapper",
         "silent": true
+      },
+      "wix": {
+        "upgradeCode": "F09264E2-B25A-4AD0-B10E-B14DD12E99E9"
+      },
+      "nsis": {
+        "installMode": "currentUser"
       }
     },
     "macOS": {

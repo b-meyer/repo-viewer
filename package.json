@@ -3,7 +3,8 @@
   "version": "0.1.0",
   "private": true,
   "description": "A live dashboard of every Git repository beneath a folder.",
-  "license": "UNLICENSED",
+  "license": "MIT",
+  "author": "Blake Meyer",
   "type": "module",
   "dependencies": {
     "@tauri-apps/api": "catalog:",
